@@ -1,0 +1,77 @@
+# RSS Telegram Bot
+
+一个用 Go 语言编写的 RSS 订阅推送机器人，可以将 RSS 源的更新实时推送到 Telegram 频道/群组。
+
+## 功能特点
+
+- 🚀 支持多个 RSS 源订阅
+  - RSS源支持多个 Telegram 频道推送
+- 🎨 自定义消息模板，支持 Markdown 格式
+- 🛡️ 自动过滤 30 天以前的旧文章
+  - 自动清理过期的文章记录（30 天）
+- ⚡️ 可靠的推送机制
+  -  消息发送失败自动重试（最多 3 次）
+  -  程序意外终止后的状态恢复，防止重复推送
+
+
+3. 配置文件
+在 `config/config.yaml` 中配置你的 RSS 源和 Telegram 频道：
+```yaml
+telegram:
+  token: "your-telegram-bot-token"
+
+feeds:
+  - name: "Example Feed"
+    url: "https://example.com/feed.xml"
+    channels:
+      - "@your_channel"
+      - "@your_channel2"
+      ...
+    template: |
+      📰 *{title}*
+      
+      {content}
+      
+      🔗 [阅读原文]({link})
+```
+
+
+## 配置说明
+
+### Telegram 配置
+- `token`: Telegram Bot Token，从 [@BotFather](https://t.me/BotFather) 获取
+- 确保你的 Bot 已被添加到目标频道，并具有发送消息的权限
+
+### RSS 源配置
+- `name`: RSS 源名称（用于日志记录）
+- `url`: RSS 源地址
+- `channels`: 要推送到的 Telegram 频道列表（格式：@channel_name）
+- `template`: 消息模板，支持 Markdown 格式，可用变量：
+  - `{title}`: 文章标题
+  - `{content}`: 文章内容
+  - `{link}`: 文章链接
+  - `{author}`: 作者（如果有）
+  - `{published}`: 发布时间（如果有）
+
+### 文章处理机制
+- **文章过期时间**: 默认 30 天，超过此时间的文章将被自动过滤
+- **去重策略**: 
+  - 优先使用文章的 GUID
+  - 如无 GUID，使用文章链接
+  - 如无链接，使用标题和发布时间的组合
+  - 最后使用文章内容的哈希值
+- **发布时间处理**:
+  - 优先按发布时间排序（从旧到新）
+  - 支持处理无发布时间的文章
+  - 无发布时间的文章将按照 RSS 源中的顺序推送
+
+### 推送控制
+- **重试机制**: 发送失败自动重试，指数避让
+- **发送间隔**: 每条消息发送后等待 1 秒，避免触发 Telegram 限制
+- **状态持久化**: 使用布隆过滤器保存已发送文章的状态，防止重复推送
+
+## 许可证
+
+MIT License
+
+

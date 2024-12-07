@@ -1,0 +1,77 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - dev.20241208 # debug
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_SHA: ${{ github.sha }}
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Set up Go Environment
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Check for file changes
+      id: file_check
+      run: |
+        if git diff --name-only HEAD^ | grep -q ".go$"; then
+          echo "updated=true" >> $GITHUB_OUTPUT
+        else
+          echo "updated=false" >> $GITHUB_OUTPUT
+        fi
+      # echo "::set-output name=updated::true"
+      # echo "::set-output name=updated::false"
+
+    - name: Run build.sh script
+      if: steps.file_check.outputs.updated == 'true'
+      # shell: bash
+      run: chmod +x ./build.sh && ./build.sh
+   
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: set lower case owner name
+      run: |
+        echo "OWNER_LC=${OWNER,,}" >>${GITHUB_ENV}
+      env:
+        OWNER: '${{ github.repository_owner }}'
+        
+    - name: Build and push Docker image
+      if: steps.file_check.outputs.updated == 'true'
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ghcr.io/${{ env.OWNER_LC }}/feeds-go:latest
+    
+    - name: Create release
+      if: steps.file_check.outputs.updated == 'true'
+      run: |
+        VERSION=`date -u +"v%Y.%m%d.$(git rev-parse --short HEAD)"`
+        echo "Creating tag for version $VERSION"
+        git tag $VERSION
+        git push origin $VERSION
+        echo "Tag $VERSION pushed!"

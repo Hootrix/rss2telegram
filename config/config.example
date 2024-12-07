@@ -1,0 +1,19 @@
+telegram:
+
+  bot_token: "900000:A********F0"
+  check_interval: 300 # 检查间隔，单位：秒
+
+feeds:
+  - name: "xiaobaiup"
+    url: "http://127.0.0.1/rss.xml"
+    channels:
+      - "@test_push"
+      - "@test_push2"
+    
+    # 消息默认  为空则默认 {title}\n\n{link}
+    template: |
+      📰 *{title}*
+      
+      {description}
+      
+      🔗 [阅读原文]({link})
