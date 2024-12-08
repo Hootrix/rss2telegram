@@ -2,7 +2,11 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
+	"sync"
+
+	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 )
 
@@ -78,22 +82,118 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// LoadConfig 从文件加载配置
-func LoadConfig(filename string) (*Config, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("reading config file: %w", err)
+// 配置文件自动监听Manager 配置管理器
+type Manager struct {
+	sync.RWMutex
+	config    *Config
+	filepath  string
+	watcher   *fsnotify.Watcher
+	callbacks []func(*Config)
+}
+
+// NewManager 创建新的配置管理器
+func NewManager(filepath string) (*Manager, error) {
+	m := &Manager{
+		filepath:  filepath,
+		callbacks: make([]func(*Config), 0),
 	}
 
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("parsing config file: %w", err)
+	// 初始加载配置
+	if err := m.Load(); err != nil {
+		return nil, err
+	}
+
+	// 初始化文件监控
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+	m.watcher = watcher
+
+	// 启动监控协程
+	go m.watchConfig()
+
+	// 添加文件监控
+	if err := watcher.Add(filepath); err != nil {
+		watcher.Close()
+		return nil, err
+	}
+
+	return m, nil
+}
+
+// Load 加载配置文件
+func (m *Manager) Load() error {
+	data, err := os.ReadFile(m.filepath)
+	if err != nil {
+		return err
+	}
+
+	var newConfig Config
+	if err := yaml.Unmarshal(data, &newConfig); err != nil {
+		return err
 	}
 
 	// 验证配置
-	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("validating config: %w", err)
+	if err := newConfig.Validate(); err != nil {
+		return err
 	}
 
-	return &config, nil
+	m.Lock()
+	m.config = &newConfig
+	callbacks := make([]func(*Config), len(m.callbacks))
+	copy(callbacks, m.callbacks)
+	m.Unlock()
+
+	// 通知所有订阅者
+	for _, cb := range callbacks {
+		cb(&newConfig)
+	}
+
+	log.Printf("Config Reloaded: %s", m.filepath)
+	return nil
+}
+
+// Get 获取当前配置
+func (m *Manager) Get() *Config {
+	m.RLock()
+	defer m.RUnlock()
+	return m.config
+}
+
+// OnConfigChange 注册配置变更回调函数
+func (m *Manager) OnConfigChange(callback func(*Config)) {
+	m.Lock()
+	m.callbacks = append(m.callbacks, callback)
+	m.Unlock()
+}
+
+// watchConfig 监控配置文件变化
+func (m *Manager) watchConfig() {
+	for {
+		select {
+		case event, ok := <-m.watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				if err := m.Load(); err != nil {
+					log.Printf("Config Reload Error: %v", err)
+				}
+			}
+		case err, ok := <-m.watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("Config Monitor Error: %v", err)
+		}
+	}
+}
+
+// Close 关闭配置管理器
+func (m *Manager) Close() error {
+	if m.watcher != nil {
+		return m.watcher.Close()
+	}
+	return nil
 }

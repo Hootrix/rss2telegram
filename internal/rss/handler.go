@@ -17,6 +17,7 @@ import (
 )
 
 type RssHandler struct {
+	sync.RWMutex
 	parser  *gofeed.Parser
 	config  *config.Config
 	bot     TelegramBot
@@ -42,15 +43,26 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) 
 	}
 }
 
+func (h *RssHandler) UpdateConfig(cfg *config.Config) {
+	h.Lock()
+	defer h.Unlock()
+	h.config = cfg
+	log.Printf("RSS处理器配置已更新")
+}
+
 func (h *RssHandler) ProcessFeeds() error {
+	h.RLock()
+	cfg := h.config
+	h.RUnlock()
+
 	var wg sync.WaitGroup
 	// 使用信号量限制并发数量，避免过多的并发请求
 	semaphore := make(chan struct{}, 2) // 处理feed name 最多2个并发
 
 	// 用于收集错误的channel
-	errChan := make(chan error, len(h.config.Feeds))
+	errChan := make(chan error, len(cfg.Feeds))
 
-	for _, feed := range h.config.Feeds {
+	for _, feed := range cfg.Feeds {
 		wg.Add(1)
 		go func(feed config.FeedConfig) {
 			defer wg.Done()
@@ -189,7 +201,7 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 
 	// 处理新项目（推送文章）
 	// 使用信号量控制并发数
-	sem := make(chan struct{}, 4) // 单个feed下处理channel 最大并发数为4
+	sem := make(chan struct{}, 2) // 单个feed下处理channel 最大并发数为2
 	var wg sync.WaitGroup
 
 	for _, item := range newItems {

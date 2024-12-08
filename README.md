@@ -2,7 +2,7 @@
 
 一个用 Go 语言编写的 RSS 订阅推送机器人，可以将 RSS 源的更新实时推送到 Telegram 频道/群组。
 
-## 功能特点
+## 功能
 
 - 🚀 支持多个 RSS 源订阅
   - RSS源支持多个 Telegram 频道推送
@@ -12,10 +12,12 @@
 - ⚡️ 可靠的推送机制
   -  消息发送失败自动重试（最多 3 次）
   -  程序意外终止后的状态恢复，防止重复推送
+- 🎉 配置文件修改后自动应用 无需重启服务
 
 
-3. 配置文件
-在 `config/config.yaml` 中配置你的 RSS 源和 Telegram 频道：
+## 配置文件
+默认在 `config/config.yaml` 中配置你的 RSS 源和 Telegram 频道：
+配置文件也可以使用`-config`参数指定
 ```yaml
 telegram:
   token: "your-telegram-bot-token"
@@ -33,6 +35,23 @@ feeds:
       {content}
       
       🔗 [阅读原文]({link})
+```
+
+## 🐳运行
+
+建议`docker`方式运行
+
+`config.yaml`配置在当前目录下的`rss2telegram-config`文件夹中，运行命令:
+```
+# 启动
+$ docker run -d --name rss2telegram  -v $(pwd)/rss2telegram-config:/app/config  ghcr.io/hootrix/rss2telegram 
+
+# 停止
+$ docker stop rss2telegram
+
+# 查看运行日志
+$ docker logs -f rss2telegram
+
 ```
 
 
@@ -73,5 +92,4 @@ feeds:
 ## 许可证
 
 MIT License
-
 
