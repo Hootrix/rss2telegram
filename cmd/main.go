@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -19,6 +20,10 @@ func main() {
 	// 设置日志格式
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
 
+	// 解析命令行参数 读取配置文件
+	configPath := flag.String("config", "config/config.yaml", "path to configuration file")
+	flag.Parse()
+
 	// 创建上下文，用于优雅退出
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -32,15 +37,18 @@ func main() {
 		cancel()
 	}()
 
-	// 读取配置文件
-	configPath := "config/config.yaml"
-	cfg, err := config.LoadConfig(configPath)
+	// 使用文件监听 读取配置文件。
+	// 内容变化后自动应用最新配置
+	cfgManager, err := config.NewManager(*configPath)
 	if err != nil {
 		log.Fatalf("Error loading config: %v", err)
 	}
+	defer cfgManager.Close()
+
+	cfg := cfgManager.Get()
 
 	// 初始化存储
-	dataDir := filepath.Join(filepath.Dir(configPath), "data")
+	dataDir := filepath.Join(filepath.Dir(*configPath), "rss2telegram-data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		log.Fatalf("Error creating data directory: %v", err)
 	}
@@ -57,7 +65,12 @@ func main() {
 	}
 
 	// 创建 RSS 处理器
-	handler := rss.NewRssHandler(cfg, bot, store)
+	rssHandler := rss.NewRssHandler(cfg, bot, store)
+
+	// 注册配置变更回调
+	cfgManager.OnConfigChange(func(newCfg *config.Config) {
+		rssHandler.UpdateConfig(newCfg)
+	})
 
 	// 定时检查 RSS 更新
 	ticker := time.NewTicker(time.Duration(cfg.Telegram.CheckInterval) * time.Second)
@@ -75,12 +88,11 @@ func main() {
 			log.Printf("Shutting down... (uptime: %v)", time.Since(startTime))
 			return
 		case <-ticker.C:
-			if err := handler.ProcessFeeds(); err != nil {
+			if err := rssHandler.ProcessFeeds(); err != nil {
 				log.Printf("Error processing feeds: %v", err)
 				// 如果发生错误，等待一段时间再继续
 				time.Sleep(time.Second * 5)
 			}
 		}
 	}
-
 }

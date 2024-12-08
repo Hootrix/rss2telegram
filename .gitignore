@@ -1,2 +1,2 @@
-config/data/*.bloom
+**.bloom
 config/*.yaml
