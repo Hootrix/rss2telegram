@@ -14,6 +14,7 @@ jobs:
       packages: write
     env:
       GITHUB_SHA: ${{ github.sha }}
+      VERSION: ${{ github.ref_name }}
 
     steps:
     - name: Check out code
@@ -74,7 +75,62 @@ jobs:
       if: steps.file_check.outputs.updated == 'true'
       run: |
         VERSION=`date -u +"v%Y.%m%d.$(git rev-parse --short HEAD)"`
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
         echo "Creating tag for version $VERSION"
         git tag $VERSION
         git push origin $VERSION
         echo "Tag $VERSION pushed!"
+
+  release-binaries:
+    needs: build-and-push
+    if: needs.build-and-push.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Build binaries
+      run: |
+        VERSION="${{ needs.build-and-push.outputs.VERSION }}"
+        mkdir -p dist
+        
+        # Build for Linux (amd64 and arm64)
+        GOOS=linux GOARCH=amd64 go build -o dist/rss2telegram-linux-amd64 ./cmd/main.go
+        GOOS=linux GOARCH=arm64 go build -o dist/rss2telegram-linux-arm64 ./cmd/main.go
+        
+        # Build for macOS (amd64 and arm64)
+        GOOS=darwin GOARCH=amd64 go build -o dist/rss2telegram-darwin-amd64 ./cmd/main.go
+        GOOS=darwin GOARCH=arm64 go build -o dist/rss2telegram-darwin-arm64 ./cmd/main.go
+        
+        # Build for Windows (amd64)
+        GOOS=windows GOARCH=amd64 go build -o dist/rss2telegram-windows-amd64.exe ./cmd/main.go
+        
+        # Create archives
+        cd dist
+        tar czf rss2telegram-linux-amd64.tar.gz rss2telegram-linux-amd64
+        tar czf rss2telegram-linux-arm64.tar.gz rss2telegram-linux-arm64
+        tar czf rss2telegram-darwin-amd64.tar.gz rss2telegram-darwin-amd64
+        tar czf rss2telegram-darwin-arm64.tar.gz rss2telegram-darwin-arm64
+        zip rss2telegram-windows-amd64.zip rss2telegram-windows-amd64.exe
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ needs.build-and-push.outputs.VERSION }}
+        name: Release ${{ needs.build-and-push.outputs.VERSION }}
+        files: |
+          dist/rss2telegram-linux-amd64.tar.gz
+          dist/rss2telegram-linux-arm64.tar.gz
+          dist/rss2telegram-darwin-amd64.tar.gz
+          dist/rss2telegram-darwin-arm64.tar.gz
+          dist/rss2telegram-windows-amd64.zip
+        draft: false
+        prerelease: false
