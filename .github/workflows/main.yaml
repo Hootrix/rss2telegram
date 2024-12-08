@@ -9,6 +9,8 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
     env:
       GITHUB_SHA: ${{ github.sha }}
 

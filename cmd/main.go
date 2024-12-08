@@ -79,7 +79,6 @@ func main() {
 				log.Printf("Error processing feeds: %v", err)
 				// 如果发生错误，等待一段时间再继续
 				time.Sleep(time.Second * 5)
-
 			}
 		}
 	}
