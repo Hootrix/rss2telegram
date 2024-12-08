@@ -12,7 +12,7 @@ import (
 
 func TestSend(t *testing.T) {
 	// 读取配置文件
-	data, err := os.ReadFile("/Users/panc/CascadeProjects/rss-telegram-bot/config/config.yaml")
+	data, err := os.ReadFile("config/config.yaml")
 	if err != nil {
 		t.Fatalf("Error reading config file: %v", err)
 	}

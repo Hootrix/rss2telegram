@@ -33,7 +33,7 @@ func main() {
 	}()
 
 	// 读取配置文件
-	configPath := "/Users/panc/CascadeProjects/rss-telegram-bot/config/config.yaml"
+	configPath := "config/config.yaml"
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		log.Fatalf("Error loading config: %v", err)

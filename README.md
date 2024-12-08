@@ -1,4 +1,4 @@
-# RSS Telegram Bot
+# rss2telegram
 
 一个用 Go 语言编写的 RSS 订阅推送机器人，可以将 RSS 源的更新实时推送到 Telegram 频道/群组。
 
