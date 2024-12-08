@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -12,7 +13,7 @@ import (
 
 	"github.com/Hootrix/rss2telegram/internal/config"
 	"github.com/Hootrix/rss2telegram/internal/storage"
-
+	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/mmcdole/gofeed"
 )
 
@@ -284,6 +285,11 @@ func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
 	}
 
 	message := template
+	converter := md.NewConverter("", true, nil)
+
+	// 编译正则表达式，用于将图片标记转换为链接
+	imgRegex := regexp.MustCompile(`!\[(.*?)\]\((.*?)\)`)
+
 	if item.Title != "" {
 		message = strings.ReplaceAll(message, "{title}", item.Title)
 	}
@@ -291,13 +297,30 @@ func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
 		message = strings.ReplaceAll(message, "{link}", item.Link)
 	}
 	if item.Description != "" {
-		message = strings.ReplaceAll(message, "{description}", item.Description)
+		// 将 HTML 转换为 Markdown
+		mdDescription, err := converter.ConvertString(item.Description)
+		if err != nil {
+			log.Printf("Error converting HTML to Markdown: %v", err)
+			mdDescription = item.Description
+		}
+		// 将图片标记转换为链接
+		mdDescription = imgRegex.ReplaceAllString(mdDescription, "[Media]($2)") // 保持 alt 文本和 URL，只去掉感叹号
+		message = strings.ReplaceAll(message, "{description}", mdDescription)
 	}
 	if item.Content != "" {
-		message = strings.ReplaceAll(message, "{content}", item.Content)
+		// 将 HTML 转换为 Markdown
+		mdContent, err := converter.ConvertString(item.Content)
+		if err != nil {
+			log.Printf("Error converting HTML to Markdown: %v", err)
+			mdContent = item.Content
+		}
+		// 将图片标记转换为链接
+		mdContent = imgRegex.ReplaceAllString(mdContent, "[Media]($2)") // 保持 alt 文本和 URL，只去掉感叹号
+		message = strings.ReplaceAll(message, "{content}", mdContent)
 	}
 	if item.PublishedParsed != nil {
-		message = strings.ReplaceAll(message, "{pubDate}", item.PublishedParsed.Format("2006-01-02 15:04:05"))
+		pubDate := item.PublishedParsed.Format("2006-01-02 15:04:05")
+		message = strings.ReplaceAll(message, "{pubDate}", pubDate)
 	}
 
 	// 清理未被替换的占位符
