@@ -18,24 +18,9 @@
 ## 配置文件
 默认在 `config/config.yaml` 中配置你的 RSS 源和 Telegram 频道：
 配置文件也可以使用`-config`参数指定
-```yaml
-telegram:
-  token: "your-telegram-bot-token"
 
-feeds:
-  - name: "Example Feed"
-    url: "https://example.com/feed.xml"
-    channels:
-      - "@your_channel"
-      - "@your_channel2"
-      ...
-    template: |
-      📰 *{title}*
-      
-      {content}
-      
-      🔗 [阅读原文]({link})
-```
+[config/config.example](config/config.example#L1)
+
 
 ## 🐳运行
 
