@@ -284,51 +284,75 @@ func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
 		template = "{title}\n\n{link}" // 默认模板
 	}
 
-	message := template
-	converter := md.NewConverter("", true, nil)
+	processor := NewTemplateProcessor()
+	converter := md.NewConverter("", true, &md.Options{
+		EscapeMode: "disabled", // 禁用转义  包括针对|的转义
+	})
 
 	// 编译正则表达式，用于将图片标记转换为链接
 	imgRegex := regexp.MustCompile(`!\[(.*?)\]\((.*?)\)`)
 
-	if item.Title != "" {
-		message = strings.ReplaceAll(message, "{title}", item.Title)
-	}
-	if item.Link != "" {
-		message = strings.ReplaceAll(message, "{link}", item.Link)
-	}
-	if item.Description != "" {
-		// 将 HTML 转换为 Markdown
-		mdDescription, err := converter.ConvertString(item.Description)
-		if err != nil {
-			log.Printf("Error converting HTML to Markdown: %v", err)
-			mdDescription = item.Description
+	replaceOpFieldFunc := func(match, field string) string {
+		// 获取基础字段内容
+		var content string
+		basefield := strings.SplitN(field, "|", 2)[0]
+		switch basefield {
+		case "title":
+			content = item.Title
+		case "description":
+			if item.Description != "" {
+				// 将 HTML 转换为 Markdown
+				mdContent, err := converter.ConvertString(item.Description)
+				if err != nil {
+					log.Printf("Error converting HTML to Markdown: %v", err)
+					content = item.Description
+				} else {
+					// 将图片标记转换为链接
+					content = imgRegex.ReplaceAllString(mdContent, "[Media]($2)")
+				}
+			}
+		case "content":
+			if item.Content != "" {
+				// 将 HTML 转换为 Markdown
+				mdContent, err := converter.ConvertString(item.Content)
+				if err != nil {
+					log.Printf("Error converting HTML to Markdown: %v", err)
+					content = item.Content
+				} else {
+					// 将图片标记转换为链接
+					content = imgRegex.ReplaceAllString(mdContent, "[Media]($2)")
+				}
+			}
+		case "link":
+			content = item.Link
+		case "pubDate":
+			if item.PublishedParsed != nil {
+				content = item.PublishedParsed.Format("2006-01-02 15:04:05")
+			}
+		default:
+			return match
 		}
-		// 将图片标记转换为链接
-		mdDescription = imgRegex.ReplaceAllString(mdDescription, "[Media]($2)") // 保持 alt 文本和 URL，只去掉感叹号
-		message = strings.ReplaceAll(message, "{description}", mdDescription)
-	}
-	if item.Content != "" {
-		// 将 HTML 转换为 Markdown
-		mdContent, err := converter.ConvertString(item.Content)
-		if err != nil {
-			log.Printf("Error converting HTML to Markdown: %v", err)
-			mdContent = item.Content
-		}
-		// 将图片标记转换为链接
-		mdContent = imgRegex.ReplaceAllString(mdContent, "[Media]($2)") // 保持 alt 文本和 URL，只去掉感叹号
-		message = strings.ReplaceAll(message, "{content}", mdContent)
-	}
-	if item.PublishedParsed != nil {
-		pubDate := item.PublishedParsed.Format("2006-01-02 15:04:05")
-		message = strings.ReplaceAll(message, "{pubDate}", pubDate)
+
+		// 处理操作链
+		return processor.ProcessField(field, content)
 	}
 
-	// 清理未被替换的占位符
-	message = strings.ReplaceAll(message, "{title}", "")
-	message = strings.ReplaceAll(message, "{link}", "")
-	message = strings.ReplaceAll(message, "{description}", "")
-	message = strings.ReplaceAll(message, "{content}", "")
-	message = strings.ReplaceAll(message, "{pubDate}", "")
+	// 使用正则表达式找出所有模板字段
+	fieldRegex := regexp.MustCompile(`{ (.*?) }`) //支持正则中使用花括号
+	message := fieldRegex.ReplaceAllStringFunc(template, func(match string) string {
+		// 去掉花括号
+		field := match[2 : len(match)-2]
+
+		return replaceOpFieldFunc(match, field)
+	})
+
+	fieldRegex = regexp.MustCompile(`{([^}]+)}`) //正则中不使用花括号的情况
+	message = fieldRegex.ReplaceAllStringFunc(message, func(match string) string {
+		// 去掉花括号
+		field := match[1 : len(match)-1]
+
+		return replaceOpFieldFunc(match, field)
+	})
 
 	// 清理多余的空行
 	message = strings.TrimSpace(message)

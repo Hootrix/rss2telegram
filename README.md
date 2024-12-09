@@ -59,6 +59,21 @@ $ docker logs -f rss2telegram
   - `{description}`: 描述（如果有）
   - `{pubDate}`: 发布时间（如果有）
 
+### 模板语法
+- **变量语法**:
+  - `{ field }` - 带空格的花括号语法，例如：`{ title }` 支持正则中使用`{}`
+  - `{field}` - 紧凑的花括号语法，例如：`{title}`
+  - 两种语法效果相同，可以根据个人偏好选择使用
+- **支持的操作符**:
+  允许对RSS数据进行提取/过滤/替换操作
+  - `extract`: 使用正则表达式提取内容，例如：`{description|extract:([\S]+?市)}`
+  - `replace`: 使用正则表达式替换内容，例如：`{ description|extract:价格：(\d+)元|replace:\d{4}:**** }`
+  - `default`: 设置默认值，当内容为空时使用，例如：`{description|extract:类型：(.*?)，|default:未知}`
+- **操作符语法**:
+  - 使用 `|` 分隔多个操作符
+  - 操作符参数使用 `:` 分隔
+  - 支持链式操作，例如：`{field|op1:param1|op2:param2}`
+
 ### 文章处理机制
 - **文章过期时间**: 默认 30 天，超过此时间的文章将被自动过滤
 - **去重策略**: 
@@ -79,4 +94,3 @@ $ docker logs -f rss2telegram
 ## 许可证
 
 MIT License
-
