@@ -41,16 +41,15 @@ jobs:
           echo "updated=true" >> $GITHUB_OUTPUT
         else
           echo "updated=false" >> $GITHUB_OUTPUT
+          echo "No Go files were changed, skipping build steps."
         fi
-      # echo "::set-output name=updated::true"
-      # echo "::set-output name=updated::false"
 
     - name: Run build.sh script
       if: steps.file_check.outputs.updated == 'true'
-      # shell: bash
       run: chmod +x ./build.sh && ./build.sh
    
     - name: Login to GitHub Container Registry
+      if: steps.file_check.outputs.updated == 'true'
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
@@ -85,7 +84,7 @@ jobs:
 
   release-binaries:
     needs: build-and-push
-    if: needs.build-and-push.result == 'success'
+    if: needs.build-and-push.result == 'success' && needs.build-and-push.outputs.version != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -93,11 +92,13 @@ jobs:
     steps:
     - name: Check out code
       uses: actions/checkout@v4
+      if: needs.build-and-push.outputs.version != ''
 
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.23'
+      if: needs.build-and-push.outputs.version != ''
 
     - name: Build binaries
       run: |
@@ -122,6 +123,7 @@ jobs:
         tar czf rss2telegram-darwin-amd64.tar.gz rss2telegram-darwin-amd64
         tar czf rss2telegram-darwin-arm64.tar.gz rss2telegram-darwin-arm64
         zip rss2telegram-windows-amd64.zip rss2telegram-windows-amd64.exe
+      if: needs.build-and-push.outputs.version != ''
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
@@ -135,4 +137,5 @@ jobs:
           dist/rss2telegram-darwin-arm64.tar.gz
           dist/rss2telegram-windows-amd64.zip
         draft: false
-        prerelease: false
+        prerelease: false #true Release会被标记为预发布版本（Pre-release）
+      if: needs.build-and-push.outputs.version != ''
