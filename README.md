@@ -1,25 +1,25 @@
 # rss2telegram
 
-一个用 Go 语言编写的 RSS 订阅推送机器人，可以将 RSS 源的更新实时推送到 Telegram 频道/群组。
+Go 语言编写的 RSS 订阅推送机器人，可以将 RSS 源的更新实时推送到 Telegram 频道/群组。
 
 ## 功能
 
 - 🚀 支持多个 RSS 源订阅
-  - RSS源支持多个 Telegram 频道推送
-- 🎨 自定义消息模板，支持 Markdown 格式
+  - RSS源支持多个 Telegram 频道/群组推送
+- 🎨 自定义消息模板（支持 Markdown 格式），自动转换RSS源中的HTML为MD格式
 - 🛡️ 自动过滤 30 天以前的旧文章
   - 自动清理过期的文章记录（30 天）
 - ⚡️ 可靠的推送机制
   -  消息发送失败自动重试（最多 3 次）
   -  程序意外终止后的状态恢复，防止重复推送
-- 🎉 配置文件修改后自动应用 无需重启服务
+- 🎉 配置文件修改后自动应用，无需重启服务
 
 
 ## 配置文件
 默认在 `config/config.yaml` 中配置你的 RSS 源和 Telegram 频道：
 配置文件也可以使用`-config`参数指定
 
-[config/config.example](config/config.example#L1)
+[config/config.example](config/config.yaml.example#L1)
 
 
 ## 🐳运行
@@ -39,6 +39,8 @@ $ docker logs -f rss2telegram
 
 ```
 
+也可以手动下载`releases`页面提供的最新版本二进制程序
+
 
 ## 配置说明
 
@@ -51,11 +53,11 @@ $ docker logs -f rss2telegram
 - `url`: RSS 源地址
 - `channels`: 要推送到的 Telegram 频道列表（格式：@channel_name）
 - `template`: 消息模板，支持 Markdown 格式，可用变量：
-  - `{title}`: 文章标题
-  - `{content}`: 文章内容
-  - `{link}`: 文章链接
-  - `{author}`: 作者（如果有）
-  - `{published}`: 发布时间（如果有）
+  - `{title}`: 标题
+  - `{link}`: 链接
+  - `{content}`: 内容（如果有）
+  - `{description}`: 描述（如果有）
+  - `{pubDate}`: 发布时间（如果有）
 
 ### 文章处理机制
 - **文章过期时间**: 默认 30 天，超过此时间的文章将被自动过滤
