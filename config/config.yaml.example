@@ -6,6 +6,7 @@ telegram:
 feeds:
   - name: "xiaobaiup"
     url: "http://127.0.0.1/rss.xml"
+    # article_expiration_duration_hours: 720 # 超过指定时间的旧文章不推送（文章有发布时间时）
     channels:
       - "@test_push"
       - "@test_push2"

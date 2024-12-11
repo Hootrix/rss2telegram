@@ -21,10 +21,11 @@ type TelegramConfig struct {
 }
 
 type FeedConfig struct {
-	Name     string   `yaml:"name"`
-	URL      string   `yaml:"url"`
-	Channels []string `yaml:"channels"`
-	Template string   `yaml:"template"`
+	Name                           string   `yaml:"name"`
+	URL                            string   `yaml:"url"`
+	ArticleExpirationDurationHours *int     `yaml:"article_expiration_duration_hours"`
+	Channels                       []string `yaml:"channels"`
+	Template                       string   `yaml:"template"`
 }
 
 // Validate 验证配置的合法性

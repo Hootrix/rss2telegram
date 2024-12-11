@@ -29,12 +29,6 @@ type TelegramBot interface {
 	Send(channel string, message string) error
 }
 
-const (
-	// 文章过期时间
-	// 超过30天的旧文章不推送
-	articleExpirationDuration = 30 * 24 * time.Hour // 30 天，与存储模块保持一致
-)
-
 func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) *RssHandler {
 	return &RssHandler{
 		parser:  gofeed.NewParser(),
@@ -167,9 +161,11 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 		// 只有当文章有发布时间时才检查是否过期
 		if item.PublishedParsed != nil {
 			age := time.Since(*item.PublishedParsed)
-			if age > articleExpirationDuration {
-				log.Printf("Skipping old item (age: %v): %s", age, item.Title)
-				continue
+			if feedConfig.ArticleExpirationDurationHours != nil {
+				if age > time.Duration(*feedConfig.ArticleExpirationDurationHours)*time.Hour {
+					log.Printf("Skipping old item (age: %v): %s", age, item.Title)
+					continue
+				}
 			}
 		}
 
