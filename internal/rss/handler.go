@@ -222,7 +222,7 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 
 	// 处理新项目（推送文章）
 	// 使用信号量控制并发数
-	sem := make(chan struct{}, 2) // 单个feed下处理channel 最大并发数为2
+	sem := make(chan struct{}, 1) // 单个feed下处理channel 最大并发数为1
 	var wg sync.WaitGroup
 
 	for _, item := range newItems {
