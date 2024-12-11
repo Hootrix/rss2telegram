@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"os"
+
 	"github.com/Hootrix/rss2telegram/internal/config"
 	"github.com/Hootrix/rss2telegram/internal/storage"
 	md "github.com/JohannesKaufmann/html-to-markdown"
@@ -147,6 +149,28 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 
 		// 检查是否所有频道都已经处理过这个项目
 		allChannelsProcessed := true
+		isFirstRun := true // 用于判断是否是第一次运行
+		for _, channel := range feedConfig.Channels {
+			// 检查 bloom 文件是否存在来判断是否是第一次运行
+			bloomPath := h.storage.GetBloomFilePath(feedConfig.URL, channel)
+			if _, err := os.Stat(bloomPath); err == nil {
+				isFirstRun = false
+				break
+			}
+		}
+
+		// 如果是第一次运行且 first_push 为 false，则跳过所有项目
+		if isFirstRun && !feedConfig.FirstPush {
+			log.Printf("First run and first_push is false, skipping all items for feed: %s", feedConfig.Name)
+			// 标记所有项目为已处理，这样下次运行时就不会重复处理
+			for _, channel := range feedConfig.Channels {
+				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
+					log.Printf("Error marking item as seen: %v", err)
+				}
+			}
+			continue
+		}
+
 		for _, channel := range feedConfig.Channels {
 			if !h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
 				allChannelsProcessed = false

@@ -24,6 +24,7 @@ type FeedConfig struct {
 	Name                           string   `yaml:"name"`
 	URL                            string   `yaml:"url"`
 	ArticleExpirationDurationHours *int     `yaml:"article_expiration_duration_hours"`
+	FirstPush                      bool     `yaml:"first_push"`
 	Channels                       []string `yaml:"channels"`
 	Template                       string   `yaml:"template"`
 }

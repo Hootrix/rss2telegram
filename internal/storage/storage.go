@@ -92,8 +92,8 @@ func (s *Storage) GenerateBloomFileName(feedURL string, channel string) string {
 	return base64.URLEncoding.EncodeToString([]byte(data))
 }
 
-// 获取bloom过滤器的文件路径
-func (s *Storage) getBloomFilePath(feedURL string, channel string) string {
+// GetBloomFilePath 获取bloom过滤器的文件路径
+func (s *Storage) GetBloomFilePath(feedURL string, channel string) string {
 	return filepath.Join(s.dataDir, s.GenerateBloomFileName(feedURL, channel)+bloomFileSuffix)
 }
 
@@ -152,7 +152,7 @@ func (s *Storage) MarkItemSeen(feedURL, feedName, channel, itemID string) error 
 
 // 读取channel的持久化存储
 func (s *Storage) loadChannelState(feedURL string, channel string) error {
-	filepath := s.getBloomFilePath(feedURL, channel)
+	filepath := s.GetBloomFilePath(feedURL, channel)
 
 	// 获取文件信息
 	fileInfo, err := os.Stat(filepath)
@@ -233,7 +233,7 @@ func (s *Storage) loadChannelState(feedURL string, channel string) error {
 
 // 将channel状态保存到文件
 func (s *Storage) saveChannelState(feedURL string, channel string, state *ChannelState) error {
-	filepath := s.getBloomFilePath(feedURL, channel)
+	filepath := s.GetBloomFilePath(feedURL, channel)
 
 	// 创建临时文件
 	tempFile := filepath + ".tmp"
