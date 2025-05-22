@@ -32,8 +32,10 @@ func NewTemplateProcessor() *TemplateProcessor {
 
 	// 注册基础操作 操作符
 	registry.Register("extract", &ExtractOperation{})
+	registry.Register("extract-all", &ExtractAllOperation{})
 	registry.Register("replace", &ReplaceOperation{})
 	registry.Register("default", &DefaultOperation{})
+	registry.Register("prefix", &PrefixOperation{})
 
 	return &TemplateProcessor{registry: registry}
 }
@@ -64,6 +66,61 @@ func (op *ExtractOperation) Process(content string, params string) string {
 	}
 	// 如果没有匹配，返回空字符串
 	return ""
+}
+
+// ExtractAllOperation 提取所有匹配操作
+const ExtractAllOperationGap = "<||4623456fdb0d55bc037afa5c25f08cd7||>"
+
+type ExtractAllOperation struct{}
+
+func (op *ExtractAllOperation) Process(content string, params string) string {
+	// 只处理正则表达式，前缀由 prefix 操作符处理
+	pattern := params
+
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		log.Printf("Invalid regex pattern: %v", err)
+		return content
+	}
+
+	// 提取所有匹配结果
+	var allMatches []string
+
+	// 使用FindAllStringSubmatch获取所有匹配
+	matches := re.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+
+	for _, match := range matches {
+		if len(match) > 1 {
+			// 如果有捕获组，添加第一个捕获组
+			allMatches = append(allMatches, match[1])
+		} else {
+			// 如果没有捕获组，添加整个匹配
+			allMatches = append(allMatches, match[0])
+		}
+	}
+	return strings.Join(allMatches, ExtractAllOperationGap)
+}
+
+// PrefixOperation 前缀操作
+type PrefixOperation struct{}
+
+func (op *PrefixOperation) Process(content string, prefix string) string {
+	// 如果内容为空，直接返回空字符串
+	if content == "" {
+		return ""
+	}
+
+	// 如果内容包含多个项（由两个空格分隔）
+	items := strings.Split(content, ExtractAllOperationGap)
+	for i, item := range items {
+		items[i] = prefix + item
+	}
+
+	// 重新用两个空格连接
+	return strings.Join(items, "  ")
 }
 
 // ReplaceOperation 替换操作

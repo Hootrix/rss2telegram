@@ -67,6 +67,8 @@ $ docker logs -f rss2telegram
 - **支持的操作符**:
   允许对RSS数据进行提取/过滤/替换操作
   - `extract`: 使用正则表达式提取内容，例如：`{description|extract:([\S]+?市)}`
+  - `extract-all`: 使用正则表达式提取所有匹配项，例如：`{title|extract-all:(\d+折)}`
+  - `prefix`: 有生成内容时添加前缀，例如：`{title|extract-all:(\d+折)|prefix:#}`, `{title|extract:(\d+折)|prefix:#}`
   - `replace`: 使用正则表达式替换内容，例如：`{ description|extract:价格：(\d+)元|replace:\d{4}:**** }`
   - `default`: 设置默认值，当内容为空时使用，例如：`{description|extract:类型：(.*?)，|default:未知}`
 - **操作符语法**:
