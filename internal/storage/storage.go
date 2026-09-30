@@ -23,6 +23,7 @@ const (
 	expectedItems = 100000 // 预期元素数量（10万）
 	falsePositive = 0.001  // 误判率 0.1%
 	// 状态过期时间
+	// [issue#5] 仅被 loadChannelState 中已停用的"30天过期清零"逻辑引用，恢复该逻辑时一并恢复
 	stateExpirationDuration = 30 * 24 * time.Hour // 30 天
 
 	//后缀
@@ -188,16 +189,23 @@ func (s *Storage) loadChannelState(feedURL string, channel string) error {
 	}
 	timestamp := time.Unix(0, int64(binary.LittleEndian.Uint64(timeBytes)))
 
+	// [issue#5] 原"30天过期即清零重建"逻辑已停用（注释保留，不物理删除）
+	// 原因：updatedAt 仅在 MarkItemSeen（推送新文章）时刷新，低频 feed 超过 30 天无新文章后，
+	// 任何一次进程重启加载到此处都会把去重记忆清零，导致该 feed 全量文章重复推送
+	// （线上实测：苹果维修计划 6 条、广本二手车 100 条旧文重推）
+	// 且该逻辑并无实际"清理"作用（不存在删除 bloom 文件的代码），bloom 为固定大小位数组
+	// 也不会膨胀；旧文章是否推送的过滤职责属于 feed 配置的 article_expiration_duration_hours
+	// 如需强制全量重推：手动删除对应 .bloom 文件后重启即可
 	// 检查是否过期(超过指定时间未更新rss)
-	if time.Since(timestamp) > stateExpirationDuration {
-		// 如果过期，创建新的状态
-		s.states[feedURL] = make(map[string]*ChannelState)
-		s.states[feedURL][channel] = &ChannelState{
-			filter:    bloom.NewWithEstimates(expectedItems, falsePositive),
-			updatedAt: time.Now(),
-		}
-		return nil
-	}
+	// if time.Since(timestamp) > stateExpirationDuration {
+	// 	// 如果过期，创建新的状态
+	// 	s.states[feedURL] = make(map[string]*ChannelState)
+	// 	s.states[feedURL][channel] = &ChannelState{
+	// 		filter:    bloom.NewWithEstimates(expectedItems, falsePositive),
+	// 		updatedAt: time.Now(),
+	// 	}
+	// 	return nil
+	// }
 
 	// 计算布隆过滤器数据的大小
 	filterSize := fileInfo.Size() - 8 // 总大小减去时间戳大小
