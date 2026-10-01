@@ -29,7 +29,7 @@ Go 语言编写的 RSS 订阅推送机器人，可以将 RSS 源的更新实时�
 `config.yaml`配置在当前目录下的`rss2telegram-config`文件夹中，运行命令:
 ```
 # 启动
-$ docker run -d --name rss2telegram  -v $(pwd)/rss2telegram-config:/app/config  ghcr.io/hootrix/rss2telegram 
+$ docker run -d --restart=always --name rss2telegram  -v $(pwd)/rss2telegram-config:/app/config  ghcr.io/hootrix/rss2telegram 
 
 # 停止
 $ docker stop rss2telegram
@@ -105,5 +105,3 @@ $ docker logs -f rss2telegram
 ## 许可证
 
 MIT License
-
-
