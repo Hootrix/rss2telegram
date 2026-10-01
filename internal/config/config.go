@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -133,7 +134,53 @@ func NewManager(configPath string) (*Manager, error) {
 	// 启动监控协程
 	go m.watchConfig()
 
+	// 挂载方式体检：单文件 bind mount 会同时废掉"内容同步"与"热更新"，提前告警避免用户排错
+	warnIfSingleFileMount(configPath)
+
 	return m, nil
+}
+
+// isSingleFileMount 判断 absPath 是否作为挂载点出现在 mountinfo 中（即被单独 bind mount 的文件）
+// 拆成纯函数便于测试：直接喂 /proc/self/mountinfo 格式文本即可，无需真实挂载与 root 权限
+// mountinfo 行格式: "ID parent major:minor root mount_point [可选字段...] - fstype source [超参数]"
+// 其中挂载点是第 5 列（index 4）
+func isSingleFileMount(mountinfo string, absPath string) bool {
+	for _, line := range strings.Split(mountinfo, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue // 空行/畸形行
+		}
+		if unescapeMountPath(fields[4]) == absPath {
+			return true
+		}
+	}
+	return false
+}
+
+// unescapeMountPath 还原 mountinfo 中的八进制转义（空格/制表符/反斜杠在挂载点路径中的转义形式）
+func unescapeMountPath(s string) string {
+	return strings.NewReplacer(`\040`, " ", `\011`, "\t", `\134`, `\`).Replace(s)
+}
+
+// warnIfSingleFileMount 检测配置文件是否被单文件 bind mount（典型：-v config.yaml:/app/config/config.yaml）
+// 单文件挂载会把 inode 钉死在容器启动时刻：宿主机编辑器"临时文件+rename"保存后换了新 inode，
+// 容器内看到的永远是旧文件——内容不同步、热更新完全失效（比目录挂载+事件缺失更彻底）
+// 边界：/proc/self/mountinfo 读取失败（mac/windows 宿主机直跑、受限环境）时静默跳过，不影响启动
+func warnIfSingleFileMount(configPath string) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return
+	}
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return
+	}
+	if !isSingleFileMount(string(data), abs) {
+		return
+	}
+	log.Printf("⚠️  [挂载方式告警] 配置文件 %s 是单文件挂载(bind mount)：宿主机编辑器保存后容器内内容不会更新，配置热更新完全失效", abs)
+	log.Printf("⚠️  请改为挂载目录，例如: docker run -v $(pwd)/rss2telegram-config:/app/config ...")
+	log.Printf("⚠️  若坚持当前方式，每次修改配置后需 docker restart 重新挂载才能生效")
 }
 
 // Load 加载配置文件
@@ -184,31 +231,33 @@ func (m *Manager) OnConfigChange(callback func(*Config)) {
 
 // watchConfig 监控配置文件变化
 // [issue#3] 配套 NewManager 改为监听目录后的重写版本：
-// - 按文件名过滤目录事件（忽略同目录其他文件，如编辑器临时文件）
-// - 事件类型扩展为 Write|Create|Rename：编辑器原子保存（tmp+rename 覆盖）在目录监听下
-//   表现为 Create（新 inode 落地），原实现只认 Write 会漏掉这种保存方式
-// - 增加去抖：一次保存可能连续产生多个事件（如 Create+Write），合并为一次重载
+//   - 按文件名过滤目录事件（忽略同目录其他文件，如编辑器临时文件）
+//   - 事件类型扩展为 Write|Create|Rename：编辑器原子保存（tmp+rename 覆盖）在目录监听下
+//     表现为 Create（新 inode 落地），原实现只认 Write 会漏掉这种保存方式
+//   - 增加去抖：一次保存可能连续产生多个事件（如 Create+Write），合并为一次重载
+//
 // 旧逻辑（监听文件本身、只处理 Write）注释保留：
-// func (m *Manager) watchConfig() {
-// 	for {
-// 		select {
-// 		case event, ok := <-m.watcher.Events:
-// 			if !ok {
-// 				return
-// 			}
-// 			if event.Op&fsnotify.Write == fsnotify.Write {
-// 				if err := m.Load(); err != nil {
-// 					log.Printf("Config Reload Error: %v", err)
-// 				}
-// 			}
-// 		case err, ok := <-m.watcher.Errors:
-// 			if !ok {
-// 				return
-// 			}
-// 			log.Printf("Config Monitor Error: %v", err)
-// 		}
-// 	}
-// }
+//
+//	func (m *Manager) watchConfig() {
+//		for {
+//			select {
+//			case event, ok := <-m.watcher.Events:
+//				if !ok {
+//					return
+//				}
+//				if event.Op&fsnotify.Write == fsnotify.Write {
+//					if err := m.Load(); err != nil {
+//						log.Printf("Config Reload Error: %v", err)
+//					}
+//				}
+//			case err, ok := <-m.watcher.Errors:
+//				if !ok {
+//					return
+//				}
+//				log.Printf("Config Monitor Error: %v", err)
+//			}
+//		}
+//	}
 func (m *Manager) watchConfig() {
 	target := filepath.Base(m.filepath)
 	var debounce *time.Timer
