@@ -41,6 +41,10 @@ $ docker logs -f rss2telegram
 
 > **⚠️ 挂载注意事项**：请始终挂载**目录**（如上例 `-v $(pwd)/rss2telegram-config:/app/config`），不要挂载单个配置文件（如 `-v config.yaml:/app/config/config.yaml`）。
 > 单文件挂载会把 inode 钉死，宿主机上编辑器保存（临时文件 + rename 覆盖）后容器内看到的仍是旧文件，配置热更新会完全失效。
+> 程序启动时会自检挂载方式：若检测到单文件挂载，日志会输出 `[挂载方式告警]` 提示改用目录挂载。
+>
+> **平台差异**：Linux 原生 Docker（推荐的生产环境）下，宿主机编辑器保存后容器内自动热更新。
+> Docker Desktop（Mac/Windows 本地开发）的虚拟文件系统不跨 VM 边界传播文件事件，宿主机保存后需 `docker restart` 才会应用新配置（文件数据本身会同步，仅事件通知不到达容器）。
 
 也可以手动下载`releases`页面提供的最新版本二进制程序
 
