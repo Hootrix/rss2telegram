@@ -204,6 +204,26 @@ func TestSendFlood429WithoutRetryAfterStaysPlainError(t *testing.T) {
 	assert.False(t, errors.As(err, &rlErr), "无 retry_after 的 429 不应包装为 RateLimitError")
 }
 
+// 边界：空 channel 应提前返回错误且不产生任何 HTTP 请求
+// （getChat 移除后不再被预查询拦截，空 chat_id 的 sendMessage 必 400，白调一次 API）
+func TestSendEmptyChannelFailsFast(t *testing.T) {
+	fake := newFakeTG(false)
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+
+	bot, err := NewBot("1:test")
+	assert.NoError(t, err)
+
+	err = bot.Send("", "hello")
+	require.Error(t, err)
+
+	assert.Empty(t, fake.sends_(), "空 channel 不应发起 sendMessage")
+	fake.mu.Lock()
+	hits := fake.getChatHits
+	fake.mu.Unlock()
+	assert.Zero(t, hits)
+}
+
 // channelRecipient 归一化：@name 原样透传、裸名补 @、数字/负数 ID 原样透传
 func TestNewChannelRecipient(t *testing.T) {
 	cases := []struct {

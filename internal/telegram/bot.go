@@ -72,6 +72,11 @@ func NewBot(token string) (*Bot, error) {
 }
 
 func (b *Bot) Send(channel string, message string) error {
+	if channel == "" {
+		// [issue #6] getChat 预查询移除后空 channel 不再被拦截，会白送一次
+		// chat_id 为空的 sendMessage（必 400）；提前返回保持旧的失败即退语义
+		return errors.New("telegram: empty channel")
+	}
 
 	// [issue #6] 旧实现每条消息先调 ChatByUsername（getChat API）解析频道再发送，
 	// 每条消息消耗 2 次 API 调用并增加 ~0.5s 延迟，是大批首刷时撞限速的放大器。
@@ -104,7 +109,8 @@ func (b *Bot) Send(channel string, message string) error {
 		}
 	}
 	// 注意重试放大：parse entities 失败时单次 Send 最多 2 次 API 调用，
-	// 叠加 handler 外层 3 次重试最坏 6 次，属可接受代价（否则该消息永远发不出去）
+	// 叠加 handler 外层双配额重试（普通 3 次 + flood 5 次，每次都可能触发降级重发）
+	// 单条消息最坏约 16 次调用，属可接受代价（否则该消息永远发不出去）
 	return err
 }
 
