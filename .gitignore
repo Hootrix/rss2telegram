@@ -1,2 +1,4 @@
 **.bloom
 config/*.yaml
+docs/
+CLAUDE.md
