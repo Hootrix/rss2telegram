@@ -45,6 +45,8 @@ $ docker logs -f rss2telegram
 >
 > **平台差异**：Linux 原生 Docker（推荐的生产环境）下，宿主机编辑器保存后容器内自动热更新。
 > Docker Desktop（Mac/Windows 本地开发）的虚拟文件系统不跨 VM 边界传播文件事件，宿主机保存后需 `docker restart` 才会应用新配置（文件数据本身会同步，仅事件通知不到达容器）。
+>
+> **已知限制**：配置热更新通过监听配置文件**所在目录**实现（应对编辑器原子保存替换 inode）。若 `config.yaml` 本身是指向其他目录文件的**符号链接**，写入目标文件的事件不会落在被监听的目录内，热更新会静默失效——请直接放置实体文件。
 
 也可以手动下载`releases`页面提供的最新版本二进制程序
 
@@ -103,12 +105,5 @@ $ docker logs -f rss2telegram
 ## 许可证
 
 MIT License
-
-
-
-# TODO
-
-case:apple频道
-
 
 

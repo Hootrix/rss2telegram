@@ -135,6 +135,46 @@ func TestConfigReloadOnInplaceWrite(t *testing.T) {
 	}
 }
 
+// CR 意见#2：Close() 必须取消 pending 中的去抖定时器
+// 修复前 debounce 是 watchConfig 局部变量，Close 只关 watcher，
+// 已排定的 200ms 去抖定时器仍会在 Close 之后触发 m.Load() 并回调所有订阅者
+func TestCloseCancelsPendingDebounce(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	initial := "telegram:\n  bot_token: \"token-1\"\n  check_interval: 60\nfeeds:\n  - name: \"f\"\n    url: \"http://example.com/rss.xml\"\n    channels: [\"@c\"]\n"
+	if err := os.WriteFile(cfgPath, []byte(initial), 0644); err != nil {
+		t.Fatalf("write initial config: %v", err)
+	}
+
+	m, err := NewManager(cfgPath)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	reloaded := make(chan struct{}, 1)
+	m.OnConfigChange(func(c *Config) {
+		select {
+		case reloaded <- struct{}{}:
+		default:
+		}
+	})
+
+	// 原地写触发事件 → 100ms 后定时器已排定且未到期（去抖窗口 200ms），此刻 Close
+	if err := os.WriteFile(cfgPath, []byte(initial), 0644); err != nil {
+		t.Fatalf("touch config: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	m.Close()
+
+	select {
+	case <-reloaded:
+		t.Fatal("Close 后 pending 的去抖定时器仍触发了重载（CR意见#2）")
+	case <-time.After(500 * time.Millisecond):
+		// 预期路径：Close 已取消定时器，静默
+	}
+}
+
 // 监听目录后必须按文件名过滤：同目录其他文件（编辑器临时文件、无关文件）变化不得触发重载
 func TestConfigIgnoresSiblingFileChanges(t *testing.T) {
 	dir := t.TempDir()

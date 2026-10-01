@@ -94,6 +94,12 @@ type Manager struct {
 	filepath  string
 	watcher   *fsnotify.Watcher
 	callbacks []func(*Config)
+	// [CR#2] 去抖定时器从 watchConfig 局部变量提升为字段：Close 需要Stop掉
+	// pending 中的定时器，否则 Close 之后仍可能触发一次 m.Load() 并回调订阅者
+	// 仅在持 m.Lock 时读写
+	debounce *time.Timer
+	// Close 已调用；用于封死"Close 与 watchConfig 排定新定时器"的竞态窗口
+	closed bool
 }
 
 // NewManager 创建新的配置管理器
@@ -121,6 +127,13 @@ func NewManager(configPath string) (*Manager, error) {
 	// 原因：watcher.Add(文件) 监听的是 inode，而编辑器（vim/vscode 等）保存普遍采用
 	// "写临时文件 + rename 覆盖"，rename 后 inode 替换，旧 inode 上永远收不到事件，
 	// 表现为配置热更新完全失效（只能重启进程）。监听目录 + 按文件名过滤事件则不受 inode 替换影响
+	//
+	// [CR#3] 已知限制：若 configPath 本身是符号链接，透写 target 文件产生的事件落在
+	// target 所在目录（未被监听），且按文件名过滤也匹配不上 → 热更新静默失效
+	// （旧实现 inotify 会 follow symlink 监听 target inode，反而能工作）
+	// 边缘场景（嵌套 symlink、k8s ConfigMap 的 ..data 变体），如需支持可在启动时
+	// filepath.EvalSymlinks 解析真实路径，但 ConfigMap 每次更新切换 ..data 指向仍会丢事件，
+	// 届时需目录级监听策略，留待单独 issue 处理
 	// 旧逻辑（监听文件本身）注释保留：
 	// if err := watcher.Add(configPath); err != nil {
 	// 	watcher.Close()
@@ -260,7 +273,6 @@ func (m *Manager) OnConfigChange(callback func(*Config)) {
 //	}
 func (m *Manager) watchConfig() {
 	target := filepath.Base(m.filepath)
-	var debounce *time.Timer
 
 	for {
 		select {
@@ -274,14 +286,31 @@ func (m *Manager) watchConfig() {
 			}
 			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
 				// 去抖：重置定时器，静默 200ms 后才真正重载（Load 幂等，偶发重复无害）
-				if debounce != nil {
-					debounce.Stop()
+				// [CR#2] 旧实现 debounce 为局部变量、Close 无法 Stop，注释保留：
+				// var debounce *time.Timer
+				// if debounce != nil { debounce.Stop() }
+				// debounce = time.AfterFunc(200*time.Millisecond, func() { m.Load() ... })
+				m.Lock()
+				if m.closed {
+					m.Unlock()
+					continue // Close 竞态窗口：不再排定新定时器
 				}
-				debounce = time.AfterFunc(200*time.Millisecond, func() {
+				if m.debounce != nil {
+					m.debounce.Stop()
+				}
+				m.debounce = time.AfterFunc(200*time.Millisecond, func() {
+					// Stop 与触发竞态输一步时（Stop 返回 false）的兜底：已 Close 则放弃重载
+					m.RLock()
+					closed := m.closed
+					m.RUnlock()
+					if closed {
+						return
+					}
 					if err := m.Load(); err != nil {
 						log.Printf("Config Reload Error: %v", err)
 					}
 				})
+				m.Unlock()
 			}
 		case err, ok := <-m.watcher.Errors:
 			if !ok {
@@ -293,7 +322,25 @@ func (m *Manager) watchConfig() {
 }
 
 // Close 关闭配置管理器
+// [CR#2] 除关闭 watcher 外，还需取消 pending 中的去抖定时器，
+// 否则 Close 之后定时器到点仍会触发 m.Load() 并回调所有订阅者（库语义泄漏）
+// 旧逻辑（只关 watcher）注释保留：
+//
+//	func (m *Manager) Close() error {
+//		if m.watcher != nil {
+//			return m.watcher.Close()
+//		}
+//		return nil
+//	}
 func (m *Manager) Close() error {
+	m.Lock()
+	m.closed = true
+	if m.debounce != nil {
+		m.debounce.Stop()
+		m.debounce = nil
+	}
+	m.Unlock()
+
 	if m.watcher != nil {
 		return m.watcher.Close()
 	}
