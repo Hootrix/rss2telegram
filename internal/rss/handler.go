@@ -2,6 +2,7 @@ package rss
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Hootrix/rss2telegram/internal/config"
 	"github.com/Hootrix/rss2telegram/internal/storage"
+	"github.com/Hootrix/rss2telegram/internal/telegram"
 	"github.com/Hootrix/rss2telegram/internal/tgmd"
 	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/mmcdole/gofeed"
@@ -26,6 +28,7 @@ type RssHandler struct {
 	config  *config.Config
 	bot     TelegramBot
 	storage *storage.Storage
+	sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
 }
 
 type TelegramBot interface {
@@ -38,7 +41,17 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) 
 		config:  cfg,
 		bot:     bot,
 		storage: store,
+		sleepFn: time.Sleep,
 	}
+}
+
+// sleep 统一走可注入的 sleepFn，nil 安全（直接字面量构造的 handler 如模板测试）
+func (h *RssHandler) sleep(d time.Duration) {
+	if h.sleepFn != nil {
+		h.sleepFn(d)
+		return
+	}
+	time.Sleep(d)
 }
 
 func (h *RssHandler) UpdateConfig(cfg *config.Config) {
@@ -256,36 +269,38 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 				sem <- struct{}{}        // 获取信号量
 				defer func() { <-sem }() // 释放信号量
 
-				// 多次重试发送消息（包含第一次请求）
-				maxRetries := 3
-				var sendSuccess bool
-				var lastError error
-				for i := 0; i < maxRetries; i++ {
-					if err := h.bot.Send(channel, message); err != nil {
-						lastError = err
-						if i == maxRetries-1 {
-							log.Printf("Failed to send message to channel %s after %d retries: %v", channel, maxRetries, err)
-							break
-						}
-						log.Printf("Error sending message to channel %s (retry %d/%d): %v", channel, i+1, maxRetries, err)
-						h.ExponentialBackoffWithJitter(i)
-						continue
-					}
-					log.Printf("Successfully sent message to channel %s: %s", channel, item.Title)
-					sendSuccess = true
-					break // 发送成功，退出重试循环
-				}
+				// [issue #6] 重试循环已提取为 sendWithRetry：429 按服务端 retry_after
+				// 等待且独立计数，普通错误维持指数退避 3 次。
+				// 旧实现保留备查（固定指数退避、flood 与普通错误共享 3 次配额、
+				// 间隔 1s 超 Telegram 单频道 ~20 条/分钟限速）：
+				// maxRetries := 3
+				// var sendSuccess bool
+				// var lastError error
+				// for i := 0; i < maxRetries; i++ {
+				// 	if err := h.bot.Send(channel, message); err != nil {
+				// 		lastError = err
+				// 		if i == maxRetries-1 {
+				// 			log.Printf("Failed to send message to channel %s after %d retries: %v", channel, maxRetries, err)
+				// 			break
+				// 		}
+				// 		log.Printf("Error sending message to channel %s (retry %d/%d): %v", channel, i+1, maxRetries, err)
+				// 		h.ExponentialBackoffWithJitter(i)
+				// 		continue
+				// 	}
+				// 	sendSuccess = true
+				// 	break
+				// }
+				sendSuccess := h.sendWithRetry(channel, message, item.Title)
 
 				// 只有在发送成功后才标记为已处理
 				if sendSuccess {
 					if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
 						log.Printf("msg send success. MarkItemSeen ERROR!!  channel %s: %v", channel, err)
 					}
-					time.Sleep(time.Second) // 发送间隔 1 秒
-				} else if lastError != nil {
-					// 如果发送失败且有错误，记录到日志
-					log.Printf("msg send Failed. item '%s' for channel 「%s」: %v", item.Title, channel, lastError)
+					h.sleep(sendInterval) // 发送间隔（原 1s，已提至 sendInterval）
 				}
+				// [issue #6] 旧失败兜底日志已并入 sendWithRetry 内部失败日志（含 title），保留备查：
+				// log.Printf("msg send Failed. item '%s' for channel 「%s」: %v", item.Title, channel, lastError)
 			}(channel, item)
 		}
 	}
@@ -296,13 +311,65 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 	return nil
 }
 
+// [issue #6] 发送重试参数
+const (
+	// 发送间隔：Telegram 对单频道的发送限速约 20 条/分钟，3s/条（≤20 条/分钟）
+	// 可稳定限内；原 1s 间隔是大批首刷持续撞 429 的直接原因
+	sendInterval = 3 * time.Second
+
+	maxSendRetries  = 3               // 普通错误的总尝试次数（含首次），维持原语义
+	maxFloodRetries = 5               // 429 flood 独立重试上限，不消耗普通配额
+	maxFloodWait    = 2 * time.Minute // 单次 flood 等待上限，防服务端异常值（如数小时）拖死 goroutine
+)
+
+// sendWithRetry 带重试发送单条消息，返回是否成功。
+//
+// [issue #6] 双计数设计：普通错误走指数退避，总共 maxSendRetries 次尝试；
+// 429 限速识别 RateLimitError 后按服务端 retry_after 指示等待再重试——
+// 服务端明确告知何时可重试，固定指数退避（1s/2s/4s）必然全部撞墙，因此
+// flood 等待不消耗普通配额、独立计数 maxFloodRetries 次防死循环。
+// 超限放弃返回 false（不标 seen，由下轮 check 补推，与原失败语义一致）
+func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
+	for attempt, floodCount := 0, 0; ; {
+		err := h.bot.Send(channel, message)
+		if err == nil {
+			log.Printf("Successfully sent message to channel %s: %s", channel, itemTitle)
+			return true
+		}
+
+		var rlErr *telegram.RateLimitError
+		if errors.As(err, &rlErr) {
+			floodCount++
+			if floodCount > maxFloodRetries {
+				log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
+				return false
+			}
+			wait := rlErr.RetryAfter + time.Second // +1s 缓冲，避免卡点重试再次撞限
+			if wait > maxFloodWait {
+				wait = maxFloodWait
+			}
+			log.Printf("Rate limited sending item '%s' to channel %s (flood retry %d/%d), waiting %v: %v", itemTitle, channel, floodCount, maxFloodRetries, wait, err)
+			h.sleep(wait)
+			continue
+		}
+
+		attempt++
+		if attempt >= maxSendRetries {
+			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
+			return false
+		}
+		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
+		h.ExponentialBackoffWithJitter(attempt - 1)
+	}
+}
+
 // 指数退避+随机抖动
 func (h *RssHandler) ExponentialBackoffWithJitter(attempt int) {
 	base := time.Second
 	maxJitter := 500 * time.Millisecond                    // 最大抖动 500毫秒
 	delay := base * time.Duration(1<<attempt)              // 指数退避。1<<attempt表示attemp的2次幂
 	jitter := time.Duration(rand.Int63n(int64(maxJitter))) // 随机抖动
-	time.Sleep(delay + jitter)
+	h.sleep(delay + jitter)                                // 走可注入 sleep，测试免真睡
 }
 
 // 格式化消息
