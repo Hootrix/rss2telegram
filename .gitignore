@@ -1,5 +1,4 @@
 **.bloom
 config/*.yaml
-# 本地设计文档/开发笔记不入库（公开仓库）
 docs/
 CLAUDE.md
