@@ -15,6 +15,7 @@ import (
 
 	"github.com/Hootrix/rss2telegram/internal/config"
 	"github.com/Hootrix/rss2telegram/internal/storage"
+	"github.com/Hootrix/rss2telegram/internal/tgmd"
 	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/mmcdole/gofeed"
 )
@@ -324,7 +325,11 @@ func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
 		basefield := strings.SplitN(field, "|", 2)[0]
 		switch basefield {
 		case "title":
-			content = item.Title
+			// title 是纯文本数据，不经 HTML→Markdown converter，需在此转义 legacy
+			// Markdown 特殊字符，否则裸 * [ 等会触发 Telegram 400 (issue #4)
+			// 转义在操作链之前：用户在操作参数里手写的 Markdown 不受影响；
+			// 代价是 extract/replace 的正则匹配的是转义后文本（如 3*4 → 3\*4）
+			content = tgmd.Escape(item.Title)
 		case "description":
 			if item.Description != "" {
 				// 将 HTML 转换为 Markdown

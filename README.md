@@ -84,6 +84,11 @@ $ docker logs -f rss2telegram
   - 使用 `|` 分隔多个操作符
   - 操作符参数使用 `:` 分隔
   - 支持链式操作，例如：`{field|op1:param1|op2:param2}`
+- **Markdown 转义注意** (issue #4):
+  - `{title}` 的内容会自动转义 Telegram Markdown 特殊字符（`_` `` ` `` `*` `[` 前加 `\`），防止标题含裸 `*`/`[` 时 Telegram 拒收 400；模板里手写的 Markdown 语法不受影响
+  - 因此 `extract`/`extract-all`/`replace` 的正则匹配的是**转义后**的 title 文本：原文 `3*4` 已变为 `3\*4`，存量配置中针对这些字符的匹配规则需相应调整（如用 `[*]` 匹配星号）
+  - 不要把 `{title}` 放进 URL 位置（如 `[x]({link}?q={title})`）：转义产生的 `\` 会进入 URL 导致坏链
+  - Markdown 解析仍失败时（如 description 含裸特殊字符），将自动降级为纯文本重发一次，保证消息送达
 
 ### 文章处理机制
 - **文章过期时间**: 默认 30 天，超过此时间的文章将被自动过滤
