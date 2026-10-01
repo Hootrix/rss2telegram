@@ -131,6 +131,7 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 	// 处理新项目
 	var newItems []*gofeed.Item
 	seenInThisRun := make(map[string]bool)
+	skippedSeen := 0 // 已推送过被去重跳过的文章数，聚合进 finish 日志（替代原逐条打印）
 
 	isFirstRun := true // 用于判断是否是第一次运行
 	for _, channel := range feedConfig.Channels {
@@ -179,7 +180,11 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 			}
 		}
 		if allChannelsProcessed {
-			log.Printf("Item already processed by all channels: %s", item.Title)
+			// [日志降噪] 原逐条打印已推送文章的日志删除：稳态下每轮检查会对全部存量文章
+			// 各刷一行（380 条的 feed 每轮 ~380 行），淹没真正有用的日志；
+			// 改为 skippedSeen 聚合计数，在 processFeed finish 中汇总输出。原日志注释保留：
+			// log.Printf("Item already processed by all channels: %s", item.Title)
+			skippedSeen++
 			continue
 		}
 
@@ -286,7 +291,7 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 
 	wg.Wait() // 等待所有 goroutine 完成
 
-	log.Printf("processFeed finish. name:%s, processed %d new items", feedConfig.Name, len(newItems))
+	log.Printf("processFeed finish. name:%s, processed %d new items, skipped %d already-seen", feedConfig.Name, len(newItems), skippedSeen)
 	return nil
 }
 
