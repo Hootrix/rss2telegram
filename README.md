@@ -39,6 +39,9 @@ $ docker logs -f rss2telegram
 
 ```
 
+> **⚠️ 挂载注意事项**：请始终挂载**目录**（如上例 `-v $(pwd)/rss2telegram-config:/app/config`），不要挂载单个配置文件（如 `-v config.yaml:/app/config/config.yaml`）。
+> 单文件挂载会把 inode 钉死，宿主机上编辑器保存（临时文件 + rename 覆盖）后容器内看到的仍是旧文件，配置热更新会完全失效。
+
 也可以手动下载`releases`页面提供的最新版本二进制程序
 
 
@@ -96,3 +99,12 @@ $ docker logs -f rss2telegram
 ## 许可证
 
 MIT License
+
+
+
+# TODO
+
+case:apple频道
+
+
+
