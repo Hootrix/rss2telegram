@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
@@ -94,9 +96,11 @@ type Manager struct {
 }
 
 // NewManager 创建新的配置管理器
-func NewManager(filepath string) (*Manager, error) {
+// [issue#3] 参数名由 filepath 改为 configPath：原参数名遮蔽了 path/filepath 包，
+// 监听目录需要调用 filepath.Dir，遮蔽时无法引用包
+func NewManager(configPath string) (*Manager, error) {
 	m := &Manager{
-		filepath:  filepath,
+		filepath:  configPath,
 		callbacks: make([]func(*Config), 0),
 	}
 
@@ -112,14 +116,22 @@ func NewManager(filepath string) (*Manager, error) {
 	}
 	m.watcher = watcher
 
-	// 启动监控协程
-	go m.watchConfig()
-
-	// 添加文件监控
-	if err := watcher.Add(filepath); err != nil {
+	// [issue#3] 改为监听配置文件所在目录而非文件本身
+	// 原因：watcher.Add(文件) 监听的是 inode，而编辑器（vim/vscode 等）保存普遍采用
+	// "写临时文件 + rename 覆盖"，rename 后 inode 替换，旧 inode 上永远收不到事件，
+	// 表现为配置热更新完全失效（只能重启进程）。监听目录 + 按文件名过滤事件则不受 inode 替换影响
+	// 旧逻辑（监听文件本身）注释保留：
+	// if err := watcher.Add(configPath); err != nil {
+	// 	watcher.Close()
+	// 	return nil, err
+	// }
+	if err := watcher.Add(filepath.Dir(configPath)); err != nil {
 		watcher.Close()
 		return nil, err
 	}
+
+	// 启动监控协程
+	go m.watchConfig()
 
 	return m, nil
 }
@@ -171,17 +183,56 @@ func (m *Manager) OnConfigChange(callback func(*Config)) {
 }
 
 // watchConfig 监控配置文件变化
+// [issue#3] 配套 NewManager 改为监听目录后的重写版本：
+// - 按文件名过滤目录事件（忽略同目录其他文件，如编辑器临时文件）
+// - 事件类型扩展为 Write|Create|Rename：编辑器原子保存（tmp+rename 覆盖）在目录监听下
+//   表现为 Create（新 inode 落地），原实现只认 Write 会漏掉这种保存方式
+// - 增加去抖：一次保存可能连续产生多个事件（如 Create+Write），合并为一次重载
+// 旧逻辑（监听文件本身、只处理 Write）注释保留：
+// func (m *Manager) watchConfig() {
+// 	for {
+// 		select {
+// 		case event, ok := <-m.watcher.Events:
+// 			if !ok {
+// 				return
+// 			}
+// 			if event.Op&fsnotify.Write == fsnotify.Write {
+// 				if err := m.Load(); err != nil {
+// 					log.Printf("Config Reload Error: %v", err)
+// 				}
+// 			}
+// 		case err, ok := <-m.watcher.Errors:
+// 			if !ok {
+// 				return
+// 			}
+// 			log.Printf("Config Monitor Error: %v", err)
+// 		}
+// 	}
+// }
 func (m *Manager) watchConfig() {
+	target := filepath.Base(m.filepath)
+	var debounce *time.Timer
+
 	for {
 		select {
 		case event, ok := <-m.watcher.Events:
 			if !ok {
 				return
 			}
-			if event.Op&fsnotify.Write == fsnotify.Write {
-				if err := m.Load(); err != nil {
-					log.Printf("Config Reload Error: %v", err)
+			// 只处理目标配置文件的事件，忽略同目录其他文件
+			if filepath.Base(event.Name) != target {
+				continue
+			}
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+				// 去抖：重置定时器，静默 200ms 后才真正重载（Load 幂等，偶发重复无害）
+				if debounce != nil {
+					debounce.Stop()
 				}
+				debounce = time.AfterFunc(200*time.Millisecond, func() {
+					if err := m.Load(); err != nil {
+						log.Printf("Config Reload Error: %v", err)
+					}
+				})
 			}
 		case err, ok := <-m.watcher.Errors:
 			if !ok {
