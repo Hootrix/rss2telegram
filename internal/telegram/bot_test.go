@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -131,11 +132,11 @@ func TestSendFallsBackToPlainTextOnParseEntitiesError(t *testing.T) {
 	defer fake.server.Close()
 	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
 
-	bot, err := NewBot("1:test")
+	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
 	// 消息含 Escape 产物（title 转义后），降级纯文本时应被反转义
-	err = bot.Send("@it_test", `\[特惠产品]天幕 3\*4.35米`)
+	err = bot.Send(context.Background(), "@it_test", NewMessage(`\[特惠产品]天幕 3\*4.35米`))
 	assert.NoError(t, err)
 
 	sends := fake.sends_()
@@ -155,10 +156,10 @@ func TestSendMarkdownSuccessSingleRequest(t *testing.T) {
 	defer fake.server.Close()
 	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
 
-	bot, err := NewBot("1:test")
+	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send("@it_test", "*正常*消息")
+	err = bot.Send(context.Background(), "@it_test", NewMessage("*正常*消息"))
 	assert.NoError(t, err)
 
 	sends := fake.sends_()
@@ -174,10 +175,10 @@ func TestSendFlood429ReturnsRateLimitErrorWithoutGetChat(t *testing.T) {
 	defer fake.server.Close()
 	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
 
-	bot, err := NewBot("1:test")
+	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send("@it_test", "hello")
+	err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
 	require.Error(t, err)
 
 	var rlErr *RateLimitError
@@ -205,10 +206,10 @@ func TestSendFlood429WithoutRetryAfterStaysPlainError(t *testing.T) {
 	defer fake.server.Close()
 	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
 
-	bot, err := NewBot("1:test")
+	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send("@it_test", "hello")
+	err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
 	require.Error(t, err)
 
 	var rlErr *RateLimitError
@@ -222,10 +223,10 @@ func TestSendEmptyChannelFailsFast(t *testing.T) {
 	defer fake.server.Close()
 	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
 
-	bot, err := NewBot("1:test")
+	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send("", "hello")
+	err = bot.Send(context.Background(), "", NewMessage("hello"))
 	require.Error(t, err)
 
 	assert.Empty(t, fake.sends_(), "空 channel 不应发起 sendMessage")
@@ -275,10 +276,10 @@ func TestSendFloodRetryAfterValidation(t *testing.T) {
 			fake.floodRetryAfter = tc.seconds
 			fake.mu.Unlock()
 			t.Setenv("TELEGRAM_API_URL", fake.server.URL)
-			bot, err := NewBot("1:test")
+			bot, err := NewBot(context.Background(), "1:test")
 			require.NoError(t, err)
 
-			err = bot.Send("@it_test", "hello")
+			err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
 			require.Error(t, err)
 			var rlErr *RateLimitError
 			assert.Equal(t, tc.wantRateLimit, errors.As(err, &rlErr))
@@ -300,10 +301,10 @@ func TestSendPlainTextFallbackPreservesRateLimitError(t *testing.T) {
 	fake.flood429 = true
 	fake.mu.Unlock()
 	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
-	bot, err := NewBot("1:test")
+	bot, err := NewBot(context.Background(), "1:test")
 	require.NoError(t, err)
 
-	err = bot.Send("@it_test", `\[标题]`)
+	err = bot.Send(context.Background(), "@it_test", NewMessage(`\[标题]`))
 	var rlErr *RateLimitError
 	require.True(t, errors.As(err, &rlErr))
 	assert.Equal(t, 21*time.Second, rlErr.RetryAfter)
@@ -311,6 +312,140 @@ func TestSendPlainTextFallbackPreservesRateLimitError(t *testing.T) {
 	require.Len(t, sends, 2)
 	assert.Equal(t, "Markdown", sends[0]["parse_mode"])
 	assert.NotContains(t, sends[1], "parse_mode")
+}
+
+func TestSendRetryKeepsPlainTextFallback(t *testing.T) {
+	fake := newFakeTG(true)
+	defer fake.server.Close()
+	fake.mu.Lock()
+	fake.flood429 = true
+	fake.mu.Unlock()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	// require.Error(t, bot.Send("@it_test", `\[标题]`))
+	// require.Error(t, bot.Send("@it_test", `\[标题]`))
+	message := NewMessage(`\[标题]`)
+	require.Error(t, bot.Send(context.Background(), "@it_test", message))
+	require.Error(t, bot.Send(context.Background(), "@it_test", message))
+	sends := fake.sends_()
+	require.Len(t, sends, 3)
+	assert.Equal(t, "Markdown", sends[0]["parse_mode"])
+	assert.NotContains(t, sends[1], "parse_mode")
+	assert.NotContains(t, sends[2], "parse_mode", "同一消息已降级，重试不得再发送 Markdown")
+}
+
+func TestSendContextCancelsInFlightRequest(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/getMe") {
+			writeFakeJSON(w, map[string]any{"ok": true, "result": map[string]any{"id": 1, "is_bot": true}})
+			return
+		}
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	t.Setenv("TELEGRAM_API_URL", server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- bot.Send(ctx, "@ch", NewMessage("hello")) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求未启动")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.NotContains(t, err.Error(), "1:test", "请求错误不得暴露 bot token")
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消未中断 HTTP 请求")
+	}
+}
+
+func TestSendDeadlineCancelsResponseBodyRead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/getMe") {
+			writeFakeJSON(w, map[string]any{"ok": true, "result": map[string]any{"id": 1, "is_bot": true}})
+			return
+		}
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		if _, err := io.WriteString(w, `{"ok":`); err != nil {
+			t.Errorf("write response: %v", err)
+			return
+		}
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	t.Setenv("TELEGRAM_API_URL", server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = bot.Send(ctx, "@ch", NewMessage("hello"))
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.NotContains(t, err.Error(), "1:test")
+}
+
+func TestNewBotContextCancelsInitialization(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	t.Setenv("TELEGRAM_API_URL", server.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewBot(ctx, "1:test")
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("getMe 请求未启动")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.NotContains(t, err.Error(), "1:test")
+	case <-time.After(5 * time.Second):
+		t.Fatal("初始化请求未响应取消")
+	}
+}
+
+func TestNewRateLimitErrorValidatesSeconds(t *testing.T) {
+	for _, seconds := range []int64{0, -1, 9_223_372_036, 9_223_372_037} {
+		t.Run(fmt.Sprint(seconds), func(t *testing.T) {
+			cause := errors.New("429")
+			err := NewRateLimitError(seconds, cause)
+			var rate *RateLimitError
+			assert.False(t, errors.As(err, &rate))
+			assert.ErrorIs(t, err, cause)
+			assert.ErrorContains(t, err, "invalid retry_after")
+		})
+	}
 }
 
 func TestChannelKey(t *testing.T) {

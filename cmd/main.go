@@ -24,18 +24,23 @@ func main() {
 	configPath := flag.String("config", "config/config.yaml", "path to configuration file")
 	flag.Parse()
 
-	// 创建上下文，用于优雅退出
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	/*
+		// 创建上下文，用于优雅退出
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	// 处理系统信号
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal: %v", sig)
-		cancel()
-	}()
+		// 处理系统信号
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			sig := <-sigChan
+			log.Printf("Received signal: %v", sig)
+			cancel()
+		}()
+	*/
+	// 取消贯穿整轮检查、退避和请求，不再等 ProcessFeeds 同步阻塞结束后才响应退出
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
 	// 使用文件监听 读取配置文件。
 	// 内容变化后自动应用最新配置
@@ -59,8 +64,12 @@ func main() {
 	}
 
 	// 创建 Telegram 机器人
-	bot, err := telegram.NewBot(cfg.Telegram.BotToken)
+	// bot, err := telegram.NewBot(cfg.Telegram.BotToken)
+	bot, err := telegram.NewBot(ctx, cfg.Telegram.BotToken)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		log.Fatalf("Error creating Telegram bot: %v", err)
 	}
 
@@ -88,10 +97,21 @@ func main() {
 			log.Printf("Shutting down... (uptime: %v)", time.Since(startTime))
 			return
 		case <-ticker.C:
-			if err := rssHandler.ProcessFeeds(); err != nil {
+			// if err := rssHandler.ProcessFeeds(); err != nil {
+			if err := rssHandler.ProcessFeeds(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				log.Printf("Error processing feeds: %v", err)
 				// 如果发生错误，等待一段时间再继续
-				time.Sleep(time.Second * 5)
+				// time.Sleep(time.Second * 5)
+				timer := time.NewTimer(5 * time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 			}
 		}
 	}
