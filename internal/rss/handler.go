@@ -24,25 +24,42 @@ import (
 
 type RssHandler struct {
 	sync.RWMutex
-	parser  *gofeed.Parser
-	config  *config.Config
-	bot     TelegramBot
-	storage *storage.Storage
-	sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
+	parser     *gofeed.Parser
+	config     *config.Config
+	bot        TelegramBot
+	storage    *storage.Storage
+	sleepFn    func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
+	nowFn      func() time.Time
+	sendMu     sync.Mutex
+	sendStates map[string]*channelSendState
 }
 
 type TelegramBot interface {
 	Send(channel string, message string) error
 }
 
+type channelSendState struct {
+	sync.Mutex
+	nextSend time.Time
+}
+
 func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) *RssHandler {
 	return &RssHandler{
-		parser:  gofeed.NewParser(),
-		config:  cfg,
-		bot:     bot,
-		storage: store,
-		sleepFn: time.Sleep,
+		parser:     gofeed.NewParser(),
+		config:     cfg,
+		bot:        bot,
+		storage:    store,
+		sleepFn:    time.Sleep,
+		nowFn:      time.Now,
+		sendStates: make(map[string]*channelSendState),
 	}
+}
+
+func (h *RssHandler) now() time.Time {
+	if h.nowFn != nil {
+		return h.nowFn()
+	}
+	return time.Now()
 }
 
 // sleep 统一走可注入的 sleepFn，nil 安全（直接字面量构造的 handler 如模板测试）
@@ -317,9 +334,11 @@ const (
 	// 可稳定限内；原 1s 间隔是大批首刷持续撞 429 的直接原因
 	sendInterval = 3 * time.Second
 
-	maxSendRetries  = 3               // 普通错误的总尝试次数（含首次），维持原语义
-	maxFloodRetries = 5               // 429 flood 独立重试上限，不消耗普通配额
-	maxFloodWait    = 2 * time.Minute // 单次 flood 等待上限，防服务端异常值（如数小时）拖死 goroutine
+	maxSendRetries  = 3 // 普通错误的总尝试次数（含首次），维持原语义
+	maxFloodRetries = 5 // 429 flood 独立重试上限，不消耗普通配额
+	// 旧说明保留：该上限只控制单次阻塞，不得截短合法的服务端冷却
+	// maxFloodWait = 2 * time.Minute // 单次 flood 等待上限，防服务端异常值（如数小时）拖死 goroutine
+	maxFloodWait = 2 * time.Minute
 )
 
 // sendWithRetry 带重试发送单条消息，返回是否成功。
@@ -329,6 +348,7 @@ const (
 // 服务端明确告知何时可重试，固定指数退避（1s/2s/4s）必然全部撞墙，因此
 // flood 等待不消耗普通配额、独立计数 maxFloodRetries 次防死循环。
 // 超限放弃返回 false（不标 seen，由下轮 check 补推，与原失败语义一致）
+/*
 func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
 	for attempt, floodCount := 0, 0; ; {
 		err := h.bot.Send(channel, message)
@@ -361,6 +381,88 @@ func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
 		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
 		h.ExponentialBackoffWithJitter(attempt - 1)
 	}
+}
+*/
+
+func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
+	state := h.channelState(channel)
+	state.Lock()
+	defer state.Unlock()
+
+	for attempt, floodCount := 0, 0; ; {
+		if !h.waitForSend(state, channel, itemTitle) {
+			return false
+		}
+		err := h.bot.Send(channel, message)
+		if err == nil {
+			state.nextSend = h.now().Add(sendInterval)
+			log.Printf("Successfully sent message to channel %s: %s", channel, itemTitle)
+			return true
+		}
+
+		var rlErr *telegram.RateLimitError
+		if errors.As(err, &rlErr) {
+			floodCount++
+			if !h.setFloodCooldown(state, rlErr, floodCount, channel, itemTitle) {
+				return false
+			}
+			continue
+		}
+
+		attempt++
+		if attempt >= maxSendRetries {
+			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
+			return false
+		}
+		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
+		h.ExponentialBackoffWithJitter(attempt - 1)
+	}
+}
+
+// 不同 feed 和检查轮次共享同一归一化频道的状态，feed 局部信号量无法保证频道限速
+func (h *RssHandler) channelState(channel string) *channelSendState {
+	key := telegram.ChannelKey(channel)
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	if h.sendStates == nil {
+		h.sendStates = make(map[string]*channelSendState)
+	}
+	state := h.sendStates[key]
+	if state == nil {
+		state = &channelSendState{}
+		h.sendStates[key] = state
+	}
+	return state
+}
+
+func (h *RssHandler) waitForSend(state *channelSendState, channel, itemTitle string) bool {
+	wait := state.nextSend.Sub(h.now())
+	if wait <= 0 {
+		return true
+	}
+	// 超过阻塞预算只延后处理，保留完整截止时间，不得在服务端冷却期内重发
+	if wait > maxFloodWait {
+		log.Printf("Deferring item '%s' to channel %s, cooldown remaining %v", itemTitle, channel, wait)
+		return false
+	}
+	h.sleep(wait)
+	return true
+}
+
+// 先保存完整冷却再检查重试上限，避免放弃上一条消息后立即发送下一条
+func (h *RssHandler) setFloodCooldown(state *channelSendState, err *telegram.RateLimitError, floodCount int, channel, itemTitle string) bool {
+	if err.RetryAfter <= 0 || err.RetryAfter > time.Duration(1<<63-1)-time.Second {
+		log.Printf("Invalid retry_after for item '%s' to channel %s: %v", itemTitle, channel, err)
+		return false
+	}
+	wait := err.RetryAfter + time.Second
+	state.nextSend = h.now().Add(wait)
+	if floodCount > maxFloodRetries {
+		log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
+		return false
+	}
+	log.Printf("Rate limited sending item '%s' to channel %s (flood retry %d/%d), cooldown %v: %v", itemTitle, channel, floodCount, maxFloodRetries, wait, err)
+	return true
 }
 
 // 指数退避+随机抖动

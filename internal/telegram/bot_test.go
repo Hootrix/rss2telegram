@@ -3,6 +3,7 @@ package telegram
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,17 +20,19 @@ import (
 // getChat、以及 sendMessage。所有 sendMessage 的原始 JSON body 被逐条记录，
 // 供断言降级行为（首次带 parse_mode 400 → 二次纯文本）
 type fakeTG struct {
-	mu          sync.Mutex
-	sends       []map[string]any // 每次 sendMessage 的 body
-	failFirst   bool             // 首次 sendMessage 返回 parse entities 400
-	flood429    bool             // 每次 sendMessage 返回 429 + retry_after（issue #6 线上报文形态）
-	floodNo429  bool             // 每次 sendMessage 返回 429 但无 retry_after 参数
-	getChatHits int              // getChat 被调用次数（issue #6 后应为 0）
-	server      *httptest.Server
+	mu              sync.Mutex
+	sends           []map[string]any // 每次 sendMessage 的 body
+	failFirst       bool             // 首次 sendMessage 返回 parse entities 400
+	flood429        bool             // 每次 sendMessage 返回 429 + retry_after（issue #6 线上报文形态）
+	floodNo429      bool             // 每次 sendMessage 返回 429 但无 retry_after 参数
+	floodRetryAfter int64
+	getChatHits     int // getChat 被调用次数（issue #6 后应为 0）
+	server          *httptest.Server
 }
 
 func newFakeTG(failFirst bool) *fakeTG {
-	f := &fakeTG{failFirst: failFirst}
+	// f := &fakeTG{failFirst: failFirst}
+	f := &fakeTG{failFirst: failFirst, floodRetryAfter: 21}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
@@ -61,13 +64,21 @@ func newFakeTG(failFirst bool) *fakeTG {
 			f.sends = append(f.sends, m)
 			flood429 := f.flood429
 			floodNo429 := f.floodNo429
+			retryAfter := f.floodRetryAfter
 			f.mu.Unlock()
 
 			// issue #6 线上 429 报文：带 retry_after 参数，telebot extractOk
 			// 对此返回 FloodError 值类型
-			if flood429 {
+			// if flood429 {
+			if flood429 && (!f.failFirst || !first) {
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
-				_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 21","parameters":{"retry_after":21}}`))
+				// _, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 21","parameters":{"retry_after":21}}`))
+				writeFakeJSON(w, map[string]any{
+					"ok": false, "error_code": 429,
+					"description": fmt.Sprintf("Too Many Requests: retry after %d", retryAfter),
+					"parameters":  map[string]any{"retry_after": retryAfter},
+				})
 				return
 			}
 			if floodNo429 {
@@ -231,11 +242,92 @@ func TestNewChannelRecipient(t *testing.T) {
 	}{
 		{"@channel", "@channel"},
 		{"bare_name", "@bare_name"},
+		{"123feed", "@123feed"},
+		{"1_Channel", "@1_Channel"},
 		{"-1001234567890", "-1001234567890"},
 		{"123456", "123456"},
 		{"", ""},
 	}
 	for _, c := range cases {
 		assert.Equal(t, c.want, string(newChannelRecipient(c.in)), "input: %q", c.in)
+	}
+}
+
+func TestSendFloodRetryAfterValidation(t *testing.T) {
+	cases := []struct {
+		name          string
+		seconds       int64
+		wantRateLimit bool
+	}{
+		{"long_valid_wait", 300, true},
+		{"zero", 0, false},
+		{"negative", -1, false},
+		{"buffer_overflow", 9_223_372_036, false},
+		{"duration_overflow", 9_223_372_037, false},
+		{"integer_overflow", 1<<63 - 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeTG(false)
+			defer fake.server.Close()
+			fake.mu.Lock()
+			fake.flood429 = true
+			fake.floodRetryAfter = tc.seconds
+			fake.mu.Unlock()
+			t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+			bot, err := NewBot("1:test")
+			require.NoError(t, err)
+
+			err = bot.Send("@it_test", "hello")
+			require.Error(t, err)
+			var rlErr *RateLimitError
+			assert.Equal(t, tc.wantRateLimit, errors.As(err, &rlErr))
+			if tc.wantRateLimit {
+				require.NotNil(t, rlErr)
+				assert.Equal(t, time.Duration(tc.seconds)*time.Second, rlErr.RetryAfter)
+			} else {
+				assert.ErrorContains(t, err, "invalid retry_after")
+			}
+			assert.Len(t, fake.sends_(), 1)
+		})
+	}
+}
+
+func TestSendPlainTextFallbackPreservesRateLimitError(t *testing.T) {
+	fake := newFakeTG(true)
+	defer fake.server.Close()
+	fake.mu.Lock()
+	fake.flood429 = true
+	fake.mu.Unlock()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot("1:test")
+	require.NoError(t, err)
+
+	err = bot.Send("@it_test", `\[标题]`)
+	var rlErr *RateLimitError
+	require.True(t, errors.As(err, &rlErr))
+	assert.Equal(t, 21*time.Second, rlErr.RetryAfter)
+	sends := fake.sends_()
+	require.Len(t, sends, 2)
+	assert.Equal(t, "Markdown", sends[0]["parse_mode"])
+	assert.NotContains(t, sends[1], "parse_mode")
+}
+
+func TestChannelKey(t *testing.T) {
+	cases := []struct {
+		channel, want string
+	}{
+		{"@Channel", "@channel"},
+		{"CHANNEL", "@channel"},
+		{"123Feed", "@123feed"},
+		{"@123Feed", "@123feed"},
+		{"@channel", "@channel"},
+		{"-1001234567890", "-1001234567890"},
+		{"123456", "123456"},
+		{"@123456", "@123456"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, ChannelKey(tc.channel), "channel: %q", tc.channel)
 	}
 }

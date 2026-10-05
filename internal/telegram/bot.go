@@ -45,10 +45,23 @@ func (r channelRecipient) Recipient() string { return string(r) }
 // newChannelRecipient 归一化频道标识：@name 原样透传；裸名补 @；
 // 数字/负数 ID（-100...）原样透传
 func newChannelRecipient(channel string) channelRecipient {
-	if channel == "" || channel[0] == '@' || channel[0] == '-' || (channel[0] >= '0' && channel[0] <= '9') {
+	// 首字符不足以判断整数 ID，数字开头的非整数裸名也必须补 @；旧判断保留
+	// if channel == "" || channel[0] == '@' || channel[0] == '-' || (channel[0] >= '0' && channel[0] <= '9') {
+	// 	return channelRecipient(channel)
+	// }
+	if channel == "" || channel[0] == '@' {
+		return channelRecipient(channel)
+	}
+	id := strings.TrimPrefix(channel, "-")
+	if id != "" && strings.IndexFunc(id, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
 		return channelRecipient(channel)
 	}
 	return channelRecipient("@" + channel)
+}
+
+// ChannelKey 归一化频道标识，使裸名、@ 前缀和大小写别名共享限流状态
+func ChannelKey(channel string) string {
+	return strings.ToLower(string(newChannelRecipient(channel)))
 }
 
 func NewBot(token string) (*Bot, error) {
@@ -105,6 +118,11 @@ func (b *Bot) Send(channel string, message string) error {
 		// tele.FloodError；包装成项目内 RateLimitError 供上层按指示等待
 		var flood tele.FloodError
 		if errors.As(err, &flood) {
+			// 秒转 Duration 前验证符号和范围，并为上层 +1s 缓冲预留空间，防止负等待或溢出
+			const maxRetryAfterSeconds = (time.Duration(1<<63-1) - time.Second) / time.Second
+			if flood.RetryAfter <= 0 || int64(flood.RetryAfter) > int64(maxRetryAfterSeconds) {
+				return fmt.Errorf("telegram: invalid retry_after %d: %w", flood.RetryAfter, err)
+			}
 			return NewRateLimitError(time.Duration(flood.RetryAfter)*time.Second, err)
 		}
 	}

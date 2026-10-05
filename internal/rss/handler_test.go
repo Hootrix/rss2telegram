@@ -3,10 +3,14 @@ package rss
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Hootrix/rss2telegram/internal/config"
+	"github.com/Hootrix/rss2telegram/internal/storage"
 	"github.com/Hootrix/rss2telegram/internal/telegram"
 	"github.com/mmcdole/gofeed"
 	"github.com/stretchr/testify/assert"
@@ -90,8 +94,23 @@ func rateErr(seconds int) *telegram.RateLimitError {
 }
 
 func newRetryTestHandler(bot *scriptBot) *RssHandler {
+	// h := &RssHandler{bot: bot}
+	// h.sleepFn = bot.recordSleep
+	// return h
+	var mu sync.Mutex
+	now := time.Unix(0, 0)
 	h := &RssHandler{bot: bot}
-	h.sleepFn = bot.recordSleep
+	h.nowFn = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	h.sleepFn = func(d time.Duration) {
+		bot.recordSleep(d)
+		mu.Lock()
+		now = now.Add(d)
+		mu.Unlock()
+	}
 	return h
 }
 
@@ -131,17 +150,120 @@ func TestSendWithRetryFloodRetryExhaustion(t *testing.T) {
 	assert.Len(t, sleeps, 5, "放弃的那次不应再 sleep")
 }
 
+// 旧测试预期保留：截短合法的服务端冷却会提前重发，长等待应延后频道处理
 // 边界：retry_after 超过 120s 上限时等待被 cap，防服务端异常值拖死 goroutine
-func TestSendWithRetryFloodWaitCapped(t *testing.T) {
+//
+//	func TestSendWithRetryFloodWaitCapped(t *testing.T) {
+//		bot := &scriptBot{script: []error{rateErr(300), nil}}
+//		h := newRetryTestHandler(bot)
+//
+//		ok := h.sendWithRetry("@ch", "msg", "标题")
+//
+//		require.True(t, ok)
+//		_, sleeps := bot.snapshot()
+//		require.Len(t, sleeps, 1)
+//		assert.Equal(t, 120*time.Second, sleeps[0], "300s 应被 cap 到 120s")
+//	}
+func TestSendWithRetryLongFloodWaitDefersChannel(t *testing.T) {
 	bot := &scriptBot{script: []error{rateErr(300), nil}}
 	h := newRetryTestHandler(bot)
 
-	ok := h.sendWithRetry("@ch", "msg", "标题")
+	assert.False(t, h.sendWithRetry("@Channel", "msg", "标题"))
+	assert.False(t, h.sendWithRetry("channel", "next", "下一条"))
+	calls, sleeps := bot.snapshot()
+	assert.Equal(t, 1, calls, "冷却到期前同频道的其他消息也不得发送")
+	assert.Empty(t, sleeps, "超过阻塞预算应延后处理，不应截短等待")
 
-	require.True(t, ok)
-	_, sleeps := bot.snapshot()
-	require.Len(t, sleeps, 1)
-	assert.Equal(t, 120*time.Second, sleeps[0], "300s 应被 cap 到 120s")
+	assert.True(t, h.sendWithRetry("@other", "msg", "其他频道"))
+	calls, _ = bot.snapshot()
+	assert.Equal(t, 2, calls, "其他频道不应被阻塞")
+
+	originalNow := h.nowFn
+	h.nowFn = func() time.Time { return originalNow().Add(300 * time.Second) }
+	assert.True(t, h.sendWithRetry("@CHANNEL", "next", "冷却后补推"))
+	calls, sleeps = bot.snapshot()
+	assert.Equal(t, 3, calls)
+	assert.Equal(t, []time.Duration{time.Second}, sleeps, "300s 到期后仍须等完 1s 缓冲")
+}
+
+func TestSendWithRetrySharesChannelInterval(t *testing.T) {
+	bot := &scriptBot{script: []error{nil}}
+	h := newRetryTestHandler(bot)
+	start := make(chan struct{})
+	results := make(chan bool, 2)
+	for _, channel := range []string{"@Channel", "channel"} {
+		go func(channel string) {
+			<-start
+			results <- h.sendWithRetry(channel, "msg", "标题")
+		}(channel)
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		select {
+		case ok := <-results:
+			require.True(t, ok)
+		case <-time.After(5 * time.Second):
+			t.Fatal("同频道发送未完成")
+		}
+	}
+
+	calls, sleeps := bot.snapshot()
+	assert.Equal(t, 2, calls)
+	require.Len(t, sleeps, 1, "并发 feed 必须共享同频道的发送间隔")
+	// assert.Positive(t, sleeps[0])
+	// assert.LessOrEqual(t, sleeps[0], sendInterval)
+	assert.Equal(t, sendInterval, sleeps[0])
+}
+
+func TestSendWithRetrySharesDigitPrefixedChannel(t *testing.T) {
+	bot := &scriptBot{script: []error{nil}}
+	h := newRetryTestHandler(bot)
+
+	assert.True(t, h.sendWithRetry("123Feed", "msg", "标题"))
+	assert.True(t, h.sendWithRetry("@123feed", "next", "下一条"))
+	calls, sleeps := bot.snapshot()
+	assert.Equal(t, 2, calls)
+	assert.Equal(t, []time.Duration{sendInterval}, sleeps)
+}
+
+func TestSendWithRetryKeepsExhaustedFloodCooldown(t *testing.T) {
+	bot := &scriptBot{script: []error{
+		rateErr(1), rateErr(1), rateErr(1), rateErr(1), rateErr(1), rateErr(1), nil,
+	}}
+	h := newRetryTestHandler(bot)
+
+	assert.False(t, h.sendWithRetry("@ch", "msg", "标题"))
+	assert.True(t, h.sendWithRetry("@ch", "next", "下一条"))
+	calls, sleeps := bot.snapshot()
+	assert.Equal(t, 7, calls)
+	require.Len(t, sleeps, 6, "放弃上一条消息后，下一条仍须遵守最后一次 429 的冷却")
+	// assert.Positive(t, sleeps[5])
+	assert.Equal(t, 2*time.Second, sleeps[5])
+}
+
+func TestSendWithRetryRejectsInvalidFloodWait(t *testing.T) {
+	cases := []struct {
+		name string
+		wait time.Duration
+	}{
+		{"zero", 0},
+		{"negative", -time.Second},
+		{"buffer_overflow", time.Duration(1<<63-1) - time.Second + time.Nanosecond},
+		{"duration_overflow", time.Duration(1<<63 - 1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bot := &scriptBot{script: []error{
+				telegram.NewRateLimitError(tc.wait, errors.New("429")), nil,
+			}}
+			h := newRetryTestHandler(bot)
+
+			assert.False(t, h.sendWithRetry("@ch", "msg", "标题"))
+			calls, sleeps := bot.snapshot()
+			assert.Equal(t, 1, calls, "异常等待值应终止当前消息重试")
+			assert.Empty(t, sleeps, "不得 sleep 非正数或溢出的等待值")
+		})
+	}
 }
 
 // 对照组：普通错误维持原有语义——总共 3 次尝试后放弃，429 计数不受影响
@@ -180,4 +302,131 @@ func TestSendWithRetryMixedErrorsKeepSeparateQuotas(t *testing.T) {
 // issue #6 修复方向 2 的落地形式：发送间隔常量 ≥3s（Telegram 单频道约 20 条/分钟）
 func TestSendIntervalWithinChannelLimit(t *testing.T) {
 	assert.GreaterOrEqual(t, sendInterval, 3*time.Second, "发送间隔不得低于 3s")
+}
+
+func TestSendWithRetryFloodWaitBudgetBoundary(t *testing.T) {
+	cases := []struct {
+		name        string
+		wait        time.Duration
+		wantSuccess bool
+	}{
+		{"within_budget", maxFloodWait - time.Second, true},
+		{"over_budget", maxFloodWait - time.Second + time.Nanosecond, false},
+		{"largest_valid_duration", time.Duration(1<<63-1) - time.Second, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bot := &scriptBot{script: []error{
+				telegram.NewRateLimitError(tc.wait, errors.New("429")), nil,
+			}}
+			h := newRetryTestHandler(bot)
+
+			assert.Equal(t, tc.wantSuccess, h.sendWithRetry("@ch", "msg", "标题"))
+			calls, sleeps := bot.snapshot()
+			if tc.wantSuccess {
+				assert.Equal(t, 2, calls)
+				assert.Equal(t, []time.Duration{maxFloodWait}, sleeps)
+			} else {
+				assert.Equal(t, 1, calls)
+				assert.Empty(t, sleeps)
+			}
+		})
+	}
+}
+
+func TestSendWithRetryRecognizesWrappedRateLimitError(t *testing.T) {
+	bot := &scriptBot{script: []error{fmt.Errorf("send: %w", rateErr(1)), nil}}
+	h := newRetryTestHandler(bot)
+
+	assert.True(t, h.sendWithRetry("@ch", "msg", "标题"))
+	calls, sleeps := bot.snapshot()
+	assert.Equal(t, 2, calls)
+	assert.Equal(t, []time.Duration{2 * time.Second}, sleeps)
+}
+
+type sendTestFunc func(string, string) error
+
+func (f sendTestFunc) Send(channel, message string) error { return f(channel, message) }
+
+func TestSendWithRetryDifferentChannelsCanProceed(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan bool, 1)
+	h := &RssHandler{bot: sendTestFunc(func(channel, message string) error {
+		if channel == "@blocked" {
+			close(started)
+			<-release
+		}
+		return nil
+	})}
+	defer func() {
+		close(release)
+		select {
+		case ok := <-firstDone:
+			assert.True(t, ok)
+		case <-time.After(5 * time.Second):
+			t.Error("被阻塞的发送未退出")
+		}
+	}()
+	go func() { firstDone <- h.sendWithRetry("@blocked", "msg", "第一频道") }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("第一频道未开始发送")
+	}
+
+	secondDone := make(chan bool, 1)
+	go func() { secondDone <- h.sendWithRetry("@other", "msg", "其他频道") }()
+	select {
+	case ok := <-secondDone:
+		assert.True(t, ok)
+	case <-time.After(5 * time.Second):
+		t.Fatal("其他频道不应等待第一频道")
+	}
+}
+
+func TestProcessFeedsSharedChannelCooldown(t *testing.T) {
+	const feedXML = `<?xml version="1.0"?><rss version="2.0"><channel><title>test</title><link>https://example.com/</link><description>test</description><item><title>item</title><link>https://example.com/item</link><guid>item-1</guid></item></channel></rss>`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		if _, err := fmt.Fprint(w, feedXML); err != nil {
+			t.Errorf("write RSS: %v", err)
+		}
+	}))
+	defer server.Close()
+	store, err := storage.NewStorage(t.TempDir())
+	require.NoError(t, err)
+	cfg := &config.Config{Feeds: []config.FeedConfig{
+		{Name: "a", URL: server.URL + "/a", Channels: []string{"@Channel"}, FirstPush: true, Template: "{title}"},
+		{Name: "b", URL: server.URL + "/b", Channels: []string{"channel"}, FirstPush: true, Template: "{title}"},
+	}}
+	bot := &scriptBot{script: []error{rateErr(300), nil}}
+	h := newRetryTestHandler(bot)
+	h.config, h.storage = cfg, store
+	h.parser = gofeed.NewParser()
+	// 预初始化 gofeed 的惰性字段，隔离既有解析器竞态，只验证并发发送调度
+	h.parser.Client = server.Client()
+	h.parser.RSSTranslator = &gofeed.DefaultRSSTranslator{}
+
+	require.NoError(t, h.ProcessFeeds())
+	h.UpdateConfig(cfg)
+	require.NoError(t, h.ProcessFeeds())
+	calls, sleeps := bot.snapshot()
+	assert.Equal(t, 1, calls, "两个 feed、配置重载及下一轮检查共享同一冷却")
+	assert.Empty(t, sleeps)
+	for _, feed := range cfg.Feeds {
+		assert.False(t, store.IsItemSeen(feed.URL, feed.Name, feed.Channels[0], "item-1"))
+	}
+
+	originalNow := h.nowFn
+	h.nowFn = func() time.Time { return originalNow().Add(301 * time.Second) }
+	require.NoError(t, h.ProcessFeeds())
+	calls, _ = bot.snapshot()
+	assert.Equal(t, 3, calls, "完整冷却到期后两个 feed 都应补推")
+	for _, feed := range cfg.Feeds {
+		assert.True(t, store.IsItemSeen(feed.URL, feed.Name, feed.Channels[0], "item-1"))
+	}
+	require.NoError(t, h.ProcessFeeds())
+	calls, _ = bot.snapshot()
+	assert.Equal(t, 3, calls, "成功标记 seen 后不应重复推送")
 }
