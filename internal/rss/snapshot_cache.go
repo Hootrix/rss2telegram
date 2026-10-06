@@ -17,8 +17,8 @@ const (
 )
 
 type cacheEntry struct {
-	key      string
-	url      string
+	key       string
+	url       string
 	expiresAt time.Time
 }
 

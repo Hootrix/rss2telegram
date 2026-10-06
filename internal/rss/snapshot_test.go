@@ -161,7 +161,13 @@ func TestSnapshotAppliesHardLimits(t *testing.T) {
 	require.Len(t, pub.pages, 1)
 	page := pub.pages[0]
 
-	countRunes := func(s string) int { n := 0; for range s { n++ }; return n }
+	countRunes := func(s string) int {
+		n := 0
+		for range s {
+			n++
+		}
+		return n
+	}
 	assert.Equal(t, 256, countRunes(page.Title), "title 按 rune 截 256")
 	assert.Equal(t, 128, countRunes(page.AuthorName), "author_name 按 rune 截 128")
 

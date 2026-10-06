@@ -14,8 +14,8 @@ import (
 	"github.com/Hootrix/rss2telegram/internal/extractor"
 	"github.com/Hootrix/rss2telegram/internal/rss"
 	"github.com/Hootrix/rss2telegram/internal/storage"
-	"github.com/Hootrix/rss2telegram/internal/telegraph"
 	"github.com/Hootrix/rss2telegram/internal/telegram"
+	"github.com/Hootrix/rss2telegram/internal/telegraph"
 )
 
 func main() {
