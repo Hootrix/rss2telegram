@@ -31,11 +31,13 @@ type RssHandler struct {
 	bot     TelegramBot
 	storage *storage.Storage
 	// sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
-	waitFn        func(context.Context, time.Duration) error
-	nowFn         func() time.Time
-	sendMu        sync.Mutex
-	sendStates    map[string]*channelSendState
-	roundBudget   time.Duration
+	waitFn     func(context.Context, time.Duration) error
+	nowFn      func() time.Time
+	sendMu     sync.Mutex
+	sendStates map[string]*channelSendState
+	// roundBudget   time.Duration
+	// 整轮共享预算会让靠前的积压/挂起 feed 每轮耗尽 deadline，后续 feed 永远轮不到，改为每 feed 独立预算
+	feedBudget    time.Duration
 	messageBudget time.Duration
 }
 
@@ -64,9 +66,10 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) 
 		bot:     bot,
 		storage: store,
 		// sleepFn: time.Sleep,
-		nowFn:         time.Now,
-		sendStates:    make(map[string]*channelSendState),
-		roundBudget:   maxBlockingBudget,
+		nowFn:      time.Now,
+		sendStates: make(map[string]*channelSendState),
+		// roundBudget:   maxBlockingBudget,
+		feedBudget:    maxBlockingBudget,
 		messageBudget: maxBlockingBudget,
 	}
 }
@@ -174,9 +177,10 @@ func (h *RssHandler) ProcessFeeds() error {
 }
 */
 
-func (h *RssHandler) ProcessFeeds(parent context.Context) error {
-	ctx, cancel := context.WithTimeout(parent, blockingBudget(h.roundBudget))
-	defer cancel()
+// 整轮只继承退出取消；单 feed 的阻塞由各自的 feedBudget 约束，慢 feed 只占名额不吞掉其他 feed 的机会
+func (h *RssHandler) ProcessFeeds(ctx context.Context) error {
+	// ctx, cancel := context.WithTimeout(parent, blockingBudget(h.roundBudget))
+	// defer cancel()
 	h.RLock()
 	cfg := h.config
 	h.RUnlock()
@@ -191,7 +195,10 @@ func (h *RssHandler) ProcessFeeds(parent context.Context) error {
 		go func(feed config.FeedConfig) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
-			if err := h.processFeed(ctx, feed); err != nil {
+			feedCtx, cancel := context.WithTimeout(ctx, blockingBudget(h.feedBudget))
+			defer cancel()
+			// if err := h.processFeed(ctx, feed); err != nil {
+			if err := h.processFeed(feedCtx, feed); err != nil {
 				errChan <- fmt.Errorf("feed %s: %w", feed.Name, err)
 			}
 		}(feed)
@@ -445,7 +452,16 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 			continue
 		}
 		for _, channel := range feedConfig.Channels {
+			// if err := ctx.Err(); err != nil {
+			// 	return fmt.Errorf("send feed items: %w", err)
+			// }
+			// 发送阶段耗尽 feed 预算属于正常积压延后（剩余条目未标 seen，下轮补推），不上报为错误；
+			// 退出取消仍返回错误
 			if err := ctx.Err(); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("Feed %s budget exhausted, deferring remaining items to next check", feedConfig.Name)
+					return nil
+				}
 				return fmt.Errorf("send feed items: %w", err)
 			}
 			if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
@@ -565,6 +581,7 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 	defer cancel()
 	state := h.channelState(channel)
 	if !claimChannel(ctx, state) {
+		log.Printf("Deferring item '%s' to channel %s: channel busy or cancelled", itemTitle, channel)
 		return false
 	}
 	defer func() { <-state.gate }()
@@ -580,6 +597,8 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 			return true
 		}
 		if ctx.Err() != nil {
+			// 之前静默返回，线上无法区分退出/超时与真实失败
+			log.Printf("Deferring item '%s' to channel %s: %v", itemTitle, channel, ctx.Err())
 			return false
 		}
 		var rate *telegram.RateLimitError
@@ -587,6 +606,7 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 			h.setFloodCooldown(state, rate, channel, itemTitle)
 			floodCount++
 			if floodCount > maxFloodRetries {
+				log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
 				return false
 			}
 			continue
@@ -596,7 +616,9 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
 			return false
 		}
+		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
 		if !h.wait(ctx, backoffWithJitter(attempt-1), deadline) {
+			log.Printf("Deferring item '%s' to channel %s: backoff exceeds remaining budget or cancelled", itemTitle, channel)
 			return false
 		}
 	}
@@ -654,7 +676,12 @@ func (h *RssHandler) waitForSend(ctx context.Context, state *channelSendState, d
 		log.Printf("Deferring item '%s' to channel %s, cooldown remaining %v", itemTitle, channel, wait)
 		return false
 	}
-	return h.wait(ctx, wait, deadline)
+	// return h.wait(ctx, wait, deadline)
+	if !h.wait(ctx, wait, deadline) {
+		log.Printf("Deferring item '%s' to channel %s: cooldown %v exceeds remaining budget or cancelled", itemTitle, channel, wait)
+		return false
+	}
+	return true
 }
 
 // 先保存完整冷却再检查重试上限，避免放弃上一条消息后立即发送下一条

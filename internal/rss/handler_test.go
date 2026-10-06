@@ -464,7 +464,31 @@ func TestProcessFeedsTwoFloodedFeedsDoNotStarveThird(t *testing.T) {
 	assert.Equal(t, map[string]int{"@flood_a": 1, "@flood_b": 1, "@ready": 1}, calls)
 }
 
-func TestProcessFeedsDeadlineCancelsFetchAndQueuedFeed(t *testing.T) {
+// 旧预期保留：整轮共享预算会让排队的第三个 feed 被取消，即靠后 feed 被饿死，已改为每 feed 独立预算
+// func TestProcessFeedsDeadlineCancelsFetchAndQueuedFeed(t *testing.T) {
+// 	started := make(chan struct{}, 3)
+// 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// 		started <- struct{}{}
+// 		<-r.Context().Done()
+// 	}))
+// 	defer server.Close()
+// 	store, err := storage.NewStorage(t.TempDir())
+// 	require.NoError(t, err)
+// 	cfg := &config.Config{}
+// 	for i := 0; i < 3; i++ {
+// 		cfg.Feeds = append(cfg.Feeds, config.FeedConfig{
+// 			Name: fmt.Sprintf("f%d", i), URL: server.URL, Channels: []string{"@ch"}, FirstPush: true,
+// 		})
+// 	}
+// 	h := NewRssHandler(cfg, &scriptBot{script: []error{nil}}, store)
+// 	h.roundBudget = 100 * time.Millisecond
+// 	err = h.ProcessFeeds(context.Background())
+// 	assert.ErrorIs(t, err, context.DeadlineExceeded)
+// 	assert.LessOrEqual(t, len(started), 2, "第三个 feed 排队期间应被整轮预算取消")
+// }
+
+// 挂起的 RSS 源只耗尽自己的 feed 预算，排队的 feed 仍要被拉取；拉取超时仍上报为错误
+func TestProcessFeedsHangingFetchDoesNotStarveQueuedFeed(t *testing.T) {
 	started := make(chan struct{}, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started <- struct{}{}
@@ -480,10 +504,65 @@ func TestProcessFeedsDeadlineCancelsFetchAndQueuedFeed(t *testing.T) {
 		})
 	}
 	h := NewRssHandler(cfg, &scriptBot{script: []error{nil}}, store)
-	h.roundBudget = 100 * time.Millisecond
+	h.feedBudget = 100 * time.Millisecond
 	err = h.ProcessFeeds(context.Background())
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
-	assert.LessOrEqual(t, len(started), 2, "第三个 feed 排队期间应被整轮预算取消")
+	assert.Len(t, started, 3, "第三个 feed 不应因前两个挂起而被跳过")
+}
+
+// 发送阶段耗尽 feed 预算属于积压延后：不报错、不标 seen，且不影响排队中的其他 feed
+func TestProcessFeedsBacklogFeedsDoNotStarveLaterFeed(t *testing.T) {
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	bot := sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) error {
+		mu.Lock()
+		calls[channel]++
+		mu.Unlock()
+		if channel == "@ready" {
+			return nil
+		}
+		<-ctx.Done() // 模拟积压：发送一直占满 feed 预算
+		return ctx.Err()
+	})
+	h := newProcessTestHandler(t, []string{"@slow_a", "@slow_b", "@ready"}, bot)
+	h.feedBudget = 100 * time.Millisecond
+
+	require.NoError(t, h.ProcessFeeds(context.Background()), "积压延后不应上报为错误")
+	mu.Lock()
+	assert.Equal(t, map[string]int{"@slow_a": 1, "@slow_b": 1, "@ready": 1}, calls)
+	mu.Unlock()
+	cfg := h.config
+	assert.False(t, h.storage.IsItemSeen(cfg.Feeds[0].URL, cfg.Feeds[0].Name, "@slow_a", "item-1"))
+	assert.True(t, h.storage.IsItemSeen(cfg.Feeds[2].URL, cfg.Feeds[2].Name, "@ready", "item-1"))
+}
+
+func TestProcessFeedBudgetExhaustedDefersRemainingChannels(t *testing.T) {
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	bot := sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) error {
+		mu.Lock()
+		calls[channel]++
+		mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	h := newProcessTestHandler(t, []string{"@slow"}, bot)
+	feed := h.config.Feeds[0]
+	feed.Channels = []string{"@slow", "@next"}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	require.NoError(t, h.processFeed(ctx, feed))
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, map[string]int{"@slow": 1}, calls, "预算耗尽后剩余频道延后到下轮")
+}
+
+func TestProcessFeedsParentCancelReportsError(t *testing.T) {
+	h := newProcessTestHandler(t, []string{"@a"}, &scriptBot{script: []error{nil}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, h.ProcessFeeds(ctx), context.Canceled)
 }
 
 func newProcessTestHandler(t *testing.T, channels []string, bot TelegramBot) *RssHandler {

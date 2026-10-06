@@ -16,8 +16,11 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
+// 不再持有初始化用的 tele.Bot：其 client 绑定 NewBot 内已 cancel 的 ctx，后续误用必失败
 type Bot struct {
-	bot    *tele.Bot
+	// bot    *tele.Bot
+	token  string
+	url    string
 	client *http.Client
 }
 
@@ -114,7 +117,8 @@ func NewBot(parent context.Context, token string) (*Bot, error) {
 	}
 
 	// return &Bot{bot: b}, nil
-	return &Bot{bot: b, client: client}, nil
+	// return &Bot{bot: b, client: client}, nil
+	return &Bot{token: b.Token, url: b.URL, client: client}, nil
 }
 
 /*
@@ -209,7 +213,8 @@ func (b *Bot) contextualBot(ctx context.Context) (*tele.Bot, error) {
 	client.Timeout = 0
 	client.Transport = contextTransport{ctx: ctx, base: transport}
 	return tele.NewBot(tele.Settings{
-		Token: b.bot.Token, URL: b.bot.URL, Client: &client, Offline: true, Updates: 1,
+		// Token: b.bot.Token, URL: b.bot.URL, Client: &client, Offline: true, Updates: 1,
+		Token: b.token, URL: b.url, Client: &client, Offline: true, Updates: 1,
 	})
 }
 
@@ -229,7 +234,8 @@ func (b *Bot) sendError(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return fmt.Errorf("telegram send: %w", ctx.Err())
 	}
-	err = &maskedError{err: err, token: b.bot.Token}
+	// err = &maskedError{err: err, token: b.bot.Token}
+	err = &maskedError{err: err, token: b.token}
 	var flood tele.FloodError
 	if errors.As(err, &flood) {
 		return NewRateLimitError(int64(flood.RetryAfter), err)
