@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>smoke</title>
+    <link>https://example.com/</link>
+    <description>telegraph snapshot smoke</description>
+    <item>
+      <title>快照冒烟文章</title>
+      <link>http://127.0.0.1:18931/s/article.html</link>
+      <guid>smoke-1</guid>
+      <pubDate>Tue, 07 Oct 2026 08:00:00 +0800</pubDate>
+      <description>摘要</description>
+    </item>
+  </channel>
+</rss>
