@@ -11,11 +11,23 @@ feeds:
     channels:
       - "@test_push"
       - "@test_push2"
-    
+
     # 消息默认  为空则默认 {title}\n\n{link}
     template: |
       📰 *{title}*
-      
+
       {description}
-      
+
       🔗 [阅读原文]({link})
+
+  # 全文快照 feed：抓原文发布到 Telegraph，{telegraph} 为快照链接（失败降级为原文链接）
+  - name: "special-feed"
+    url: "https://example.com/rss"
+    channels:
+      - "@test_push"
+    snapshot: telegraph  # 可选，缺省不启用；其他值启动报错
+    template: |
+      📰 *{title}*
+
+      🔗 [快照]({telegraph})
+      🌐 [原文]({link})
