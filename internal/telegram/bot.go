@@ -33,6 +33,9 @@ type Message struct {
 
 func NewMessage(text string) *Message { return &Message{text: text} }
 
+// Text 只读访问原始消息文本，供跨包（rss 集成测试等）断言内容
+func (m *Message) Text() string { return m.text }
+
 // RateLimitError 表示 Telegram 429 限速，携带服务端指示的等待时长。
 // 独立成项目内类型：handler 层用 errors.As 识别即可，无需 import telebot
 type RateLimitError struct {

@@ -31,7 +31,7 @@ func TestFormatMessageTitleEscape(t *testing.T) {
 	}
 
 	t.Run("默认模板下 title 的 * 和 [ 被转义", func(t *testing.T) {
-		result := handler.formatMessage(item, "{title}\n\n{link}")
+		result := handler.formatMessage(item, "{title}\n\n{link}", "")
 		expected := `\[特惠产品]露营多挂点长方形庇护所天幕 3\*4.35米 FRESH & BLACK技术 XL ¥299.9 5折
 
 https://example.com/p/1`
@@ -41,7 +41,7 @@ https://example.com/p/1`
 	t.Run("模板手写的粗体语法保留，仅 title 值内特殊字符转义", func(t *testing.T) {
 		// 模板的包裹 * 不受影响；title 内的 * 转义后恰好不与包裹符错配
 		item2 := &gofeed.Item{Title: "[特惠产品]*CN Venum 拳击手套 ¥269.9"}
-		result := handler.formatMessage(item2, "*{title}*")
+		result := handler.formatMessage(item2, "*{title}*", "")
 		assert.Equal(t, `*\[特惠产品]\*CN Venum 拳击手套 ¥269.9*`, result)
 	})
 
@@ -49,7 +49,7 @@ https://example.com/p/1`
 		item3 := &gofeed.Item{
 			Description: "尺寸 3*4.35米 _型号_",
 		}
-		result := handler.formatMessage(item3, "{description}")
+		result := handler.formatMessage(item3, "{description}", "")
 		assert.Equal(t, "尺寸 3*4.35米 _型号_", result)
 	})
 }
@@ -480,7 +480,7 @@ func TestProcessFeedsTwoFloodedFeedsDoNotStarveThird(t *testing.T) {
 // 			Name: fmt.Sprintf("f%d", i), URL: server.URL, Channels: []string{"@ch"}, FirstPush: true,
 // 		})
 // 	}
-// 	h := NewRssHandler(cfg, &scriptBot{script: []error{nil}}, store)
+// 	h := NewRssHandler(cfg, &scriptBot{script: []error{nil}}, store, nil)
 // 	h.roundBudget = 100 * time.Millisecond
 // 	err = h.ProcessFeeds(context.Background())
 // 	assert.ErrorIs(t, err, context.DeadlineExceeded)
@@ -503,7 +503,7 @@ func TestProcessFeedsHangingFetchDoesNotStarveQueuedFeed(t *testing.T) {
 			Name: fmt.Sprintf("f%d", i), URL: server.URL, Channels: []string{"@ch"}, FirstPush: true,
 		})
 	}
-	h := NewRssHandler(cfg, &scriptBot{script: []error{nil}}, store)
+	h := NewRssHandler(cfg, &scriptBot{script: []error{nil}}, store, nil)
 	h.feedBudget = 100 * time.Millisecond
 	err = h.ProcessFeeds(context.Background())
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
@@ -583,7 +583,7 @@ func newProcessTestHandler(t *testing.T, channels []string, bot TelegramBot) *Rs
 			Channels: []string{channel}, FirstPush: true, Template: "{title}",
 		})
 	}
-	return NewRssHandler(cfg, bot, store)
+	return NewRssHandler(cfg, bot, store, nil)
 }
 
 func TestSendIntervalWithinChannelLimit(t *testing.T) {

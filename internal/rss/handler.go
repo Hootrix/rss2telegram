@@ -26,10 +26,11 @@ import (
 
 type RssHandler struct {
 	sync.RWMutex
-	parser  *gofeed.Parser
-	config  *config.Config
-	bot     TelegramBot
-	storage *storage.Storage
+	parser   *gofeed.Parser
+	config   *config.Config
+	bot      TelegramBot
+	storage  *storage.Storage
+	snapshot Snapshotter
 	// sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
 	waitFn     func(context.Context, time.Duration) error
 	nowFn      func() time.Time
@@ -46,13 +47,19 @@ type TelegramBot interface {
 	Send(context.Context, string, *telegram.Message) error
 }
 
+// Snapshotter 快照编排抽象（*SnapshotService 实现）；
+// nil 时配置了 snapshot 的 feed 也只跳过快照不 panic
+type Snapshotter interface {
+	Snapshot(ctx context.Context, feed config.FeedConfig, item *gofeed.Item) (string, error)
+}
+
 type channelSendState struct {
 	// sync.Mutex
 	gate     chan struct{}
 	nextSend time.Time
 }
 
-func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) *RssHandler {
+func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage, snapshot Snapshotter) *RssHandler {
 	parser := gofeed.NewParser()
 	// ParseURLWithContext 可取消请求；并发读取前初始化 SDK 惰性字段，避免竞争写入
 	parser.Client = &http.Client{Timeout: maxBlockingBudget}
@@ -61,10 +68,11 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) 
 	parser.JSONTranslator = &gofeed.DefaultJSONTranslator{}
 	return &RssHandler{
 		// parser: gofeed.NewParser(),
-		parser:  parser,
-		config:  cfg,
-		bot:     bot,
-		storage: store,
+		parser:   parser,
+		config:   cfg,
+		bot:      bot,
+		storage:  store,
+		snapshot: snapshot,
 		// sleepFn: time.Sleep,
 		nowFn:      time.Now,
 		sendStates: make(map[string]*channelSendState),
@@ -447,7 +455,20 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 	// 发送后的全 feed sleep 已在上方旧代码保留，节流仅由共享频道状态负责
 	for _, item := range newItems {
 		itemID := generateItemID(item)
-		message := h.formatMessage(item, feedConfig.Template)
+
+		// [issue #12] 快照阶段：配置了 snapshot 的 feed 在渲染前建快照，
+		// {telegraph} 降级值已在编排器内决定（快照失败=原文链接，无 link=空串）。
+		// 失败语义与下方发送阶段一致：父预算耗尽延后下轮（不上报），退出取消上报
+		teleURL, err := h.snapshotForItem(ctx, feedConfig, item)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("Feed %s budget exhausted during snapshot, deferring remaining items to next check", feedConfig.Name)
+				return nil
+			}
+			return fmt.Errorf("snapshot feed items: %w", err)
+		}
+
+		message := h.formatMessage(item, feedConfig.Template, teleURL)
 		if message == "" {
 			continue
 		}
@@ -723,8 +744,18 @@ func backoffWithJitter(attempt int) time.Duration {
 	return time.Second*time.Duration(1<<attempt) + time.Duration(rand.Int63n(int64(500*time.Millisecond)))
 }
 
+// snapshotForItem 对配置了 snapshot 的 feed 建快照；未启用或编排器缺位返回空串
+func (h *RssHandler) snapshotForItem(ctx context.Context, feedConfig config.FeedConfig, item *gofeed.Item) (string, error) {
+	// Validate() 已保证非空 snapshot 只能是 telegraph，无需再比对枚举值
+	if feedConfig.Snapshot == "" || h.snapshot == nil {
+		return "", nil
+	}
+	return h.snapshot.Snapshot(ctx, feedConfig, item)
+}
+
 // 格式化消息
-func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
+// [issue #12] telegraphURL 为快照编排结果：成功=页面 URL，降级=原文链接，无 link=空串
+func (h *RssHandler) formatMessage(item *gofeed.Item, template string, telegraphURL string) string {
 	if template == "" {
 		template = "{title}\n\n{link}" // 默认模板
 	}
@@ -774,6 +805,9 @@ func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
 			}
 		case "link":
 			content = item.Link
+		case "telegraph":
+			// URL 数据域，不做 Markdown 转义；空串时模板自行决定兜底（default 操作链）
+			content = telegraphURL
 		case "pubDate":
 			if item.PublishedParsed != nil {
 				content = item.PublishedParsed.Format("2006-01-02 15:04:05")

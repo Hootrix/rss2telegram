@@ -22,10 +22,10 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
-// snapshotCache mutex 保护的 TTL+LRU 缓存
+// SnapshotCache mutex 保护的 TTL+LRU 缓存
 // 不用 singleflight：合并调用继承第一个调用者的 ctx，其取消会带崩父 ctx 正常
 // 的其他调用者（CR2-#4）；重复建页概率极低，与"重启后重复建页"同一接受标准
-type snapshotCache struct {
+type SnapshotCache struct {
 	mu      sync.Mutex
 	ttl     time.Duration
 	cap     int
@@ -34,14 +34,14 @@ type snapshotCache struct {
 	now     func() time.Time
 }
 
-func newSnapshotCache(ttl time.Duration, cap int) *snapshotCache {
+func NewSnapshotCache(ttl time.Duration, cap int) *SnapshotCache {
 	if ttl <= 0 {
 		ttl = defaultSnapshotCacheTTL
 	}
 	if cap <= 0 {
 		cap = defaultSnapshotCacheCap
 	}
-	return &snapshotCache{
+	return &SnapshotCache{
 		ttl:     ttl,
 		cap:     cap,
 		entries: make(map[string]*list.Element),
@@ -51,7 +51,7 @@ func newSnapshotCache(ttl time.Duration, cap int) *snapshotCache {
 }
 
 // get 命中返回快照 URL；过期条目即删（惰性淘汰）
-func (c *snapshotCache) get(key string) (string, bool) {
+func (c *SnapshotCache) get(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.entries[key]
@@ -69,7 +69,7 @@ func (c *snapshotCache) get(key string) (string, bool) {
 }
 
 // set 写入并置于队首；超容量按最旧淘汰（LRU 兜底，防慢泄漏）
-func (c *snapshotCache) set(key, url string) {
+func (c *SnapshotCache) set(key, url string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.entries[key]; ok {
@@ -95,7 +95,7 @@ func (c *snapshotCache) set(key, url string) {
 }
 
 // len 供测试断言容量行为
-func (c *snapshotCache) len() int {
+func (c *SnapshotCache) len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.order.Len()

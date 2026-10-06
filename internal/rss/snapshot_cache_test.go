@@ -8,10 +8,10 @@ import (
 )
 
 // newTestCache 构造小容量短 TTL 缓存并暴露 now 注入
-func newTestCache(ttl time.Duration, cap int) (*snapshotCache, *time.Time) {
+func newTestCache(ttl time.Duration, cap int) (*SnapshotCache, *time.Time) {
 	base := time.Now()
 	now := &base
-	c := newSnapshotCache(ttl, cap)
+	c := NewSnapshotCache(ttl, cap)
 	c.now = func() time.Time { return *now }
 	return c, now
 }

@@ -58,7 +58,7 @@ func (p *fakePublisher) CreatePage(ctx context.Context, page telegraph.Page) (st
 }
 
 func newSnapSvc(fetcher *fakeFetcher, publisher *fakePublisher) *SnapshotService {
-	return NewSnapshotService(fetcher, publisher, newSnapshotCache(0, 0))
+	return NewSnapshotService(fetcher, publisher, NewSnapshotCache(0, 0))
 }
 
 func snapFeed(name string, channels ...string) config.FeedConfig {

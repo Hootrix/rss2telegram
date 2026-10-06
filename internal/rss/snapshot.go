@@ -38,13 +38,13 @@ type pagePublisher interface {
 type SnapshotService struct {
 	fetcher        pageFetcher
 	publisher      pagePublisher
-	cache          *snapshotCache
+	cache          *SnapshotCache
 	publishTimeout time.Duration
 }
 
-func NewSnapshotService(fetcher pageFetcher, publisher pagePublisher, cache *snapshotCache) *SnapshotService {
+func NewSnapshotService(fetcher pageFetcher, publisher pagePublisher, cache *SnapshotCache) *SnapshotService {
 	if cache == nil {
-		cache = newSnapshotCache(0, 0)
+		cache = NewSnapshotCache(0, 0)
 	}
 	return &SnapshotService{
 		fetcher:        fetcher,
