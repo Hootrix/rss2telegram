@@ -44,7 +44,12 @@ type Client struct {
 
 func NewClient(dataDir, baseURL string, hc *http.Client) *Client {
 	if baseURL == "" {
-		baseURL = DefaultBaseURL
+		// 可测试性注入点：与 telegram 包 TELEGRAM_API_URL 同款约定（本地集成测试假服务器）
+		if env := os.Getenv("TELEGRAPH_API_URL"); env != "" {
+			baseURL = env
+		} else {
+			baseURL = DefaultBaseURL
+		}
 	}
 	if hc == nil {
 		// 兜底超时；精确的 10s 子超时由调用方 ctx 控制

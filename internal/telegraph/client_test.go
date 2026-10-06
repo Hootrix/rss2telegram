@@ -180,3 +180,13 @@ func TestCreatePageServerUnreachable(t *testing.T) {
 	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
 	require.Error(t, err)
 }
+
+func TestBaseURLEnvOverride(t *testing.T) {
+	ft, srv := newFakeTelegraph(t)
+	// 与 telegram 包 TELEGRAM_API_URL 同款约定：集成测试指向本地假服务器
+	t.Setenv("TELEGRAPH_API_URL", srv.URL)
+	c := NewClient(t.TempDir(), "", nil)
+	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), ft.accounts.Load())
+}
