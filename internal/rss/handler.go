@@ -1,10 +1,13 @@
 package rss
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"regexp"
 	"sort"
 	"strings"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/Hootrix/rss2telegram/internal/config"
 	"github.com/Hootrix/rss2telegram/internal/storage"
+	"github.com/Hootrix/rss2telegram/internal/telegram"
 	"github.com/Hootrix/rss2telegram/internal/tgmd"
 	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/mmcdole/gofeed"
@@ -26,19 +30,95 @@ type RssHandler struct {
 	config  *config.Config
 	bot     TelegramBot
 	storage *storage.Storage
+	// sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
+	waitFn     func(context.Context, time.Duration) error
+	nowFn      func() time.Time
+	sendMu     sync.Mutex
+	sendStates map[string]*channelSendState
+	// roundBudget   time.Duration
+	// 整轮共享预算会让靠前的积压/挂起 feed 每轮耗尽 deadline，后续 feed 永远轮不到，改为每 feed 独立预算
+	feedBudget    time.Duration
+	messageBudget time.Duration
 }
 
 type TelegramBot interface {
-	Send(channel string, message string) error
+	// Send(channel string, message string) error
+	Send(context.Context, string, *telegram.Message) error
+}
+
+type channelSendState struct {
+	// sync.Mutex
+	gate     chan struct{}
+	nextSend time.Time
 }
 
 func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) *RssHandler {
+	parser := gofeed.NewParser()
+	// ParseURLWithContext 可取消请求；并发读取前初始化 SDK 惰性字段，避免竞争写入
+	parser.Client = &http.Client{Timeout: maxBlockingBudget}
+	parser.RSSTranslator = &gofeed.DefaultRSSTranslator{}
+	parser.AtomTranslator = &gofeed.DefaultAtomTranslator{}
+	parser.JSONTranslator = &gofeed.DefaultJSONTranslator{}
 	return &RssHandler{
-		parser:  gofeed.NewParser(),
+		// parser: gofeed.NewParser(),
+		parser:  parser,
 		config:  cfg,
 		bot:     bot,
 		storage: store,
+		// sleepFn: time.Sleep,
+		nowFn:      time.Now,
+		sendStates: make(map[string]*channelSendState),
+		// roundBudget:   maxBlockingBudget,
+		feedBudget:    maxBlockingBudget,
+		messageBudget: maxBlockingBudget,
 	}
+}
+
+func (h *RssHandler) now() time.Time {
+	if h.nowFn != nil {
+		return h.nowFn()
+	}
+	return time.Now()
+}
+
+// sleep 统一走可注入的 sleepFn，nil 安全（直接字面量构造的 handler 如模板测试）
+// func (h *RssHandler) sleep(d time.Duration) {
+// 	if h.sleepFn != nil {
+// 		h.sleepFn(d)
+// 		return
+// 	}
+// 	time.Sleep(d)
+// }
+
+// 累计截止时间在入队前建立，等待不可超过剩余预算，也必须响应退出取消
+func (h *RssHandler) wait(ctx context.Context, d time.Duration, deadline time.Time) bool {
+	if ctx.Err() != nil || !h.now().Before(deadline) {
+		return false
+	}
+	if d <= 0 {
+		return true
+	}
+	if d >= deadline.Sub(h.now()) {
+		return false
+	}
+	if h.waitFn != nil {
+		return h.waitFn(ctx, d) == nil && ctx.Err() == nil && h.now().Before(deadline)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil && h.now().Before(deadline)
+	}
+}
+
+func blockingBudget(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return maxBlockingBudget
 }
 
 func (h *RssHandler) UpdateConfig(cfg *config.Config) {
@@ -48,6 +128,7 @@ func (h *RssHandler) UpdateConfig(cfg *config.Config) {
 	log.Printf("RSS处理器配置已更新")
 }
 
+/*
 func (h *RssHandler) ProcessFeeds() error {
 	h.RLock()
 	cfg := h.config
@@ -94,6 +175,61 @@ func (h *RssHandler) ProcessFeeds() error {
 	}
 	return nil
 }
+*/
+
+// 整轮只继承退出取消；单 feed 的阻塞由各自的 feedBudget 约束，慢 feed 只占名额不吞掉其他 feed 的机会
+func (h *RssHandler) ProcessFeeds(ctx context.Context) error {
+	// ctx, cancel := context.WithTimeout(parent, blockingBudget(h.roundBudget))
+	// defer cancel()
+	h.RLock()
+	cfg := h.config
+	h.RUnlock()
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 2)
+	errChan := make(chan error, len(cfg.Feeds))
+	for _, feed := range cfg.Feeds {
+		if !acquireFeed(ctx, semaphore) {
+			break
+		}
+		wg.Add(1)
+		go func(feed config.FeedConfig) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			feedCtx, cancel := context.WithTimeout(ctx, blockingBudget(h.feedBudget))
+			defer cancel()
+			// if err := h.processFeed(ctx, feed); err != nil {
+			if err := h.processFeed(feedCtx, feed); err != nil {
+				errChan <- fmt.Errorf("feed %s: %w", feed.Name, err)
+			}
+		}(feed)
+	}
+	wg.Wait()
+	close(errChan)
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+	if ctx.Err() != nil {
+		errs = append(errs, fmt.Errorf("processing feeds: %w", ctx.Err()))
+	}
+	return errors.Join(errs...)
+}
+
+// 先取得名额再创建 worker，避免无限排队 goroutine；取消同时释放排队和在途任务
+func acquireFeed(ctx context.Context, semaphore chan struct{}) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case semaphore <- struct{}{}:
+		if ctx.Err() == nil {
+			return true
+		}
+		<-semaphore
+	case <-ctx.Done():
+	}
+	return false
+}
 
 // 生成项目的唯一标识
 func generateItemID(item *gofeed.Item) string {
@@ -116,10 +252,15 @@ func generateItemID(item *gofeed.Item) string {
 	return fmt.Sprintf("content:%x", sha256.Sum256([]byte(item.Content)))
 }
 
-func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
+// func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
+func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConfig) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("process feed: %w", err)
+	}
 	log.Printf("Processing feed: %s (%s)", feedConfig.Name, feedConfig.URL)
 
-	feed, err := h.parser.ParseURL(feedConfig.URL)
+	// feed, err := h.parser.ParseURL(feedConfig.URL)
+	feed, err := h.parser.ParseURLWithContext(feedConfig.URL, ctx)
 	if err != nil {
 		return fmt.Errorf("error parsing feed %s: %w", feedConfig.Name, err)
 	}
@@ -146,6 +287,9 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 
 	// 对所有项目进行处理，不再依赖发布时间排序
 	for _, item := range feed.Items {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("filter feed items: %w", err)
+		}
 		if item.Title == "" && item.Link == "" {
 			log.Printf("Skipping item without title and link in feed %s", feedConfig.Name)
 			continue
@@ -167,6 +311,9 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 			log.Printf("First run and first_push is false, skipping all items for feed: %s", feedConfig.Name)
 			// 标记所有项目为已处理，这样下次运行时就不会重复处理
 			for _, channel := range feedConfig.Channels {
+				if err := ctx.Err(); err != nil {
+					return fmt.Errorf("mark initial feed items: %w", err)
+				}
 				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
 					log.Printf("Error marking item as seen: %v", err)
 				}
@@ -227,82 +374,353 @@ func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 		newItems = append(withTime, withoutTime...)
 	}
 
-	// 处理新项目（推送文章）
-	// 使用信号量控制并发数
-	sem := make(chan struct{}, 1) // 单个feed下处理channel 最大并发数为1
-	var wg sync.WaitGroup
+	/*
+		// 处理新项目（推送文章）
+		// 使用信号量控制并发数
+		sem := make(chan struct{}, 1) // 单个feed下处理channel 最大并发数为1
+		var wg sync.WaitGroup
 
+		for _, item := range newItems {
+			itemID := generateItemID(item)
+
+			// 并发处理每个channel
+			for _, channel := range feedConfig.Channels {
+				// 检查这个 channel 是否已经处理过这个 item
+				if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
+					log.Printf("Item %s already processed for channel %s", item.Title, channel)
+					continue
+				}
+
+				// 格式化消息
+				message := h.formatMessage(item, feedConfig.Template)
+				if message == "" {
+					log.Printf("formatMessage Empty Result, skip. RSS item title: %s", item.Title)
+					continue
+				}
+
+				wg.Add(1)
+				go func(channel string, item *gofeed.Item) {
+					defer wg.Done()
+					sem <- struct{}{}        // 获取信号量
+					defer func() { <-sem }() // 释放信号量
+
+					// [issue #6] 重试循环已提取为 sendWithRetry：429 按服务端 retry_after
+					// 等待且独立计数，普通错误维持指数退避 3 次。
+					// 旧实现保留备查（固定指数退避、flood 与普通错误共享 3 次配额、
+					// 间隔 1s 超 Telegram 单频道 ~20 条/分钟限速）：
+					// maxRetries := 3
+					// var sendSuccess bool
+					// var lastError error
+					// for i := 0; i < maxRetries; i++ {
+					// 	if err := h.bot.Send(channel, message); err != nil {
+					// 		lastError = err
+					// 		if i == maxRetries-1 {
+					// 			log.Printf("Failed to send message to channel %s after %d retries: %v", channel, maxRetries, err)
+					// 			break
+					// 		}
+					// 		log.Printf("Error sending message to channel %s (retry %d/%d): %v", channel, i+1, maxRetries, err)
+					// 		h.ExponentialBackoffWithJitter(i)
+					// 		continue
+					// 	}
+					// 	sendSuccess = true
+					// 	break
+					// }
+					sendSuccess := h.sendWithRetry(channel, message, item.Title)
+
+					// 只有在发送成功后才标记为已处理
+					if sendSuccess {
+						if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
+							log.Printf("msg send success. MarkItemSeen ERROR!!  channel %s: %v", channel, err)
+						}
+						h.sleep(sendInterval) // 发送间隔（原 1s，已提至 sendInterval）
+					}
+					// [issue #6] 旧失败兜底日志已并入 sendWithRetry 内部失败日志（含 title），保留备查：
+					// log.Printf("msg send Failed. item '%s' for channel 「%s」: %v", item.Title, channel, lastError)
+				}(channel, item)
+			}
+		}
+
+		wg.Wait() // 等待所有 goroutine 完成
+	*/
+
+	// 单个 feed 原本就只有一个发送名额，直接串行处理，避免每条消息排队 goroutine
+	// 发送后的全 feed sleep 已在上方旧代码保留，节流仅由共享频道状态负责
 	for _, item := range newItems {
 		itemID := generateItemID(item)
-
-		// 并发处理每个channel
+		message := h.formatMessage(item, feedConfig.Template)
+		if message == "" {
+			continue
+		}
 		for _, channel := range feedConfig.Channels {
-			// 检查这个 channel 是否已经处理过这个 item
+			// if err := ctx.Err(); err != nil {
+			// 	return fmt.Errorf("send feed items: %w", err)
+			// }
+			// 发送阶段耗尽 feed 预算属于正常积压延后（剩余条目未标 seen，下轮补推），不上报为错误；
+			// 退出取消仍返回错误
+			if err := ctx.Err(); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("Feed %s budget exhausted, deferring remaining items to next check", feedConfig.Name)
+					return nil
+				}
+				return fmt.Errorf("send feed items: %w", err)
+			}
 			if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
-				log.Printf("Item %s already processed for channel %s", item.Title, channel)
 				continue
 			}
-
-			// 格式化消息
-			message := h.formatMessage(item, feedConfig.Template)
-			if message == "" {
-				log.Printf("formatMessage Empty Result, skip. RSS item title: %s", item.Title)
-				continue
+			if h.sendWithRetry(ctx, channel, message, item.Title) {
+				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
+					log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
+				}
 			}
-
-			wg.Add(1)
-			go func(channel string, item *gofeed.Item) {
-				defer wg.Done()
-				sem <- struct{}{}        // 获取信号量
-				defer func() { <-sem }() // 释放信号量
-
-				// 多次重试发送消息（包含第一次请求）
-				maxRetries := 3
-				var sendSuccess bool
-				var lastError error
-				for i := 0; i < maxRetries; i++ {
-					if err := h.bot.Send(channel, message); err != nil {
-						lastError = err
-						if i == maxRetries-1 {
-							log.Printf("Failed to send message to channel %s after %d retries: %v", channel, maxRetries, err)
-							break
-						}
-						log.Printf("Error sending message to channel %s (retry %d/%d): %v", channel, i+1, maxRetries, err)
-						h.ExponentialBackoffWithJitter(i)
-						continue
-					}
-					log.Printf("Successfully sent message to channel %s: %s", channel, item.Title)
-					sendSuccess = true
-					break // 发送成功，退出重试循环
-				}
-
-				// 只有在发送成功后才标记为已处理
-				if sendSuccess {
-					if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
-						log.Printf("msg send success. MarkItemSeen ERROR!!  channel %s: %v", channel, err)
-					}
-					time.Sleep(time.Second) // 发送间隔 1 秒
-				} else if lastError != nil {
-					// 如果发送失败且有错误，记录到日志
-					log.Printf("msg send Failed. item '%s' for channel 「%s」: %v", item.Title, channel, lastError)
-				}
-			}(channel, item)
 		}
 	}
-
-	wg.Wait() // 等待所有 goroutine 完成
 
 	log.Printf("processFeed finish. name:%s, processed %d new items, skipped %d already-seen", feedConfig.Name, len(newItems), skippedSeen)
 	return nil
 }
 
+// [issue #6] 发送重试参数
+const (
+	// 发送间隔：Telegram 对单频道的发送限速约 20 条/分钟，3s/条（≤20 条/分钟）
+	// 可稳定限内；原 1s 间隔是大批首刷持续撞 429 的直接原因
+	sendInterval = 3 * time.Second
+
+	maxSendRetries  = 3 // 普通错误的总尝试次数（含首次），维持原语义
+	maxFloodRetries = 5 // 429 flood 独立重试上限，不消耗普通配额
+	// 旧说明保留：该上限只控制单次阻塞，不得截短合法的服务端冷却
+	// maxFloodWait = 2 * time.Minute // 单次 flood 等待上限，防服务端异常值（如数小时）拖死 goroutine
+	// maxFloodWait = 2 * time.Minute
+	maxFloodWait      = 10 * time.Second
+	maxBlockingBudget = 2 * time.Minute
+)
+
+// sendWithRetry 带重试发送单条消息，返回是否成功。
+//
+// [issue #6] 双计数设计：普通错误走指数退避，总共 maxSendRetries 次尝试；
+// 429 限速识别 RateLimitError 后按服务端 retry_after 指示等待再重试——
+// 服务端明确告知何时可重试，固定指数退避（1s/2s/4s）必然全部撞墙，因此
+// flood 等待不消耗普通配额、独立计数 maxFloodRetries 次防死循环。
+// 超限放弃返回 false（不标 seen，由下轮 check 补推，与原失败语义一致）
+/*
+func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
+	for attempt, floodCount := 0, 0; ; {
+		err := h.bot.Send(channel, message)
+		if err == nil {
+			log.Printf("Successfully sent message to channel %s: %s", channel, itemTitle)
+			return true
+		}
+
+		var rlErr *telegram.RateLimitError
+		if errors.As(err, &rlErr) {
+			floodCount++
+			if floodCount > maxFloodRetries {
+				log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
+				return false
+			}
+			wait := rlErr.RetryAfter + time.Second // +1s 缓冲，避免卡点重试再次撞限
+			if wait > maxFloodWait {
+				wait = maxFloodWait
+			}
+			log.Printf("Rate limited sending item '%s' to channel %s (flood retry %d/%d), waiting %v: %v", itemTitle, channel, floodCount, maxFloodRetries, wait, err)
+			h.sleep(wait)
+			continue
+		}
+
+		attempt++
+		if attempt >= maxSendRetries {
+			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
+			return false
+		}
+		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
+		h.ExponentialBackoffWithJitter(attempt - 1)
+	}
+}
+*/
+
+/*
+func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
+	state := h.channelState(channel)
+	state.Lock()
+	defer state.Unlock()
+
+	for attempt, floodCount := 0, 0; ; {
+		if !h.waitForSend(state, channel, itemTitle) {
+			return false
+		}
+		err := h.bot.Send(channel, message)
+		if err == nil {
+			state.nextSend = h.now().Add(sendInterval)
+			log.Printf("Successfully sent message to channel %s: %s", channel, itemTitle)
+			return true
+		}
+
+		var rlErr *telegram.RateLimitError
+		if errors.As(err, &rlErr) {
+			floodCount++
+			if !h.setFloodCooldown(state, rlErr, floodCount, channel, itemTitle) {
+				return false
+			}
+			continue
+		}
+
+		attempt++
+		if attempt >= maxSendRetries {
+			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
+			return false
+		}
+		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
+		h.ExponentialBackoffWithJitter(attempt - 1)
+	}
+}
+*/
+
+func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, itemTitle string) bool {
+	budget := blockingBudget(h.messageBudget)
+	deadline := h.now().Add(budget)
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
+	state := h.channelState(channel)
+	if !claimChannel(ctx, state) {
+		log.Printf("Deferring item '%s' to channel %s: channel busy or cancelled", itemTitle, channel)
+		return false
+	}
+	defer func() { <-state.gate }()
+	delivery := telegram.NewMessage(message)
+	for attempt, floodCount := 0, 0; ; {
+		if !h.waitForSend(ctx, state, deadline, channel, itemTitle) {
+			return false
+		}
+		err := h.bot.Send(ctx, channel, delivery)
+		if err == nil {
+			state.nextSend = h.now().Add(sendInterval)
+			log.Printf("Successfully sent message to channel %s: %s", channel, itemTitle)
+			return true
+		}
+		if ctx.Err() != nil {
+			// 之前静默返回，线上无法区分退出/超时与真实失败
+			log.Printf("Deferring item '%s' to channel %s: %v", itemTitle, channel, ctx.Err())
+			return false
+		}
+		var rate *telegram.RateLimitError
+		if errors.As(err, &rate) && rate != nil {
+			h.setFloodCooldown(state, rate, channel, itemTitle)
+			floodCount++
+			if floodCount > maxFloodRetries {
+				log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
+				return false
+			}
+			continue
+		}
+		attempt++
+		if attempt >= maxSendRetries {
+			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
+			return false
+		}
+		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
+		if !h.wait(ctx, backoffWithJitter(attempt-1), deadline) {
+			log.Printf("Deferring item '%s' to channel %s: backoff exceeds remaining budget or cancelled", itemTitle, channel)
+			return false
+		}
+	}
+}
+
+// 忙频道快速延后，不能持有 feed 名额在另一个消息的锁后无限排队
+func claimChannel(ctx context.Context, state *channelSendState) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case state.gate <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// 不同 feed 和检查轮次共享同一归一化频道的状态，feed 局部信号量无法保证频道限速
+func (h *RssHandler) channelState(channel string) *channelSendState {
+	key := telegram.ChannelKey(channel)
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	if h.sendStates == nil {
+		h.sendStates = make(map[string]*channelSendState)
+	}
+	state := h.sendStates[key]
+	if state == nil {
+		// state = &channelSendState{}
+		state = &channelSendState{gate: make(chan struct{}, 1)}
+		h.sendStates[key] = state
+	}
+	return state
+}
+
+/*
+func (h *RssHandler) waitForSend(state *channelSendState, channel, itemTitle string) bool {
+	wait := state.nextSend.Sub(h.now())
+	if wait <= 0 {
+		return true
+	}
+	// 超过阻塞预算只延后处理，保留完整截止时间，不得在服务端冷却期内重发
+	if wait > maxFloodWait {
+		log.Printf("Deferring item '%s' to channel %s, cooldown remaining %v", itemTitle, channel, wait)
+		return false
+	}
+	h.sleep(wait)
+	return true
+}
+*/
+
+func (h *RssHandler) waitForSend(ctx context.Context, state *channelSendState, deadline time.Time, channel, itemTitle string) bool {
+	wait := state.nextSend.Sub(h.now())
+	if wait > maxFloodWait {
+		log.Printf("Deferring item '%s' to channel %s, cooldown remaining %v", itemTitle, channel, wait)
+		return false
+	}
+	// return h.wait(ctx, wait, deadline)
+	if !h.wait(ctx, wait, deadline) {
+		log.Printf("Deferring item '%s' to channel %s: cooldown %v exceeds remaining budget or cancelled", itemTitle, channel, wait)
+		return false
+	}
+	return true
+}
+
+// 先保存完整冷却再检查重试上限，避免放弃上一条消息后立即发送下一条
+/*
+func (h *RssHandler) setFloodCooldown(state *channelSendState, err *telegram.RateLimitError, floodCount int, channel, itemTitle string) bool {
+	if err.RetryAfter <= 0 || err.RetryAfter > time.Duration(1<<63-1)-time.Second {
+		log.Printf("Invalid retry_after for item '%s' to channel %s: %v", itemTitle, channel, err)
+		return false
+	}
+	wait := err.RetryAfter + time.Second
+	state.nextSend = h.now().Add(wait)
+	if floodCount > maxFloodRetries {
+		log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
+		return false
+	}
+	log.Printf("Rate limited sending item '%s' to channel %s (flood retry %d/%d), cooldown %v: %v", itemTitle, channel, floodCount, maxFloodRetries, wait, err)
+	return true
+}
+*/
+
+func (h *RssHandler) setFloodCooldown(state *channelSendState, err *telegram.RateLimitError, channel, itemTitle string) {
+	wait := err.RetryAfter + time.Second
+	state.nextSend = h.now().Add(wait)
+	log.Printf("Rate limited sending item '%s' to channel %s, cooldown %v: %v", itemTitle, channel, wait, err)
+}
+
 // 指数退避+随机抖动
+/*
 func (h *RssHandler) ExponentialBackoffWithJitter(attempt int) {
 	base := time.Second
 	maxJitter := 500 * time.Millisecond                    // 最大抖动 500毫秒
 	delay := base * time.Duration(1<<attempt)              // 指数退避。1<<attempt表示attemp的2次幂
 	jitter := time.Duration(rand.Int63n(int64(maxJitter))) // 随机抖动
-	time.Sleep(delay + jitter)
+	h.sleep(delay + jitter)                                // 走可注入 sleep，测试免真睡
+}
+*/
+
+func backoffWithJitter(attempt int) time.Duration {
+	return time.Second*time.Duration(1<<attempt) + time.Duration(rand.Int63n(int64(500*time.Millisecond)))
 }
 
 // 格式化消息
