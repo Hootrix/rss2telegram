@@ -30,7 +30,12 @@ type FeedConfig struct {
 	FirstPush                      bool     `yaml:"first_push"`
 	Channels                       []string `yaml:"channels"`
 	Template                       string   `yaml:"template"`
+	// 快照后端枚举：空 = 不启用；为将来其他后端（如 archive.today）预留空间
+	Snapshot string `yaml:"snapshot"`
 }
+
+// SnapshotTelegraph 唯一支持的快照后端（issue #12）
+const SnapshotTelegraph = "telegraph"
 
 // Validate 验证配置的合法性
 func (c *Config) Validate() error {
@@ -81,6 +86,11 @@ func (c *Config) Validate() error {
 		if feed.Template == "" {
 			// 设置默认模板
 			feed.Template = "📰 *{title}*\n\n{description}\n\n🔗 [阅读原文]({link})"
+		}
+
+		// 快照开关：字符串枚举，仅允许空串或已实现的后端
+		if feed.Snapshot != "" && feed.Snapshot != SnapshotTelegraph {
+			return fmt.Errorf("feed %s: invalid snapshot %q (only %q is supported)", feed.Name, feed.Snapshot, SnapshotTelegraph)
 		}
 	}
 
