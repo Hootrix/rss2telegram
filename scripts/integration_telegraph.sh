@@ -10,7 +10,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${PORT:-18931}"
 WORK="$(mktemp -d /tmp/rss2telegram-smoke.XXXXXX)"
-trap 'kill ${BOT_PID:-} ${FAKE_PID:-} 2>/dev/null; wait ${BOT_PID:-} ${FAKE_PID:-} 2>/dev/null; rm -rf "$WORK"' EXIT
+# trap 内 wait 收集被 TERM 杀死的后台进程返回 128+N，set -e 会立即中止 shell
+# （后续 rm -rf 不再执行、退出码泄漏成 143），必须 || true 兜底
+trap 'kill ${BOT_PID:-} ${FAKE_PID:-} 2>/dev/null; wait ${BOT_PID:-} ${FAKE_PID:-} 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 echo "==> 工作目录: $WORK"
 echo "==> 构建主程序与假服务器"
@@ -20,7 +22,7 @@ go build -o "$WORK/faketelegraph" "$ROOT/scripts/faketelegraph"
 echo "==> 启动 faketelegraph (port $PORT)"
 "$WORK/faketelegraph" -addr "127.0.0.1:$PORT" \
   -root "$ROOT/testdata/telegraph_smoke" \
-  -pages "$WORK/pages.jsonl" -sent "$WORK/sent.jsonl" &
+  -pages "$WORK/pages.jsonl" -edits "$WORK/edits.jsonl" -sent "$WORK/sent.jsonl" &
 FAKE_PID=$!
 
 mkdir -p "$WORK/config"
@@ -47,9 +49,10 @@ TELEGRAPH_API_URL="http://127.0.0.1:$PORT" \
   "$WORK/rss2telegram" -config "$WORK/config/config.yaml" &
 BOT_PID=$!
 
-# 轮询等待首条推送落地（check_interval=2s，快照全链路本地 <1s）
+# 轮询等待首条推送落地（check_interval=2s，快照全链路本地 <1s）；
+# edits.jsonl 也纳入等待：回填发生在 sendMessage 之后，晚于 sent.jsonl 落地
 for _ in $(seq 1 15); do
-  [ -s "$WORK/sent.jsonl" ] && [ -s "$WORK/pages.jsonl" ] && break
+  [ -s "$WORK/sent.jsonl" ] && [ -s "$WORK/pages.jsonl" ] && [ -s "$WORK/edits.jsonl" ] && break
   sleep 1
 done
 sleep 1 # 等日志落盘
@@ -91,8 +94,28 @@ else
   echo "FAIL: 建页数异常"; FAIL=1
 fi
 
+# author_url 回填（issue #12）：editPage 请求定位到所建页面，author_url 为消息链接
+# 假 Telegram 固定返回 message_id=1 → 链接为 t.me/smoke_ch/1；
+# path 与真实 API 一致不带前导斜杠（缓存 Path 已 TrimPrefix 页面 URL 前缀）
+EDIT=$(head -1 "$WORK/edits.jsonl")
+for expect in '"path":"smoke-1"' '"author_url":"https://t.me/smoke_ch/1"' '快照冒烟文章'; do
+  if grep -qF "$expect" <<<"$EDIT"; then
+    echo "PASS: 回填请求含 $expect"
+  else
+    echo "FAIL: 回填请求缺少 $expect"; cat "$WORK/edits.jsonl" 2>/dev/null; FAIL=1
+  fi
+done
+
+# 回填仅重提交不新建页（editPage 不进 pages.jsonl 已由"只建一页"隐含，这里显式断言恰好一次编辑）
+if [ "$(wc -l < "$WORK/edits.jsonl" | tr -d ' ')" = "1" ]; then
+  echo "PASS: 恰好一次回填"
+else
+  echo "FAIL: 回填次数异常"; cat "$WORK/edits.jsonl"; FAIL=1
+fi
+
 if [ "$FAIL" = 0 ]; then
   echo "==> 冒烟通过 ✅"
+  exit 0 # 显式退出码：EXIT trap 中 wait 已终止进程的状态会泄漏成 128+N
 else
   echo "==> 冒烟失败 ❌"; exit 1
 fi

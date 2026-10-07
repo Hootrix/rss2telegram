@@ -9,6 +9,7 @@
 //
 // 路由：
 //   - POST /createAccount, /createPage   假 Telegraph API（createPage 逐条记录到 -pages）
+//   - POST /editPage                     假 Telegraph API（author_url 回填，记录到 -edits，issue #12）
 //   - /bot<token>/<method>               假 Telegram API（getMe/sendMessage，消息记录到 -sent）
 //   - /s/<file>                          静态伺服 -root 目录（RSS 源与原文 HTML 都放这里）
 package main
@@ -31,6 +32,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:18931", "监听地址")
 	root := flag.String("root", "", "以 /s/ 前缀伺服的静态目录（rss.xml 与原文 html）")
 	pagesPath := flag.String("pages", "pages.jsonl", "createPage 请求记录(jsonl)")
+	editsPath := flag.String("edits", "edits.jsonl", "editPage 请求记录(jsonl)")
 	sentPath := flag.String("sent", "sent.jsonl", "sendMessage 记录(jsonl)")
 	flag.Parse()
 
@@ -38,12 +40,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("open pages log: %v", err)
 	}
+	edits, err := os.OpenFile(*editsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("open edits log: %v", err)
+	}
 	sent, err := os.OpenFile(*sentPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("open sent log: %v", err)
 	}
 
-	var mu sync.Mutex // 两个 jsonl 文件写入互斥
+	var mu sync.Mutex // jsonl 文件写入互斥
 	var accounts atomic.Int64
 	var pagesCount atomic.Int64
 
@@ -75,6 +81,24 @@ func main() {
 					"url":  fmt.Sprintf("https://telegra.ph/smoke-%d", n),
 				},
 			})
+
+		case r.URL.Path == "/editPage" && r.Method == http.MethodPost:
+			// author_url 回填（issue #12）：记录请求体供断言全量重提交（title/content 原样）
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+			var req struct {
+				Path      string `json:"path"`
+				Title     string `json:"title"`
+				AuthorURL string `json:"author_url"`
+			}
+			_ = json.Unmarshal(body, &req)
+			record, _ := json.Marshal(map[string]any{
+				"path": req.Path, "title": req.Title, "author_url": req.AuthorURL,
+				"content_len": len(body),
+			})
+			mu.Lock()
+			_, _ = edits.Write(append(record, '\n'))
+			mu.Unlock()
+			writeJSON(w, map[string]any{"ok": true, "result": map[string]any{"path": req.Path}})
 
 		case strings.HasPrefix(r.URL.Path, "/bot"):
 			handleBotAPI(w, r, sent, &mu)
