@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>builtin-sample</title><link>http://x/</link><description>offline fallback</description>
+<item><title>样例一</title><link>http://x/1</link><guid>S1</guid></item>
+<item><title>样例二</title><link>http://x/2</link><guid>S2</guid></item>
+</channel></rss>
