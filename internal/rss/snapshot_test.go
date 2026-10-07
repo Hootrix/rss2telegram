@@ -45,6 +45,27 @@ type fakePublisher struct {
 	url   string
 	err   error
 	block bool // 阻塞直到 ctx 结束（模拟慢发布触发父取消判定）
+
+	editCalls atomic.Int32
+	edits     []editRecord
+	editErr   error
+}
+
+// editRecord 记录一次 EditPage 调用参数（回填断言用）
+type editRecord struct {
+	path string
+	page telegraph.Page
+}
+
+func (p *fakePublisher) EditPage(ctx context.Context, path string, page telegraph.Page) error {
+	p.editCalls.Add(1)
+	p.mu.Lock()
+	p.edits = append(p.edits, editRecord{path: path, page: page})
+	p.mu.Unlock()
+	if p.editErr != nil {
+		return p.editErr
+	}
+	return nil
 }
 
 func (p *fakePublisher) CreatePage(ctx context.Context, page telegraph.Page) (string, error) {
@@ -308,6 +329,76 @@ func TestSnapshotEmptyTitleFallback(t *testing.T) {
 	defer pub.mu.Unlock()
 	require.Len(t, pub.pages, 1)
 	assert.NotEmpty(t, pub.pages[0].Title)
+}
+
+// ---- author_url 消息链接回填（issue #12）----
+
+// 建页成功后回填：EditPage 必须带全量原参数（title/content/author_name）+ 新 author_url
+// （editPage 全量替换语义，缺字段即清空，见 telegraph client 注释）
+func TestBackfillAuthor(t *testing.T) {
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(&fakeFetcher{html: fullBodyHTML}, pub)
+	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
+
+	_, err := svc.Snapshot(context.Background(), feed, item)
+	require.NoError(t, err)
+
+	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan/42"))
+	assert.Equal(t, int32(1), pub.editCalls.Load())
+
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	require.Len(t, pub.edits, 1)
+	e := pub.edits[0]
+	assert.Equal(t, "ok-1", e.path, "path 从缓存条目取")
+	assert.Equal(t, "标题", e.page.Title, "title 原样重提交")
+	assert.Equal(t, "f", e.page.AuthorName, "author_name 原样重提交（不传即清空）")
+	assert.Equal(t, "https://t.me/chan/42", e.page.AuthorURL)
+	assert.NotEmpty(t, e.page.Content, "content 原样重提交")
+}
+
+// 跳过面：降级（不入缓存→miss）与从未建页的 item 都不触发 EditPage、不报错
+func TestBackfillAuthorSkips(t *testing.T) {
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	// 抓取失败 → 降级照发，不入缓存 → 回填应跳过
+	svc := newSnapSvc(&fakeFetcher{err: errors.New("http 403")}, pub)
+	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
+
+	teleURL, err := svc.Snapshot(context.Background(), feed, item)
+	require.NoError(t, err)
+	assert.Equal(t, "https://e.com/a", teleURL, "前置：确为降级")
+
+	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan/1"), "降级条目跳过")
+	require.NoError(t, svc.BackfillAuthor(context.Background(), snapFeed("f", "@chan"), snapItem("其他", "https://e.com/b", "g2"), "https://t.me/chan/1"), "从未建页跳过")
+	assert.Equal(t, int32(0), pub.editCalls.Load())
+}
+
+// editPage 失败返回错误（调用方记日志）；缓存条目不受影响
+func TestBackfillAuthorEditError(t *testing.T) {
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1", editErr: errors.New("telegraph editPage: api error")}
+	svc := newSnapSvc(&fakeFetcher{html: fullBodyHTML}, pub)
+	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
+
+	_, err := svc.Snapshot(context.Background(), feed, item)
+	require.NoError(t, err)
+
+	err = svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan/42")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "editPage")
+}
+
+// 多频道覆盖语义：第二次回填覆盖第一次（单页只装得下一个消息链接）
+func TestBackfillAuthorLastWriteWins(t *testing.T) {
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(&fakeFetcher{html: fullBodyHTML}, pub)
+	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
+
+	_, err := svc.Snapshot(context.Background(), feed, item)
+	require.NoError(t, err)
+
+	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan/1"))
+	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan2/2"))
+	assert.Equal(t, int32(2), pub.editCalls.Load())
 }
 
 // ---- author_url 构造（边界表：@name 去掉 @；裸名直接拼；纯数字 ID 不构造）----

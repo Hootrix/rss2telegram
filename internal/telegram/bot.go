@@ -174,21 +174,23 @@ func (b *Bot) Send(channel string, message string) error {
 }
 */
 
-func (b *Bot) Send(ctx context.Context, channel string, message *Message) error {
+// Send 发送消息并返回成功消息的 message_id（issue #12：快照页 author_url 回填
+// 消息链接用）；markdown 降级重发场景取最终成功那次的 message_id
+func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64, error) {
 	if channel == "" {
-		return errors.New("telegram: empty channel")
+		return 0, errors.New("telegram: empty channel")
 	}
 	if message == nil || message.text == "" {
-		return errors.New("telegram: empty message")
+		return 0, errors.New("telegram: empty message")
 	}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("telegram send: %w", err)
+		return 0, fmt.Errorf("telegram send: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	sender, err := b.contextualBot(ctx)
 	if err != nil {
-		return fmt.Errorf("create telegram sender: %w", err)
+		return 0, fmt.Errorf("create telegram sender: %w", err)
 	}
 	text, options := message.text, &tele.SendOptions{}
 	if message.plain {
@@ -196,13 +198,16 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) error 
 	} else {
 		options.ParseMode = tele.ModeMarkdown
 	}
-	_, err = sender.Send(newChannelRecipient(channel), text, options)
+	sent, err := sender.Send(newChannelRecipient(channel), text, options)
 	if err != nil && !message.plain && isParseEntitiesError(err) {
 		message.plain = true
 		log.Printf("markdown parse failed, falling back to plain text")
-		_, err = sender.Send(newChannelRecipient(channel), tgmd.Unescape(message.text))
+		sent, err = sender.Send(newChannelRecipient(channel), tgmd.Unescape(message.text))
 	}
-	return b.sendError(ctx, err)
+	if err != nil {
+		return 0, b.sendError(ctx, err)
+	}
+	return int64(sent.ID), nil
 }
 
 // Raw 内部的 Background 不接收调用方取消，独立发送实例复用连接池并注入本次 context

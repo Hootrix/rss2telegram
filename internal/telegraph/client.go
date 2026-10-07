@@ -169,6 +169,22 @@ func (c *Client) CreatePage(ctx context.Context, page Page) (string, error) {
 	return res.URL, nil
 }
 
+// EditPage 编辑已发布页面。editPage 为全量替换语义（2026-10-07 实测真实 API）：
+// title/content 必传（缺失报 TITLE_REQUIRED/CONTENT_REQUIRED），author_name/author_url
+// 不传即被清空——调用方必须带上建页时的全部参数（issue #12 author_url 回填）
+func (c *Client) EditPage(ctx context.Context, path string, page Page) error {
+	tok, err := c.accessToken(ctx)
+	if err != nil {
+		return err
+	}
+	req := struct {
+		AccessToken string `json:"access_token"`
+		Path        string `json:"path"`
+		Page
+	}{AccessToken: tok, Path: path, Page: page}
+	return c.call(ctx, "editPage", req, nil)
+}
+
 // saveToken 临时文件 + rename 原子落盘（CR1-#9），0600 防同机其他用户读取
 func saveToken(path, token string) error {
 	data, err := json.Marshal(map[string]string{"access_token": token})

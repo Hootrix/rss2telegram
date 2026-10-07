@@ -42,10 +42,23 @@ func TestFormatMessageTelegraphField(t *testing.T) {
 
 // fakeSnapshotter 快照编排替身：记录调用并可编排返回
 type fakeSnapshotter struct {
-	mu    sync.Mutex
-	calls int
-	url   string
-	err   error
+	mu        sync.Mutex
+	calls     int
+	url       string
+	err       error
+	backfills []backfillCall // BackfillAuthor 调用记录（issue #12 回填）
+}
+
+type backfillCall struct {
+	feed    string
+	msgLink string
+}
+
+func (f *fakeSnapshotter) BackfillAuthor(_ context.Context, feed config.FeedConfig, _ *gofeed.Item, msgLink string) error {
+	f.mu.Lock()
+	f.backfills = append(f.backfills, backfillCall{feed: feed.Name, msgLink: msgLink})
+	f.mu.Unlock()
+	return nil
 }
 
 func (f *fakeSnapshotter) Snapshot(_ context.Context, _ config.FeedConfig, _ *gofeed.Item) (string, error) {
@@ -78,11 +91,11 @@ func newSnapshotTestHandler(t *testing.T, feedCfg config.FeedConfig, snap Snapsh
 
 	var mu sync.Mutex
 	sent := &[]string{}
-	bot := sendTestFunc(func(_ context.Context, _ string, m *telegram.Message) error {
+	bot := sendTestFunc(func(_ context.Context, _ string, m *telegram.Message) (int64, error) {
 		mu.Lock()
 		*sent = append(*sent, m.Text())
 		mu.Unlock()
-		return nil
+		return 777, nil // 固定 msgID 供回填断言（issue #12）
 	})
 	return NewRssHandler(cfg, bot, store, snap), sent
 }
@@ -143,3 +156,41 @@ func TestProcessFeedNoSnapshotConfigured(t *testing.T) {
 }
 
 var _ = errors.New // 占位：保持 errors 导入（后续断言扩展用）
+
+// ---- author_url 消息链接回填（issue #12）----
+
+// 发送成功后对公开频道回填消息链接：t.me/<name>/<msgID>，msgID 取自 Send 响应
+func TestProcessFeedBackfillsMessageLink(t *testing.T) {
+	feed := config.FeedConfig{
+		Name: "special", Channels: []string{"@c"}, Snapshot: config.SnapshotTelegraph,
+		Template: "{title}",
+	}
+	snap := &fakeSnapshotter{url: "https://telegra.ph/p1"}
+	h, sent := newSnapshotTestHandler(t, feed, snap)
+
+	require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+	require.Len(t, *sent, 1, "前置：消息已发送")
+
+	snap.mu.Lock()
+	defer snap.mu.Unlock()
+	require.Len(t, snap.backfills, 1, "发送成功后必须回填一次")
+	assert.Equal(t, "special", snap.backfills[0].feed)
+	assert.Equal(t, "https://t.me/c/777", snap.backfills[0].msgLink)
+}
+
+// 私有频道（纯数字 ID）无公开消息链接，不回填；消息照发
+func TestProcessFeedNoBackfillForPrivateChannel(t *testing.T) {
+	feed := config.FeedConfig{
+		Name: "special", Channels: []string{"-1001234567890"}, Snapshot: config.SnapshotTelegraph,
+		Template: "{title}",
+	}
+	snap := &fakeSnapshotter{url: "https://telegra.ph/p1"}
+	h, sent := newSnapshotTestHandler(t, feed, snap)
+
+	require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+	require.Len(t, *sent, 1, "私有频道消息照发")
+
+	snap.mu.Lock()
+	defer snap.mu.Unlock()
+	assert.Empty(t, snap.backfills, "私有频道不得回填")
+}

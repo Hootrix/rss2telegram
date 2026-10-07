@@ -16,20 +16,30 @@ func newTestCache(ttl time.Duration, cap int) (*SnapshotCache, *time.Time) {
 	return c, now
 }
 
+// pageParamsOf 构造最小建页参数（URL 必填，其余回填断言用）
+func pageParamsOf(url string) snapshotPageParams {
+	return snapshotPageParams{URL: url, Path: url, Title: "t", Content: []any{"c"}, AuthorName: "a"}
+}
+
 func TestSnapshotCacheSetGet(t *testing.T) {
 	c, _ := newTestCache(time.Hour, 10)
 	_, ok := c.get("feed|item1")
 	assert.False(t, ok, "空缓存必 miss")
 
-	c.set("feed|item1", "https://telegra.ph/a")
-	url, ok := c.get("feed|item1")
+	// editPage 全量替换语义：缓存须保存完整建页参数供回填重提交（issue #12）
+	want := snapshotPageParams{
+		URL: "https://telegra.ph/a", Path: "a",
+		Title: "标题", Content: []any{"正文"}, AuthorName: "feed名",
+	}
+	c.set("feed|item1", want)
+	got, ok := c.get("feed|item1")
 	assert.True(t, ok)
-	assert.Equal(t, "https://telegra.ph/a", url)
+	assert.Equal(t, want, got)
 }
 
 func TestSnapshotCacheTTLExpiry(t *testing.T) {
 	c, now := newTestCache(24*time.Hour, 10)
-	c.set("feed|item1", "https://telegra.ph/a")
+	c.set("feed|item1", pageParamsOf("https://telegra.ph/a"))
 
 	*now = now.Add(23 * time.Hour)
 	_, ok := c.get("feed|item1")
@@ -42,11 +52,11 @@ func TestSnapshotCacheTTLExpiry(t *testing.T) {
 
 func TestSnapshotCacheLRUEviction(t *testing.T) {
 	c, _ := newTestCache(time.Hour, 2)
-	c.set("k1", "u1")
-	c.set("k2", "u2")
+	c.set("k1", pageParamsOf("u1"))
+	c.set("k2", pageParamsOf("u2"))
 	c.get("k1") // k1 变为最近使用，k2 成为最旧
 
-	c.set("k3", "u3") // 容量 2，淘汰最旧的 k2
+	c.set("k3", pageParamsOf("u3")) // 容量 2，淘汰最旧的 k2
 	_, ok := c.get("k2")
 	assert.False(t, ok, "最旧条目被 LRU 淘汰")
 	_, ok = c.get("k1")
@@ -57,9 +67,9 @@ func TestSnapshotCacheLRUEviction(t *testing.T) {
 
 func TestSnapshotCacheOverwriteNoDuplicate(t *testing.T) {
 	c, _ := newTestCache(time.Hour, 2)
-	c.set("k1", "u1")
-	c.set("k1", "u2") // 同 key 覆盖，不占新名额
+	c.set("k1", pageParamsOf("u1"))
+	c.set("k1", pageParamsOf("u2")) // 同 key 覆盖，不占新名额
 	assert.Equal(t, 1, c.len())
 	url, _ := c.get("k1")
-	assert.Equal(t, "u2", url, "覆盖后取新值")
+	assert.Equal(t, "u2", url.URL, "覆盖后取新值")
 }

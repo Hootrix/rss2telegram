@@ -17,13 +17,15 @@ import (
 )
 
 // fakeTelegraph 假 Telegraph API：记录 createAccount 次数（每次发出递增 token），
-// 记录最近一次 createPage 请求体；可切换为返回 API 错误
+// 记录最近一次 createPage/editPage 请求体；可切换为返回 API 错误
 type fakeTelegraph struct {
 	accounts    atomic.Int64
 	pages       atomic.Int64
-	apiErr      atomic.Value // string，非空时 createPage 返回该 API 错误
+	edits       atomic.Int64
+	apiErr      atomic.Value // string，非空时 createPage/editPage 返回该 API 错误
 	mu          sync.Mutex
 	lastPage    map[string]any
+	lastEdit    map[string]any
 	lastAccount map[string]any
 }
 
@@ -66,6 +68,20 @@ func newFakeTelegraph(t *testing.T) (*fakeTelegraph, *httptest.Server) {
 				"url":  "https://telegra.ph/Test-10-01",
 			},
 		})
+	})
+
+	mux.HandleFunc("POST /editPage", func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		ft.mu.Lock()
+		ft.lastEdit = req
+		ft.mu.Unlock()
+		if msg, ok := ft.apiErr.Load().(string); ok && msg != "" {
+			writeJSON(w, map[string]any{"ok": false, "error": msg})
+			return
+		}
+		ft.edits.Add(1)
+		writeJSON(w, map[string]any{"ok": true, "result": map[string]any{"ok": true}})
 	})
 
 	srv := httptest.NewServer(mux)
@@ -189,4 +205,41 @@ func TestBaseURLEnvOverride(t *testing.T) {
 	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), ft.accounts.Load())
+}
+
+// EditPage 全量替换语义（实测 TITLE_REQUIRED/CONTENT_REQUIRED/author 不传即清空）：
+// 请求体必须带全量 title/content/author_name/author_url（issue #12 回填）
+func TestEditPageFullParams(t *testing.T) {
+	ft, srv := newFakeTelegraph(t)
+	c := newTestClient(t, t.TempDir(), srv.URL)
+
+	content := []any{Node{Tag: "p", Children: []any{"hello"}}}
+	err := c.EditPage(context.Background(), "Test-10-01", Page{
+		Title:      "Test",
+		AuthorName: "special-feed",
+		AuthorURL:  "https://t.me/chan/42",
+		Content:    content,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), ft.edits.Load())
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	req := ft.lastEdit
+	assert.Equal(t, "Test-10-01", req["path"])
+	assert.Equal(t, "Test", req["title"])
+	assert.Equal(t, "special-feed", req["author_name"])
+	assert.Equal(t, "https://t.me/chan/42", req["author_url"])
+	assert.Equal(t, []any{map[string]any{"tag": "p", "children": []any{"hello"}}}, req["content"])
+	assert.NotEmpty(t, req["access_token"], "token 随请求发出（懒建号）")
+}
+
+func TestEditPageAPIError(t *testing.T) {
+	ft, srv := newFakeTelegraph(t)
+	ft.apiErr.Store("ACCESS_TOKEN_INVALID")
+	c := newTestClient(t, t.TempDir(), srv.URL)
+
+	err := c.EditPage(context.Background(), "Test-10-01", Page{Title: "t", Content: []any{"x"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "editPage")
 }

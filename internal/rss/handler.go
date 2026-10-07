@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,13 +45,16 @@ type RssHandler struct {
 
 type TelegramBot interface {
 	// Send(channel string, message string) error
-	Send(context.Context, string, *telegram.Message) error
+	// [issue #12] 返回 msgID 供快照页 author_url 回填消息链接
+	Send(context.Context, string, *telegram.Message) (int64, error)
 }
 
 // Snapshotter 快照编排抽象（*SnapshotService 实现）；
 // nil 时配置了 snapshot 的 feed 也只跳过快照不 panic
 type Snapshotter interface {
 	Snapshot(ctx context.Context, feed config.FeedConfig, item *gofeed.Item) (string, error)
+	// BackfillAuthor 发送成功后将快照页 author_url 更新为 msgLink（issue #12，尽力而为）
+	BackfillAuthor(ctx context.Context, feed config.FeedConfig, item *gofeed.Item, msgLink string) error
 }
 
 type channelSendState struct {
@@ -488,10 +492,12 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 			if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
 				continue
 			}
-			if h.sendWithRetry(ctx, channel, message, item.Title) {
+			if msgID, ok := h.sendWithRetry(ctx, channel, message, item.Title); ok {
 				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
 					log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
 				}
+				// [issue #12] 快照页 author_url 回填为消息链接（公开频道，尽力而为）
+				h.backfillSnapshotLink(ctx, feedConfig, item, channel, msgID)
 			}
 		}
 	}
@@ -595,7 +601,9 @@ func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
 }
 */
 
-func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, itemTitle string) bool {
+// sendWithRetry 带重试发送单条消息，返回成功消息的 message_id（失败为 0）与是否成功。
+// msgID 供快照页 author_url 回填消息链接（issue #12），非快照路径可忽略
+func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, itemTitle string) (int64, bool) {
 	budget := blockingBudget(h.messageBudget)
 	deadline := h.now().Add(budget)
 	ctx, cancel := context.WithTimeout(parent, budget)
@@ -603,24 +611,24 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 	state := h.channelState(channel)
 	if !claimChannel(ctx, state) {
 		log.Printf("Deferring item '%s' to channel %s: channel busy or cancelled", itemTitle, channel)
-		return false
+		return 0, false
 	}
 	defer func() { <-state.gate }()
 	delivery := telegram.NewMessage(message)
 	for attempt, floodCount := 0, 0; ; {
 		if !h.waitForSend(ctx, state, deadline, channel, itemTitle) {
-			return false
+			return 0, false
 		}
-		err := h.bot.Send(ctx, channel, delivery)
+		msgID, err := h.bot.Send(ctx, channel, delivery)
 		if err == nil {
 			state.nextSend = h.now().Add(sendInterval)
 			log.Printf("Successfully sent message to channel %s: %s", channel, itemTitle)
-			return true
+			return msgID, true
 		}
 		if ctx.Err() != nil {
 			// 之前静默返回，线上无法区分退出/超时与真实失败
 			log.Printf("Deferring item '%s' to channel %s: %v", itemTitle, channel, ctx.Err())
-			return false
+			return 0, false
 		}
 		var rate *telegram.RateLimitError
 		if errors.As(err, &rate) && rate != nil {
@@ -628,20 +636,37 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 			floodCount++
 			if floodCount > maxFloodRetries {
 				log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
-				return false
+				return 0, false
 			}
 			continue
 		}
 		attempt++
 		if attempt >= maxSendRetries {
 			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
-			return false
+			return 0, false
 		}
 		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
 		if !h.wait(ctx, backoffWithJitter(attempt-1), deadline) {
 			log.Printf("Deferring item '%s' to channel %s: backoff exceeds remaining budget or cancelled", itemTitle, channel)
-			return false
+			return 0, false
 		}
+	}
+}
+
+// backfillSnapshotLink 发送成功后将快照页 author_url 回填为消息链接（issue #12）。
+// 尽力而为：仅公开频道（channelURL 判定）回填；私有频道（纯数字 ID）跳过；
+// 未启用快照/编排器缺位/回填失败均不影响已推送消息，失败仅记日志。
+// 多频道场景每次覆盖——单页只装得下一个消息链接，最后成功者生效
+func (h *RssHandler) backfillSnapshotLink(ctx context.Context, feed config.FeedConfig, item *gofeed.Item, channel string, msgID int64) {
+	if h.snapshot == nil || feed.Snapshot == "" || msgID <= 0 {
+		return
+	}
+	if channelURL(channel) == "" {
+		return // 私有频道无公开 t.me 消息链接
+	}
+	msgLink := "https://t.me/" + strings.TrimPrefix(channel, "@") + "/" + strconv.FormatInt(msgID, 10)
+	if err := h.snapshot.BackfillAuthor(ctx, feed, item, msgLink); err != nil {
+		log.Printf("snapshot backfill author_url failed, feed %s item %q: %v", feed.Name, item.Title, err)
 	}
 }
 

@@ -65,7 +65,7 @@ type scriptBot struct {
 }
 
 // func (b *scriptBot) Send(channel, message string) error {
-func (b *scriptBot) Send(ctx context.Context, channel string, message *telegram.Message) error {
+func (b *scriptBot) Send(ctx context.Context, channel string, message *telegram.Message) (int64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	i := b.calls
@@ -73,7 +73,7 @@ func (b *scriptBot) Send(ctx context.Context, channel string, message *telegram.
 		i = len(b.script) - 1
 	}
 	b.calls++
-	return b.script[i]
+	return 0, b.script[i] // 脚本场景不关心 msgID（回填由专用用例覆盖）
 }
 
 func (b *scriptBot) recordSleep(d time.Duration) {
@@ -138,7 +138,7 @@ func TestSendWithRetryFloodRetriesIndependentOfNormalQuota(t *testing.T) {
 	}}
 	h := newRetryTestHandler(bot)
 
-	ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
+	_, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
 
 	require.True(t, ok, "5 次 flood 后第 6 次应成功")
 	calls, sleeps := bot.snapshot()
@@ -157,7 +157,7 @@ func TestSendWithRetryFloodRetryExhaustion(t *testing.T) {
 	}}
 	h := newRetryTestHandler(bot)
 
-	ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
+	_, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
 
 	assert.False(t, ok, "超过 5 次 flood 重试应放弃")
 	calls, sleeps := bot.snapshot()
@@ -172,7 +172,7 @@ func TestSendWithRetryFloodRetryExhaustion(t *testing.T) {
 //		bot := &scriptBot{script: []error{rateErr(300), nil}}
 //		h := newRetryTestHandler(bot)
 //
-//		ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
+//		ok, _ := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
 //
 //		require.True(t, ok)
 //		_, sleeps := bot.snapshot()
@@ -183,19 +183,25 @@ func TestSendWithRetryLongFloodWaitDefersChannel(t *testing.T) {
 	bot := &scriptBot{script: []error{rateErr(300), nil}}
 	h := newRetryTestHandler(bot)
 
-	assert.False(t, h.sendWithRetry(context.Background(), "@Channel", "msg", "标题"))
-	assert.False(t, h.sendWithRetry(context.Background(), "channel", "next", "下一条"))
+	assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@Channel", "msg", "标题"); return ok }())
+	assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "channel", "next", "下一条"); return ok }())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 1, calls, "冷却到期前同频道的其他消息也不得发送")
 	assert.Empty(t, sleeps, "超过阻塞预算应延后处理，不应截短等待")
 
-	assert.True(t, h.sendWithRetry(context.Background(), "@other", "msg", "其他频道"))
+	assert.True(t, func() bool {
+		_, ok := h.sendWithRetry(context.Background(), "@other", "msg", "其他频道")
+		return ok
+	}())
 	calls, _ = bot.snapshot()
 	assert.Equal(t, 2, calls, "其他频道不应被阻塞")
 
 	originalNow := h.nowFn
 	h.nowFn = func() time.Time { return originalNow().Add(300 * time.Second) }
-	assert.True(t, h.sendWithRetry(context.Background(), "@CHANNEL", "next", "冷却后补推"))
+	assert.True(t, func() bool {
+		_, ok := h.sendWithRetry(context.Background(), "@CHANNEL", "next", "冷却后补推")
+		return ok
+	}())
 	calls, sleeps = bot.snapshot()
 	assert.Equal(t, 3, calls)
 	assert.Equal(t, []time.Duration{time.Second}, sleeps, "300s 到期后仍须等完 1s 缓冲")
@@ -235,8 +241,8 @@ func TestSendWithRetrySharesChannelInterval(t *testing.T) {
 func TestSendWithRetrySharesChannelInterval(t *testing.T) {
 	bot := &scriptBot{script: []error{nil}}
 	h := newRetryTestHandler(bot)
-	assert.True(t, h.sendWithRetry(context.Background(), "@Channel", "msg", "标题"))
-	assert.True(t, h.sendWithRetry(context.Background(), "channel", "next", "下一条"))
+	assert.True(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@Channel", "msg", "标题"); return ok }())
+	assert.True(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "channel", "next", "下一条"); return ok }())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 2, calls)
 	assert.Equal(t, []time.Duration{sendInterval}, sleeps)
@@ -246,8 +252,11 @@ func TestSendWithRetrySharesDigitPrefixedChannel(t *testing.T) {
 	bot := &scriptBot{script: []error{nil}}
 	h := newRetryTestHandler(bot)
 
-	assert.True(t, h.sendWithRetry(context.Background(), "123Feed", "msg", "标题"))
-	assert.True(t, h.sendWithRetry(context.Background(), "@123feed", "next", "下一条"))
+	assert.True(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "123Feed", "msg", "标题"); return ok }())
+	assert.True(t, func() bool {
+		_, ok := h.sendWithRetry(context.Background(), "@123feed", "next", "下一条")
+		return ok
+	}())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 2, calls)
 	assert.Equal(t, []time.Duration{sendInterval}, sleeps)
@@ -259,8 +268,8 @@ func TestSendWithRetryKeepsExhaustedFloodCooldown(t *testing.T) {
 	}}
 	h := newRetryTestHandler(bot)
 
-	assert.False(t, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
-	assert.True(t, h.sendWithRetry(context.Background(), "@ch", "next", "下一条"))
+	assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题"); return ok }())
+	assert.True(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "next", "下一条"); return ok }())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 7, calls)
 	require.Len(t, sleeps, 6, "放弃上一条消息后，下一条仍须遵守最后一次 429 的冷却")
@@ -286,7 +295,7 @@ func TestSendWithRetryRejectsInvalidFloodWait(t *testing.T) {
 			}}
 			h := newRetryTestHandler(bot)
 
-			assert.False(t, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
+			assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题"); return ok }())
 			calls, sleeps := bot.snapshot()
 			assert.Equal(t, 1, calls, "异常等待值应终止当前消息重试")
 			assert.Empty(t, sleeps, "不得 sleep 非正数或溢出的等待值")
@@ -300,7 +309,7 @@ func TestSendWithRetryInvalidSecondsUseNormalQuota(t *testing.T) {
 		t.Run(fmt.Sprint(seconds), func(t *testing.T) {
 			bot := &scriptBot{script: []error{telegram.NewRateLimitError(seconds, errors.New("429"))}}
 			h := newRetryTestHandler(bot)
-			assert.False(t, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
+			assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题"); return ok }())
 			calls, sleeps := bot.snapshot()
 			assert.Equal(t, 3, calls)
 			assert.Len(t, sleeps, 2)
@@ -314,7 +323,7 @@ func TestSendWithRetryNormalErrorsExhaustQuota(t *testing.T) {
 	bot := &scriptBot{script: []error{generic, generic, generic}}
 	h := newRetryTestHandler(bot)
 
-	ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
+	_, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
 
 	assert.False(t, ok)
 	calls, sleeps := bot.snapshot()
@@ -334,7 +343,7 @@ func TestSendWithRetryMixedErrorsKeepSeparateQuotas(t *testing.T) {
 	}}
 	h := newRetryTestHandler(bot)
 
-	ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
+	_, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
 
 	assert.False(t, ok)
 	calls, _ := bot.snapshot()
@@ -347,7 +356,7 @@ func TestSendWithRetryCumulativeBudget(t *testing.T) {
 	h := newRetryTestHandler(bot)
 	h.messageBudget = 7 * time.Second
 
-	assert.False(t, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
+	assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题"); return ok }())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 3, calls)
 	assert.Equal(t, []time.Duration{3 * time.Second, 3 * time.Second}, sleeps)
@@ -365,7 +374,7 @@ func TestSendWithRetryCancellationInterruptsBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan bool, 1)
-	go func() { done <- h.sendWithRetry(ctx, "@ch", "msg", "标题") }()
+	go func() { _, ok := h.sendWithRetry(ctx, "@ch", "msg", "标题"); done <- ok }()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -385,7 +394,7 @@ func TestSendWithRetryCancellationInterruptsBackoff(t *testing.T) {
 func TestSendWithRetryCancellationInterruptsChannelCooldown(t *testing.T) {
 	bot := &scriptBot{script: []error{nil}}
 	h := newRetryTestHandler(bot)
-	require.True(t, h.sendWithRetry(context.Background(), "@ch", "msg", "第一条"))
+	require.True(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "第一条"); return ok }())
 	entered := make(chan struct{})
 	h.waitFn = func(ctx context.Context, _ time.Duration) error {
 		close(entered)
@@ -395,7 +404,7 @@ func TestSendWithRetryCancellationInterruptsChannelCooldown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan bool, 1)
-	go func() { done <- h.sendWithRetry(ctx, "@ch", "next", "下一条") }()
+	go func() { _, ok := h.sendWithRetry(ctx, "@ch", "next", "下一条"); done <- ok }()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -414,22 +423,25 @@ func TestSendWithRetryCancellationInterruptsChannelCooldown(t *testing.T) {
 
 func TestSendWithRetryBusyChannelDefersWithoutQueueing(t *testing.T) {
 	started := make(chan struct{})
-	h := &RssHandler{bot: sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) error {
+	h := &RssHandler{bot: sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) (int64, error) {
 		close(started)
 		<-ctx.Done()
-		return ctx.Err()
+		return 0, ctx.Err()
 	})}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	firstDone := make(chan bool, 1)
-	go func() { firstDone <- h.sendWithRetry(ctx, "@Channel", "msg", "第一条") }()
+	go func() { _, ok := h.sendWithRetry(ctx, "@Channel", "msg", "第一条"); firstDone <- ok }()
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("发送未启动")
 	}
 	secondDone := make(chan bool, 1)
-	go func() { secondDone <- h.sendWithRetry(context.Background(), "channel", "next", "下一条") }()
+	go func() {
+		_, ok := h.sendWithRetry(context.Background(), "channel", "next", "下一条")
+		secondDone <- ok
+	}()
 	select {
 	case ok := <-secondDone:
 		assert.False(t, ok, "忙频道应延后，不在频道锁后排队")
@@ -448,14 +460,14 @@ func TestSendWithRetryBusyChannelDefersWithoutQueueing(t *testing.T) {
 func TestProcessFeedsTwoFloodedFeedsDoNotStarveThird(t *testing.T) {
 	var mu sync.Mutex
 	calls := make(map[string]int)
-	bot := sendTestFunc(func(_ context.Context, channel string, _ *telegram.Message) error {
+	bot := sendTestFunc(func(_ context.Context, channel string, _ *telegram.Message) (int64, error) {
 		mu.Lock()
 		calls[channel]++
 		mu.Unlock()
 		if channel != "@ready" {
-			return rateErr(119)
+			return 0, rateErr(119)
 		}
-		return nil
+		return 0, nil
 	})
 	h := newProcessTestHandler(t, []string{"@flood_a", "@flood_b", "@ready"}, bot)
 	require.NoError(t, h.ProcessFeeds(context.Background()))
@@ -514,15 +526,15 @@ func TestProcessFeedsHangingFetchDoesNotStarveQueuedFeed(t *testing.T) {
 func TestProcessFeedsBacklogFeedsDoNotStarveLaterFeed(t *testing.T) {
 	var mu sync.Mutex
 	calls := make(map[string]int)
-	bot := sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) error {
+	bot := sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) (int64, error) {
 		mu.Lock()
 		calls[channel]++
 		mu.Unlock()
 		if channel == "@ready" {
-			return nil
+			return 0, nil
 		}
 		<-ctx.Done() // 模拟积压：发送一直占满 feed 预算
-		return ctx.Err()
+		return 0, ctx.Err()
 	})
 	h := newProcessTestHandler(t, []string{"@slow_a", "@slow_b", "@ready"}, bot)
 	h.feedBudget = 100 * time.Millisecond
@@ -539,12 +551,12 @@ func TestProcessFeedsBacklogFeedsDoNotStarveLaterFeed(t *testing.T) {
 func TestProcessFeedBudgetExhaustedDefersRemainingChannels(t *testing.T) {
 	var mu sync.Mutex
 	calls := make(map[string]int)
-	bot := sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) error {
+	bot := sendTestFunc(func(ctx context.Context, channel string, _ *telegram.Message) (int64, error) {
 		mu.Lock()
 		calls[channel]++
 		mu.Unlock()
 		<-ctx.Done()
-		return ctx.Err()
+		return 0, ctx.Err()
 	})
 	h := newProcessTestHandler(t, []string{"@slow"}, bot)
 	feed := h.config.Feeds[0]
@@ -594,7 +606,7 @@ func TestSendWithRetryRepeated119SecondsDefers(t *testing.T) {
 	bot := &scriptBot{script: []error{rateErr(119)}}
 	h := newRetryTestHandler(bot)
 
-	assert.False(t, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
+	assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题"); return ok }())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 1, calls, "119s 冷却应立即延后，不能在单条消息里等待五轮")
 	assert.Empty(t, sleeps)
@@ -606,7 +618,7 @@ func TestSendWithRetryInvalidRetryAfterUsesNormalQuota(t *testing.T) {
 	}}
 	h := newRetryTestHandler(bot)
 
-	assert.False(t, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
+	assert.False(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题"); return ok }())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 3, calls, "非法 retry_after 应统一走普通错误配额")
 	assert.Len(t, sleeps, 2)
@@ -672,7 +684,8 @@ func TestSendWithRetryShortWaitThreshold(t *testing.T) {
 		t.Run(fmt.Sprint(seconds), func(t *testing.T) {
 			bot := &scriptBot{script: []error{telegram.NewRateLimitError(seconds, errors.New("429")), nil}}
 			h := newRetryTestHandler(bot)
-			assert.Equal(t, seconds == 9, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
+			_, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题")
+			assert.Equal(t, seconds == 9, ok)
 			calls, sleeps := bot.snapshot()
 			if seconds == 9 {
 				assert.Equal(t, 2, calls)
@@ -689,7 +702,7 @@ func TestSendWithRetryRecognizesWrappedRateLimitError(t *testing.T) {
 	bot := &scriptBot{script: []error{fmt.Errorf("send: %w", rateErr(1)), nil}}
 	h := newRetryTestHandler(bot)
 
-	assert.True(t, h.sendWithRetry(context.Background(), "@ch", "msg", "标题"))
+	assert.True(t, func() bool { _, ok := h.sendWithRetry(context.Background(), "@ch", "msg", "标题"); return ok }())
 	calls, sleeps := bot.snapshot()
 	assert.Equal(t, 2, calls)
 	assert.Equal(t, []time.Duration{2 * time.Second}, sleeps)
@@ -697,9 +710,9 @@ func TestSendWithRetryRecognizesWrappedRateLimitError(t *testing.T) {
 
 // type sendTestFunc func(string, string) error
 // func (f sendTestFunc) Send(channel, message string) error { return f(channel, message) }
-type sendTestFunc func(context.Context, string, *telegram.Message) error
+type sendTestFunc func(context.Context, string, *telegram.Message) (int64, error)
 
-func (f sendTestFunc) Send(ctx context.Context, channel string, message *telegram.Message) error {
+func (f sendTestFunc) Send(ctx context.Context, channel string, message *telegram.Message) (int64, error) {
 	return f(ctx, channel, message)
 }
 
@@ -707,12 +720,12 @@ func TestSendWithRetryDifferentChannelsCanProceed(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	firstDone := make(chan bool, 1)
-	h := &RssHandler{bot: sendTestFunc(func(_ context.Context, channel string, _ *telegram.Message) error {
+	h := &RssHandler{bot: sendTestFunc(func(_ context.Context, channel string, _ *telegram.Message) (int64, error) {
 		if channel == "@blocked" {
 			close(started)
 			<-release
 		}
-		return nil
+		return 0, nil
 	})}
 	defer func() {
 		close(release)
@@ -723,7 +736,10 @@ func TestSendWithRetryDifferentChannelsCanProceed(t *testing.T) {
 			t.Error("被阻塞的发送未退出")
 		}
 	}()
-	go func() { firstDone <- h.sendWithRetry(context.Background(), "@blocked", "msg", "第一频道") }()
+	go func() {
+		_, ok := h.sendWithRetry(context.Background(), "@blocked", "msg", "第一频道")
+		firstDone <- ok
+	}()
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
@@ -731,7 +747,10 @@ func TestSendWithRetryDifferentChannelsCanProceed(t *testing.T) {
 	}
 
 	secondDone := make(chan bool, 1)
-	go func() { secondDone <- h.sendWithRetry(context.Background(), "@other", "msg", "其他频道") }()
+	go func() {
+		_, ok := h.sendWithRetry(context.Background(), "@other", "msg", "其他频道")
+		secondDone <- ok
+	}()
 	select {
 	case ok := <-secondDone:
 		assert.True(t, ok)

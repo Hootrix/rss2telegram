@@ -28,6 +28,9 @@ const defaultPublishTimeout = 10 * time.Second
 // title 占位：Telegraph title 必填 1-256，RSS item 可能无标题
 const snapshotUntitled = "无标题"
 
+// 快照页面域（createPage 返回 URL 的固定前缀；缓存条目 Path 由其截取）
+const telegraphPagePrefix = "https://telegra.ph/"
+
 // feed 来源正文缺失（Content 与 Description 皆空）
 var errEmptyFeedContent = errors.New("empty feed content")
 
@@ -38,6 +41,8 @@ type pageFetcher interface {
 
 type pagePublisher interface {
 	CreatePage(ctx context.Context, page telegraph.Page) (string, error)
+	// EditPage 全量替换语义：title/content 必传，author 不传即清空（author_url 回填用）
+	EditPage(ctx context.Context, path string, page telegraph.Page) error
 }
 
 type SnapshotService struct {
@@ -69,8 +74,8 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 
 	// 缓存 key 带 feed 维度：GUID 仅 feed 内唯一，跨 feed 必撞（CR2-#2）
 	key := feed.Name + "|" + generateItemID(item)
-	if url, ok := s.cache.get(key); ok {
-		return url, nil
+	if page, ok := s.cache.get(key); ok {
+		return page.URL, nil
 	}
 
 	// 旧实现（snapshot_source 分派前：正文固定抓原文）注释保留：
@@ -92,9 +97,10 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 
 	pubCtx, cancel := context.WithTimeout(ctx, s.publishTimeout)
 	defer cancel()
+	authorName := truncateByRunes(feed.Name, 128)
 	url, err := s.publisher.CreatePage(pubCtx, telegraph.Page{
 		Title:      title,
-		AuthorName: truncateByRunes(feed.Name, 128),
+		AuthorName: authorName,
 		AuthorURL:  channelURL(feed.Channels[0]),
 		Content:    content,
 	})
@@ -102,9 +108,40 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 		return s.settle(ctx, item, fmt.Errorf("createPage %s: %w", item.Link, err))
 	}
 
-	// 只缓存成功：降级值不入缓存，避免一次临时失败被永久固化
-	s.cache.set(key, url)
+	// 只缓存成功：降级值不入缓存，避免一次临时失败被永久固化。
+	// 缓存完整建页参数（而非仅 URL）：editPage 全量替换语义下回填 author_url 需原样重提交
+	s.cache.set(key, snapshotPageParams{
+		URL:        url,
+		Path:       strings.TrimPrefix(url, telegraphPagePrefix),
+		Title:      title,
+		Content:    content,
+		AuthorName: authorName,
+	})
 	return url, nil
+}
+
+// BackfillAuthor 将快照页 author_url 回填为消息链接（t.me/<channel>/<msg_id>）。
+// 尽力而为：未建页/降级（降级值不入缓存，天然 miss）与缓存缺失（进程重启前的旧条目）
+// 静默跳过返回 nil；editPage 失败返回错误由调用方记日志，不影响已推送的消息。
+// 多频道场景每次覆盖（最后成功者生效——单页只装得下一个消息链接）
+func (s *SnapshotService) BackfillAuthor(ctx context.Context, feed config.FeedConfig, item *gofeed.Item, msgLink string) error {
+	// 与 Snapshot 同一 key：降级（fetch 失败等）不入缓存，get 必 miss → 跳过
+	page, ok := s.cache.get(feed.Name + "|" + generateItemID(item))
+	if !ok {
+		return nil
+	}
+
+	publishCtx, cancel := context.WithTimeout(ctx, s.publishTimeout)
+	defer cancel()
+	if err := s.publisher.EditPage(publishCtx, page.Path, telegraph.Page{
+		Title:      page.Title,
+		AuthorName: page.AuthorName,
+		AuthorURL:  msgLink,
+		Content:    page.Content,
+	}); err != nil {
+		return fmt.Errorf("editPage %s: %w", page.URL, err)
+	}
+	return nil
 }
 
 // sourceNodes 取快照正文并转为 Telegraph 节点，按 feed.SnapshotSource 分派（issue #12）：

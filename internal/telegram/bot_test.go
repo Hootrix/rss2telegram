@@ -27,7 +27,8 @@ type fakeTG struct {
 	flood429        bool             // 每次 sendMessage 返回 429 + retry_after（issue #6 线上报文形态）
 	floodNo429      bool             // 每次 sendMessage 返回 429 但无 retry_after 参数
 	floodRetryAfter int64
-	getChatHits     int // getChat 被调用次数（issue #6 后应为 0）
+	msgID           int64 // 成功响应携带的 message_id；0 = 固定返回 1（回填测试用）
+	getChatHits     int   // getChat 被调用次数（issue #6 后应为 0）
 	server          *httptest.Server
 }
 
@@ -96,10 +97,14 @@ func newFakeTG(failFirst bool) *fakeTG {
 				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 150"}`))
 				return
 			}
+			msgID := int64(1)
+			if f.msgID != 0 {
+				msgID = f.msgID
+			}
 			writeFakeJSON(w, map[string]any{
 				"ok": true,
 				"result": map[string]any{
-					"message_id": 1,
+					"message_id": msgID,
 					"chat":       map[string]any{"id": -1009999, "type": "channel"},
 					"date":       1,
 					"text":       m["text"],
@@ -136,7 +141,7 @@ func TestSendFallsBackToPlainTextOnParseEntitiesError(t *testing.T) {
 	assert.NoError(t, err)
 
 	// 消息含 Escape 产物（title 转义后），降级纯文本时应被反转义
-	err = bot.Send(context.Background(), "@it_test", NewMessage(`\[特惠产品]天幕 3\*4.35米`))
+	_, err = bot.Send(context.Background(), "@it_test", NewMessage(`\[特惠产品]天幕 3\*4.35米`))
 	assert.NoError(t, err)
 
 	sends := fake.sends_()
@@ -159,7 +164,7 @@ func TestSendMarkdownSuccessSingleRequest(t *testing.T) {
 	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send(context.Background(), "@it_test", NewMessage("*正常*消息"))
+	_, err = bot.Send(context.Background(), "@it_test", NewMessage("*正常*消息"))
 	assert.NoError(t, err)
 
 	sends := fake.sends_()
@@ -178,7 +183,7 @@ func TestSendFlood429ReturnsRateLimitErrorWithoutGetChat(t *testing.T) {
 	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
+	_, err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
 	require.Error(t, err)
 
 	var rlErr *RateLimitError
@@ -209,7 +214,7 @@ func TestSendFlood429WithoutRetryAfterStaysPlainError(t *testing.T) {
 	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
+	_, err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
 	require.Error(t, err)
 
 	var rlErr *RateLimitError
@@ -226,7 +231,7 @@ func TestSendEmptyChannelFailsFast(t *testing.T) {
 	bot, err := NewBot(context.Background(), "1:test")
 	assert.NoError(t, err)
 
-	err = bot.Send(context.Background(), "", NewMessage("hello"))
+	_, err = bot.Send(context.Background(), "", NewMessage("hello"))
 	require.Error(t, err)
 
 	assert.Empty(t, fake.sends_(), "空 channel 不应发起 sendMessage")
@@ -279,7 +284,7 @@ func TestSendFloodRetryAfterValidation(t *testing.T) {
 			bot, err := NewBot(context.Background(), "1:test")
 			require.NoError(t, err)
 
-			err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
+			_, err = bot.Send(context.Background(), "@it_test", NewMessage("hello"))
 			require.Error(t, err)
 			var rlErr *RateLimitError
 			assert.Equal(t, tc.wantRateLimit, errors.As(err, &rlErr))
@@ -304,7 +309,7 @@ func TestSendPlainTextFallbackPreservesRateLimitError(t *testing.T) {
 	bot, err := NewBot(context.Background(), "1:test")
 	require.NoError(t, err)
 
-	err = bot.Send(context.Background(), "@it_test", NewMessage(`\[标题]`))
+	_, err = bot.Send(context.Background(), "@it_test", NewMessage(`\[标题]`))
 	var rlErr *RateLimitError
 	require.True(t, errors.As(err, &rlErr))
 	assert.Equal(t, 21*time.Second, rlErr.RetryAfter)
@@ -327,8 +332,8 @@ func TestSendRetryKeepsPlainTextFallback(t *testing.T) {
 	// require.Error(t, bot.Send("@it_test", `\[标题]`))
 	// require.Error(t, bot.Send("@it_test", `\[标题]`))
 	message := NewMessage(`\[标题]`)
-	require.Error(t, bot.Send(context.Background(), "@it_test", message))
-	require.Error(t, bot.Send(context.Background(), "@it_test", message))
+	require.Error(t, func() error { _, err := bot.Send(context.Background(), "@it_test", message); return err }())
+	require.Error(t, func() error { _, err := bot.Send(context.Background(), "@it_test", message); return err }())
 	sends := fake.sends_()
 	require.Len(t, sends, 3)
 	assert.Equal(t, "Markdown", sends[0]["parse_mode"])
@@ -357,7 +362,7 @@ func TestSendContextCancelsInFlightRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- bot.Send(ctx, "@ch", NewMessage("hello")) }()
+	go func() { _, err := bot.Send(ctx, "@ch", NewMessage("hello")); done <- err }()
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
@@ -396,7 +401,7 @@ func TestSendDeadlineCancelsResponseBodyRead(t *testing.T) {
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	err = bot.Send(ctx, "@ch", NewMessage("hello"))
+	_, err = bot.Send(ctx, "@ch", NewMessage("hello"))
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.NotContains(t, err.Error(), "1:test")
 }
@@ -465,4 +470,35 @@ func TestChannelKey(t *testing.T) {
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, ChannelKey(tc.channel), "channel: %q", tc.channel)
 	}
+}
+
+// Send 返回成功消息的 message_id（issue #12：快照页 author_url 回填消息链接用）；
+// markdown 降级重发场景取最终成功那次的 message_id
+func TestSendReturnsMessageID(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.msgID = 777
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	id, err := bot.Send(context.Background(), "@it_test", NewMessage("*正常*消息"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(777), id)
+}
+
+func TestSendReturnsFinalMessageIDOnPlainFallback(t *testing.T) {
+	fake := newFakeTG(true) // 首次 markdown 400 → 纯文本重发成功
+	fake.msgID = 888
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	id, err := bot.Send(context.Background(), "@it_test", NewMessage(`\[特惠]3\*4`))
+	require.NoError(t, err)
+	require.Len(t, fake.sends_(), 2, "前置：确实走了降级重发")
+	assert.Equal(t, int64(888), id, "取最终成功那次的 message_id")
 }

@@ -16,9 +16,19 @@ const (
 	defaultSnapshotCacheCap = 1024
 )
 
+// snapshotPageParams 建页参数快照：editPage 为全量替换语义（不传即清空），
+// author_url 回填需原样重提交 title/content/author_name（issue #12）
+type snapshotPageParams struct {
+	URL        string
+	Path       string // editPage 用：URL 去掉页面域前缀
+	Title      string
+	Content    []any
+	AuthorName string
+}
+
 type cacheEntry struct {
 	key       string
-	url       string
+	page      snapshotPageParams
 	expiresAt time.Time
 }
 
@@ -50,37 +60,37 @@ func NewSnapshotCache(ttl time.Duration, cap int) *SnapshotCache {
 	}
 }
 
-// get 命中返回快照 URL；过期条目即删（惰性淘汰）
-func (c *SnapshotCache) get(key string) (string, bool) {
+// get 命中返回建页参数快照；过期条目即删（惰性淘汰）
+func (c *SnapshotCache) get(key string) (snapshotPageParams, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.entries[key]
 	if !ok {
-		return "", false
+		return snapshotPageParams{}, false
 	}
 	entry := el.Value.(*cacheEntry)
 	if !c.now().Before(entry.expiresAt) {
 		c.order.Remove(el)
 		delete(c.entries, key)
-		return "", false
+		return snapshotPageParams{}, false
 	}
 	c.order.MoveToFront(el)
-	return entry.url, true
+	return entry.page, true
 }
 
 // set 写入并置于队首；超容量按最旧淘汰（LRU 兜底，防慢泄漏）
-func (c *SnapshotCache) set(key, url string) {
+func (c *SnapshotCache) set(key string, page snapshotPageParams) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.entries[key]; ok {
-		el.Value.(*cacheEntry).url = url
+		el.Value.(*cacheEntry).page = page
 		el.Value.(*cacheEntry).expiresAt = c.now().Add(c.ttl)
 		c.order.MoveToFront(el)
 		return
 	}
 	el := c.order.PushFront(&cacheEntry{
 		key:       key,
-		url:       url,
+		page:      page,
 		expiresAt: c.now().Add(c.ttl),
 	})
 	c.entries[key] = el
