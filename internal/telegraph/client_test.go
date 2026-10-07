@@ -71,7 +71,7 @@ func newFakeTelegraph(t *testing.T) (*fakeTelegraph, *httptest.Server) {
 		writeJSON(w, map[string]any{
 			"ok": true,
 			"result": map[string]any{
-				"path": "/Test-10-01",
+				"path": "Test-10-01", // 与真实 API 一致：无 leading slash
 				"url":  "https://telegra.ph/Test-10-01",
 			},
 		})
@@ -110,13 +110,14 @@ func TestCreatePageLazyAccount(t *testing.T) {
 	dir := t.TempDir()
 	c := newTestClient(t, dir, srv.URL)
 
-	url, err := c.CreatePage(context.Background(), Page{
+	url, path, err := c.CreatePage(context.Background(), Page{
 		Title:      "Test",
 		AuthorName: "special-feed",
 		Content:    []any{Node{Tag: "p", Children: []any{"hello"}}},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "https://telegra.ph/Test-10-01", url)
+	assert.Equal(t, "Test-10-01", path, "path 应取 API result 自带字段")
 
 	// 首次使用自动匿名建号一次，token 随 createPage 请求发出
 	assert.Equal(t, int64(1), ft.accounts.Load())
@@ -139,12 +140,12 @@ func TestTokenPersistenceReuse(t *testing.T) {
 	dir := t.TempDir()
 
 	c1 := newTestClient(t, dir, srv.URL)
-	_, err := c1.CreatePage(context.Background(), Page{Title: "t"})
+	_, _, err := c1.CreatePage(context.Background(), Page{Title: "t"})
 	require.NoError(t, err)
 
 	// 新实例复用持久化 token，不重复建号
 	c2 := newTestClient(t, dir, srv.URL)
-	_, err = c2.CreatePage(context.Background(), Page{Title: "t2"})
+	_, _, err = c2.CreatePage(context.Background(), Page{Title: "t2"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), ft.accounts.Load())
 }
@@ -157,7 +158,7 @@ func TestCorruptTokenFileRecreates(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, tokenFile), []byte("\x00garbage"), 0o600))
 
 	c := newTestClient(t, dir, srv.URL)
-	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
+	_, _, err := c.CreatePage(context.Background(), Page{Title: "t"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), ft.accounts.Load())
 
@@ -186,12 +187,14 @@ func TestConcurrentLazyInitSingleAccount(t *testing.T) {
 
 func TestCreatePageAPIError(t *testing.T) {
 	ft, srv := newFakeTelegraph(t)
-	ft.apiErr.Store("AccessTokenInvalid")
+	// 非凭证类 API 错误不触发重建（错误码经 apiError 类型精确判定，外部 CR）
+	ft.apiErr.Store("CONTENT_TOO_BIG")
 
 	c := newTestClient(t, t.TempDir(), srv.URL)
-	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
+	_, _, err := c.CreatePage(context.Background(), Page{Title: "t"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "AccessTokenInvalid")
+	assert.Contains(t, err.Error(), "CONTENT_TOO_BIG")
+	assert.Equal(t, int64(1), ft.accounts.Load(), "非 TOKEN 错误不应触发重建")
 }
 
 func TestCreatePageServerUnreachable(t *testing.T) {
@@ -200,7 +203,7 @@ func TestCreatePageServerUnreachable(t *testing.T) {
 	srv.Close() // 立即关闭，构造网络不可达
 
 	c := newTestClient(t, t.TempDir(), url)
-	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
+	_, _, err := c.CreatePage(context.Background(), Page{Title: "t"})
 	require.Error(t, err)
 }
 
@@ -209,7 +212,7 @@ func TestBaseURLEnvOverride(t *testing.T) {
 	// 与 telegram 包 TELEGRAM_API_URL 同款约定：集成测试指向本地假服务器
 	t.Setenv("TELEGRAPH_API_URL", srv.URL)
 	c := NewClient(t.TempDir(), "", nil)
-	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
+	_, _, err := c.CreatePage(context.Background(), Page{Title: "t"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), ft.accounts.Load())
 }
@@ -249,6 +252,8 @@ func TestEditPageAPIError(t *testing.T) {
 	err := c.EditPage(context.Background(), "Test-10-01", Page{Title: "t", Content: []any{"x"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "editPage")
+	// 编辑页不重建重试：新账号也编不了旧账号的页面，白建一号（外部 CR）
+	assert.Equal(t, int64(1), ft.accounts.Load())
 }
 
 // token 失效自愈（外部 CR）：格式合法但已失效的 token 会让每次建页降级，
@@ -259,13 +264,13 @@ func TestInvalidTokenRefreshesAndRetries(t *testing.T) {
 	c := newTestClient(t, dir, srv.URL)
 
 	// 首次建页拿到 TOKEN-1 并落盘
-	_, err := c.CreatePage(context.Background(), Page{Title: "t1"})
+	_, _, err := c.CreatePage(context.Background(), Page{Title: "t1"})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), ft.accounts.Load())
 
 	// TOKEN-1 失效：createPage 应自动清凭证、建 TOKEN-2、重试成功
 	ft.badTokens.Store("TOKEN-1", true)
-	url, err := c.CreatePage(context.Background(), Page{Title: "t2"})
+	url, _, err := c.CreatePage(context.Background(), Page{Title: "t2"})
 	require.NoError(t, err, "失效 token 应自愈而非降级")
 	assert.Equal(t, "https://telegra.ph/Test-10-01", url)
 	assert.Equal(t, int64(2), ft.accounts.Load(), "失效后应重建一次账号")
@@ -273,7 +278,7 @@ func TestInvalidTokenRefreshesAndRetries(t *testing.T) {
 
 	// 新 token 已落盘：新实例直接复用，不再回退到失效的 TOKEN-1
 	c2 := newTestClient(t, dir, srv.URL)
-	_, err = c2.CreatePage(context.Background(), Page{Title: "t3"})
+	_, _, err = c2.CreatePage(context.Background(), Page{Title: "t3"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), ft.accounts.Load(), "不应再建第三次账号")
 	ft.mu.Lock()
@@ -290,8 +295,39 @@ func TestInvalidTokenRetryStillFails(t *testing.T) {
 	ft.badTokens.Store("TOKEN-1", true)
 	ft.badTokens.Store("TOKEN-2", true)
 
-	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
+	_, _, err := c.CreatePage(context.Background(), Page{Title: "t"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ACCESS_TOKEN_INVALID")
 	assert.Equal(t, int64(2), ft.accounts.Load(), "重建一次后不再追加重建")
+}
+
+// 并发失效只重建一次（外部 CR）：handler 并发处理 feed，N 个 feed 同遇
+// ACCESS_TOKEN_INVALID 时 refreshToken 的 stale 比较应只放行一个重建，
+// 其余直接复用新 token——无比较则锁只排队、各建一号（共 N+1 次）
+func TestInvalidTokenConcurrentSingleRebuild(t *testing.T) {
+	ft, srv := newFakeTelegraph(t)
+	dir := t.TempDir()
+	c := newTestClient(t, dir, srv.URL)
+
+	// 先落盘拿到 TOKEN-1，再标记失效
+	_, _, err := c.CreatePage(context.Background(), Page{Title: "warm"})
+	require.NoError(t, err)
+	ft.badTokens.Store("TOKEN-1", true)
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, errs[i] = c.CreatePage(context.Background(), Page{Title: "t"})
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, int64(2), ft.accounts.Load(), "并发失效应只重建一次")
+	assert.Equal(t, int64(1+n), ft.pages.Load())
 }

@@ -44,6 +44,7 @@ type fakePublisher struct {
 	mu    sync.Mutex
 	pages []telegraph.Page
 	url   string
+	path  string // 空时从 url 截 telegraphPagePrefix 得出（模拟 API 返回的 path 字段）
 	err   error
 	block bool // 阻塞直到 ctx 结束（模拟慢发布触发父取消判定）
 
@@ -69,19 +70,23 @@ func (p *fakePublisher) EditPage(ctx context.Context, path string, page telegrap
 	return nil
 }
 
-func (p *fakePublisher) CreatePage(ctx context.Context, page telegraph.Page) (string, error) {
+func (p *fakePublisher) CreatePage(ctx context.Context, page telegraph.Page) (string, string, error) {
 	p.calls.Add(1)
 	p.mu.Lock()
 	p.pages = append(p.pages, page)
 	p.mu.Unlock()
 	if p.block {
 		<-ctx.Done()
-		return "", ctx.Err()
+		return "", "", ctx.Err()
 	}
 	if p.err != nil {
-		return "", p.err
+		return "", "", p.err
 	}
-	return p.url, nil
+	path := p.path
+	if path == "" {
+		path = strings.TrimPrefix(p.url, telegraphPagePrefix)
+	}
+	return p.url, path, nil
 }
 
 func newSnapSvc(fetcher *fakeFetcher, publisher *fakePublisher) *SnapshotService {
@@ -516,10 +521,10 @@ func TestBackfillAuthorRetryAfterFailure(t *testing.T) {
 	assert.Equal(t, "https://t.me/chan2/2", pub.edits[1].page.AuthorURL)
 }
 
-// 页面 path 兜底：createPage 返回 URL 非 telegra.ph 前缀（假服务器/域名变化）时
-// 取 URL path 段，不把整段 URL 当 path 发给 editPage（外部 CR）
-func TestSnapshotPathFallbackToURLPath(t *testing.T) {
-	pub := &fakePublisher{url: "http://fake.local/pg-7"}
+// 页面 path 直接用 createPage 返回值：假服务器/非 telegra.ph 域下不再从 URL 截取
+// （旧实现会在带路径前缀的假服务器上算错 path，外部 CR）
+func TestSnapshotPathFromAPIResponse(t *testing.T) {
+	pub := &fakePublisher{url: "http://fake.local/pg-7", path: "pg-7"}
 	svc := newSnapSvc(&fakeFetcher{html: fullBodyHTML}, pub)
 	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
 
@@ -530,7 +535,7 @@ func TestSnapshotPathFallbackToURLPath(t *testing.T) {
 	pub.mu.Lock()
 	defer pub.mu.Unlock()
 	require.Len(t, pub.edits, 1)
-	assert.Equal(t, "pg-7", pub.edits[0].path, "path 应从 URL path 段兜底解析")
+	assert.Equal(t, "pg-7", pub.edits[0].path, "path 应为 API 返回值，不从 URL 推导")
 }
 
 // ---- author_url 构造（边界表：@name 去掉 @；裸名直接拼；纯数字 ID 不构造）----

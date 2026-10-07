@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	neturl "net/url"
 	"strings"
 	"time"
 
@@ -29,7 +28,7 @@ const defaultPublishTimeout = 10 * time.Second
 // title 占位：Telegraph title 必填 1-256，RSS item 可能无标题
 const snapshotUntitled = "无标题"
 
-// 快照页面域（createPage 返回 URL 的固定前缀；缓存条目 Path 由其截取）
+// 快照页面域：仅用于拼接频道主页等展示场景（缓存条目 Path 改由 createPage 返回）
 const telegraphPagePrefix = "https://telegra.ph/"
 
 // feed 来源正文缺失（Content 与 Description 皆空）
@@ -41,7 +40,8 @@ type pageFetcher interface {
 }
 
 type pagePublisher interface {
-	CreatePage(ctx context.Context, page telegraph.Page) (string, error)
+	// CreatePage 返回 (url, path)；path 为 API result 自带字段，回填 editPage 直接使用
+	CreatePage(ctx context.Context, page telegraph.Page) (url, path string, err error)
 	// EditPage 全量替换语义：title/content 必传，author 不传即清空（author_url 回填用）
 	EditPage(ctx context.Context, path string, page telegraph.Page) error
 }
@@ -105,7 +105,7 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 	if len(feed.Channels) > 0 {
 		authorURL = channelURL(feed.Channels[0])
 	}
-	url, err := s.publisher.CreatePage(pubCtx, telegraph.Page{
+	url, path, err := s.publisher.CreatePage(pubCtx, telegraph.Page{
 		Title:      title,
 		AuthorName: authorName,
 		AuthorURL:  authorURL,
@@ -115,18 +115,11 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 		return s.settle(ctx, item, fmt.Errorf("createPage %s: %w", item.Link, err))
 	}
 
-	// 页面 path：官方域名下 TrimPrefix 即得；前缀未命中（假服务器/域名变化）
-	// 时取 URL path 段兜底，避免把整段 URL 当 path 发给 editPage（外部 CR）。
-	// 原实现只 TrimPrefix：
-	// Path: strings.TrimPrefix(url, telegraphPagePrefix),
-	path := strings.TrimPrefix(url, telegraphPagePrefix)
-	if path == url {
-		if u, perr := neturl.Parse(url); perr == nil {
-			if p := strings.TrimPrefix(u.Path, "/"); p != "" {
-				path = p
-			}
-		}
-	}
+	// 页面 path 直接用 createPage 返回值（API result 自带 path 字段）。
+	// 旧实现靠 URL 字符串截前缀、失败再 url.Parse 兜底——假服务器地址带路径
+	// 前缀时仍会算错，不如直接用返回字段（外部 CR）：
+	// path := strings.TrimPrefix(url, telegraphPagePrefix)
+	// if path == url { if u, perr := neturl.Parse(url); ... }
 
 	// 只缓存成功：降级值不入缓存，避免一次临时失败被永久固化。
 	// 缓存完整建页参数（而非仅 URL）：editPage 全量替换语义下回填 author_url 需原样重提交
@@ -152,7 +145,8 @@ func (s *SnapshotService) BackfillAuthor(ctx context.Context, feed config.FeedCo
 	// 与 Snapshot 同一 key：降级（fetch 失败等）不入缓存，get 必 miss → 跳过
 	key := feed.Name + "|" + generateItemID(item)
 	page, ok := s.cache.get(key)
-	if !ok || page.Backfilled {
+	// Path 为空属 API 异常（正常建页必返回 path）：editPage 必败，跳过避免每次白调
+	if !ok || page.Backfilled || page.Path == "" {
 		return nil
 	}
 
