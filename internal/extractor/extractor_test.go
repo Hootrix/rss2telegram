@@ -150,3 +150,38 @@ func TestFetchAndExtractHTTPStatus(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "403")
 }
+
+// ValidateText 与 FetchAndExtract 内部校验同一组阈值（FFFD 占比 + rune 下限），
+// 抽出导出供 feed 来源路径（snapshot_source: feed）复用，两条路径失败口径一致（issue #12）
+func TestValidateText(t *testing.T) {
+	t.Run("正常中文正文通过", func(t *testing.T) {
+		require.NoError(t, ValidateText(longText(15)))
+	})
+
+	t.Run("199/200 rune 边界", func(t *testing.T) {
+		// 中文与 4 字节 emoji 混合，确保按 rune 而非字节计数
+		under := strings.Repeat("正", 197) + "🙂🙂"
+		require.Equal(t, 199, len([]rune(under)))
+		require.Error(t, ValidateText(under))
+
+		exact := strings.Repeat("正", 198) + "🙂🙂"
+		require.Equal(t, 200, len([]rune(exact)))
+		require.NoError(t, ValidateText(exact))
+	})
+
+	t.Run("空串失败", func(t *testing.T) {
+		require.Error(t, ValidateText(""))
+	})
+
+	t.Run("FFFD 恰好 1% 通过，超过失败", func(t *testing.T) {
+		// 构造均 ≥200 rune，确保只触发乱码规则不撞长度下限；占比 >1% 判乱码
+		slightlyUnder := strings.Repeat("正", 398) + "��" // 2/400 = 0.5% < 1%
+		require.NoError(t, ValidateText(slightlyUnder))
+
+		over := strings.Repeat("正", 296) + strings.Repeat("�", 4) // 4/300 ≈ 1.33% > 1%
+		require.Error(t, ValidateText(over))
+
+		exactlyOnePct := strings.Repeat("正", 198) + "��" // 2/200 = 1%，阈值严格大于才判乱码
+		require.NoError(t, ValidateText(exactlyOnePct))
+	})
+}

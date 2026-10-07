@@ -108,11 +108,8 @@ func (e *Extractor) FetchAndExtract(ctx context.Context, rawURL string) (string,
 	}
 	plain := text.String()
 
-	if replacementRatio(plain) > maxReplacementRatio {
-		return "", fmt.Errorf("extract %s: mojibake detected (U+FFFD ratio over 1%%)", rawURL)
-	}
-	if runeCount(plain) < minTextRunes {
-		return "", fmt.Errorf("extract %s: extracted text too short (%d runes)", rawURL, runeCount(plain))
+	if err := ValidateText(plain); err != nil {
+		return "", fmt.Errorf("extract %s: %w", rawURL, err)
 	}
 
 	var htmlOut strings.Builder
@@ -120,6 +117,18 @@ func (e *Extractor) FetchAndExtract(ctx context.Context, rawURL string) (string,
 		return "", fmt.Errorf("extract %s: render html: %w", rawURL, err)
 	}
 	return htmlOut.String(), nil
+}
+
+// ValidateText 对正文纯文本做质量校验：U+FFFD 占比超 1% 判乱码，纯文本不足 200 rune 判过短。
+// 抓原文（page）与 feed 来源两条路径共用，失败口径一致（issue #12 snapshot_source）
+func ValidateText(plain string) error {
+	if replacementRatio(plain) > maxReplacementRatio {
+		return fmt.Errorf("mojibake detected (U+FFFD ratio over 1%%)")
+	}
+	if n := runeCount(plain); n < minTextRunes {
+		return fmt.Errorf("text too short (%d runes)", n)
+	}
+	return nil
 }
 
 // replacementRatio 统计 U+FFFD 占总 rune 数比例

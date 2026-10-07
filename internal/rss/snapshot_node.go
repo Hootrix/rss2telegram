@@ -148,7 +148,10 @@ func convertNode(n *html.Node, inline bool) []any {
 		if src == "" {
 			src = attrValue(n, "src")
 		}
-		if src == "" {
+		// 非 http(s) 的图（data:/相对///cdn）原样进 Telegraph 只会成坏图，整体丢弃；
+		// 不做相对 URL 解析：base 存在三义（xml:base/channel link/item link），
+		// SPA hash 路由下 item link 作 base 必错，宁缺毋坏（issue #12）
+		if !isHTTPURL(src) {
 			return nil
 		}
 		attrs["src"] = src
@@ -180,6 +183,12 @@ func attrValue(n *html.Node, key string) string {
 		}
 	}
 	return ""
+}
+
+// isHTTPURL 判断地址是否为绝对 http(s) URL（scheme 大小写不敏感，空串自然为 false）
+func isHTTPURL(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 // hasBlockishDescendant 判断子树内是否含块级标签（用于 div 降级决策）
@@ -286,6 +295,19 @@ func contentSize(nodes []any) int {
 		return 1 << 30 // 不可序列化视为超限，走截断分支统一兜底
 	}
 	return len(b)
+}
+
+// nodesPlainText 拼接根级节点数组的全部纯文本，节点间补空格避免相邻段落文字粘连
+// （feed 来源的正文校验用；FFFD 分母与 rune 计数口径不受影响，issue #12）
+func nodesPlainText(nodes []any) string {
+	var b strings.Builder
+	for i, n := range nodes {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(nodeText(n))
+	}
+	return b.String()
 }
 
 // nodeText 提取根级元素（Node 或 string）的全部纯文本

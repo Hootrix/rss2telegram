@@ -10,12 +10,14 @@ package rss
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
 	"github.com/Hootrix/rss2telegram/internal/config"
+	"github.com/Hootrix/rss2telegram/internal/extractor"
 	"github.com/Hootrix/rss2telegram/internal/telegraph"
 	"github.com/mmcdole/gofeed"
 )
@@ -25,6 +27,9 @@ const defaultPublishTimeout = 10 * time.Second
 
 // title 占位：Telegraph title 必填 1-256，RSS item 可能无标题
 const snapshotUntitled = "无标题"
+
+// feed 来源正文缺失（Content 与 Description 皆空）
+var errEmptyFeedContent = errors.New("empty feed content")
 
 // pageFetcher / pagePublisher 抽象 extractor 与 telegraph client，测试可替换
 type pageFetcher interface {
@@ -68,12 +73,17 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 		return url, nil
 	}
 
-	html, err := s.fetcher.FetchAndExtract(ctx, item.Link)
+	// 旧实现（snapshot_source 分派前：正文固定抓原文）注释保留：
+	// html, err := s.fetcher.FetchAndExtract(ctx, item.Link)
+	// if err != nil {
+	//     return s.settle(ctx, item, fmt.Errorf("fetch %s: %w", item.Link, err))
+	// }
+	// content := truncateContent(htmlToNodes(html), item.Link, maxContentBytes)
+	nodes, err := s.sourceNodes(ctx, feed, item)
 	if err != nil {
-		return s.settle(ctx, item, fmt.Errorf("fetch %s: %w", item.Link, err))
+		return s.settle(ctx, item, err)
 	}
-
-	content := truncateContent(htmlToNodes(html), item.Link, maxContentBytes)
+	content := truncateContent(nodes, item.Link, maxContentBytes)
 
 	title := truncateByRunes(item.Title, 256)
 	if title == "" {
@@ -95,6 +105,46 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 	// 只缓存成功：降级值不入缓存，避免一次临时失败被永久固化
 	s.cache.set(key, url)
 	return url, nil
+}
+
+// sourceNodes 取快照正文并转为 Telegraph 节点，按 feed.SnapshotSource 分派（issue #12）：
+//   - page（默认）：抓原文 + readability，行为不变
+//   - feed：取 RSS item 正文（Content 优先，空取 Description），零网络抓取；
+//     不过 readability（RSS 正文已是正文片段，洗片段只有洗坏风险），
+//     质量校验与 page 同阈值（extractor.ValidateText）
+//
+// 失败统一由调用方 settle：feed 内容问题不回退抓原文（选 feed 的典型场景抓原文本就无效）
+func (s *SnapshotService) sourceNodes(ctx context.Context, feed config.FeedConfig, item *gofeed.Item) ([]any, error) {
+	if feed.SnapshotSource == config.SnapshotSourceFeed {
+		nodes, err := feedContentNodes(item)
+		if err != nil {
+			return nil, fmt.Errorf("feed %s: %w", feed.Name, err)
+		}
+		return nodes, nil
+	}
+
+	html, err := s.fetcher.FetchAndExtract(ctx, item.Link)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", item.Link, err)
+	}
+	return htmlToNodes(html), nil
+}
+
+// feedContentNodes 从 RSS item 取正文 HTML 转节点并校验：
+// 纯图帖/摘要型误配（正文 <200 rune）由 ValidateText 拦截，错误信息带 rune 数便于排查
+func feedContentNodes(item *gofeed.Item) ([]any, error) {
+	raw := item.Content
+	if raw == "" {
+		raw = item.Description
+	}
+	if raw == "" {
+		return nil, errEmptyFeedContent
+	}
+	nodes := htmlToNodes(raw)
+	if err := extractor.ValidateText(nodesPlainText(nodes)); err != nil {
+		return nil, err
+	}
+	return nodes, nil
 }
 
 // settle 统一失败结算：父取消 → 延后（错误）；否则降级照发（原文链接 + 日志）

@@ -32,10 +32,18 @@ type FeedConfig struct {
 	Template                       string   `yaml:"template"`
 	// 快照后端枚举：空 = 不启用；为将来其他后端（如 archive.today）预留空间
 	Snapshot string `yaml:"snapshot"`
+	// 快照正文来源：page（默认）= 抓原文 + readability；feed = 取 RSS item 正文，
+	// 跳过原文抓取（全文输出型 RSS 源用，SPA/反爬站点由 RSS 生成层保证全文）（issue #12）
+	SnapshotSource string `yaml:"snapshot_source"`
 }
 
-// SnapshotTelegraph 唯一支持的快照后端（issue #12）
-const SnapshotTelegraph = "telegraph"
+const (
+	SnapshotTelegraph = "telegraph"
+
+	// 快照正文来源枚举（issue #12）：将来新来源（如外部渲染端点）作为新值扩展
+	SnapshotSourcePage = "page"
+	SnapshotSourceFeed = "feed"
+)
 
 // Validate 验证配置的合法性
 func (c *Config) Validate() error {
@@ -91,6 +99,19 @@ func (c *Config) Validate() error {
 		// 快照开关：字符串枚举，仅允许空串或已实现的后端
 		if feed.Snapshot != "" && feed.Snapshot != SnapshotTelegraph {
 			return fmt.Errorf("feed %s: invalid snapshot %q (only %q is supported)", feed.Name, feed.Snapshot, SnapshotTelegraph)
+		}
+
+		// 快照正文来源：仅允许空串/page/feed；非空时必须启用快照——
+		// 来源只服务快照，独立存在无意义且易被误以为生效（issue #12）
+		switch feed.SnapshotSource {
+		case "", SnapshotSourcePage, SnapshotSourceFeed:
+		default:
+			return fmt.Errorf("feed %s: invalid snapshot_source %q (only %q and %q are supported)",
+				feed.Name, feed.SnapshotSource, SnapshotSourcePage, SnapshotSourceFeed)
+		}
+		if feed.SnapshotSource != "" && feed.Snapshot == "" {
+			return fmt.Errorf("feed %s: snapshot_source %q requires snapshot %q to be enabled",
+				feed.Name, feed.SnapshotSource, SnapshotTelegraph)
 		}
 	}
 

@@ -31,3 +31,17 @@ feeds:
 
       🔗 [快照]({telegraph})
       🌐 [原文]({link})
+
+  # 全文输出型 RSS 源：正文取 RSS item（content:encoded 优先，空取 description），
+  # 跳过原文抓取，不受反爬/JS 渲染影响；要求源输出全文且图片为绝对 http(s) 地址
+  - name: "fulltext-feed"
+    url: "https://example.com/fulltext.xml"
+    channels:
+      - "@test_push"
+    snapshot: telegraph
+    snapshot_source: feed  # 可选，缺省 page（抓原文）；需同时启用 snapshot
+    template: |
+      📰 *{title}*
+
+      🔗 [快照]({telegraph})
+      🌐 [原文]({link})

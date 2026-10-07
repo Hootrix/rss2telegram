@@ -44,6 +44,7 @@ type fakePublisher struct {
 	pages []telegraph.Page
 	url   string
 	err   error
+	block bool // 阻塞直到 ctx 结束（模拟慢发布触发父取消判定）
 }
 
 func (p *fakePublisher) CreatePage(ctx context.Context, page telegraph.Page) (string, error) {
@@ -51,6 +52,10 @@ func (p *fakePublisher) CreatePage(ctx context.Context, page telegraph.Page) (st
 	p.mu.Lock()
 	p.pages = append(p.pages, page)
 	p.mu.Unlock()
+	if p.block {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if p.err != nil {
 		return "", p.err
 	}
@@ -67,6 +72,101 @@ func snapFeed(name string, channels ...string) config.FeedConfig {
 
 func snapItem(title, link, guid string) *gofeed.Item {
 	return &gofeed.Item{Title: title, Link: link, GUID: guid}
+}
+
+// ---- snapshot_source: feed（正文取 RSS item，跳过原文抓取，issue #12）----
+
+func snapFeedSourceFeed(name string, channels ...string) config.FeedConfig {
+	f := snapFeed(name, channels...)
+	f.SnapshotSource = config.SnapshotSourceFeed
+	return f
+}
+
+func snapItemContent(title, link, guid, content, description string) *gofeed.Item {
+	return &gofeed.Item{Title: title, Link: link, GUID: guid, Content: content, Description: description}
+}
+
+var fullBodyHTML = `<p>` + strings.Repeat("正", 300) + `</p>`
+
+// feed 模式全程零网络抓取：fetcher 调用次数必须为 0（抓原文本就无效的场景白耗 15s 预算）
+func TestSnapshotFeedSourceSuccessWithoutFetch(t *testing.T) {
+	fetcher := &fakeFetcher{} // 未配置返回值，被调用即拿到空 html
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(fetcher, pub)
+
+	url, err := svc.Snapshot(context.Background(), snapFeedSourceFeed("f", "@chan"),
+		snapItemContent("标题", "https://e.com/a", "g1", fullBodyHTML, ""))
+	require.NoError(t, err)
+	assert.Equal(t, "https://telegra.ph/ok-1", url)
+	assert.Equal(t, int32(0), fetcher.calls.Load(), "feed 模式不得抓原文")
+
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	require.Len(t, pub.pages, 1)
+	content, err := json.Marshal(pub.pages[0].Content)
+	require.NoError(t, err)
+	assert.Contains(t, string(content), strings.Repeat("正", 10), "发布内容来自 RSS item 正文")
+}
+
+// Content 为空回退 Description：大量 RSS 2.0 全文源只写 description 不写 content:encoded
+func TestSnapshotFeedSourceDescriptionFallback(t *testing.T) {
+	fetcher := &fakeFetcher{}
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(fetcher, pub)
+
+	url, err := svc.Snapshot(context.Background(), snapFeedSourceFeed("f", "@chan"),
+		snapItemContent("标题", "https://e.com/a", "g1", "", fullBodyHTML))
+	require.NoError(t, err)
+	assert.Equal(t, "https://telegra.ph/ok-1", url)
+	assert.Equal(t, int32(0), fetcher.calls.Load())
+}
+
+// 失败直接降级不回退抓原文（摘要型源误配 feed 由 rune 下限拦截，日志带 rune 数便于排查）
+func TestSnapshotFeedSourceDegrades(t *testing.T) {
+	fetcher := &fakeFetcher{}
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(fetcher, pub)
+
+	degrade := func(name string, item *gofeed.Item) {
+		t.Run(name, func(t *testing.T) {
+			url, err := svc.Snapshot(context.Background(), snapFeedSourceFeed("f", "@chan"), item)
+			require.NoError(t, err, "feed 内容失败必须降级照发而非报错")
+			assert.Equal(t, "https://e.com/a", url)
+			assert.Equal(t, int32(0), fetcher.calls.Load(), "降级也不得回退抓原文")
+		})
+	}
+
+	degrade("Content 与 Description 皆空", snapItemContent("标题", "https://e.com/a", "g1", "", ""))
+	degrade("正文过短（description==title 型摘要源）", snapItemContent("短标题", "https://e.com/a", "g2", "一句话摘要", "一句话摘要"))
+	degrade("FFFD 超标", snapItemContent("标题", "https://e.com/a", "g3",
+		strings.Repeat("�", 50)+strings.Repeat("正", 50), ""))
+	assert.Equal(t, int32(0), pub.calls.Load(), "内容失败不应建页")
+}
+
+// feed 模式父 ctx 取消于 createPage 阶段：延后语义与 page 模式一致（返回错误，不降级）
+func TestSnapshotFeedSourceParentCancelAtCreatePage(t *testing.T) {
+	fetcher := &fakeFetcher{}
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1", block: true}
+	svc := newSnapSvc(fetcher, pub)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	url, err := svc.Snapshot(ctx, snapFeedSourceFeed("f", "@chan"),
+		snapItemContent("标题", "https://e.com/a", "g1", fullBodyHTML, ""))
+	require.Error(t, err, "父取消必须返回错误供上层延后")
+	assert.Empty(t, url)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// nodesPlainText 根级节点间补空格：相邻段落文字不得粘连（FFFD 分母与 rune 计数口径不受影响）
+func TestNodesPlainText(t *testing.T) {
+	nodes := []any{
+		telegraph.Node{Tag: "p", Children: []any{"第一段"}},
+		telegraph.Node{Tag: "p", Children: []any{"第二段"}},
+	}
+	assert.Equal(t, "第一段 第二段", nodesPlainText(nodes))
+	assert.Empty(t, nodesPlainText(nil))
 }
 
 // ---- 编排 ----
