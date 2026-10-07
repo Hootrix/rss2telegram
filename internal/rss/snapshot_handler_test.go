@@ -4,7 +4,6 @@ package rss
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -154,8 +153,6 @@ func TestProcessFeedNoSnapshotConfigured(t *testing.T) {
 	require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
 	assert.Zero(t, snap.callCount(), "未启用快照的 feed 不得调用编排器")
 }
-
-var _ = errors.New // 占位：保持 errors 导入（后续断言扩展用）
 
 // ---- author_url 消息链接回填（issue #12）----
 

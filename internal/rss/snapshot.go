@@ -98,10 +98,16 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 	pubCtx, cancel := context.WithTimeout(ctx, s.publishTimeout)
 	defer cancel()
 	authorName := truncateByRunes(feed.Name, 128)
+	// feed.Channels 为空属 Validate 之外的非法输入（本服务是导出 API）：
+	// 不 panic，按无公开频道处理，author_url 留空由回填兜底
+	authorURL := ""
+	if len(feed.Channels) > 0 {
+		authorURL = channelURL(feed.Channels[0])
+	}
 	url, err := s.publisher.CreatePage(pubCtx, telegraph.Page{
 		Title:      title,
 		AuthorName: authorName,
-		AuthorURL:  channelURL(feed.Channels[0]),
+		AuthorURL:  authorURL,
 		Content:    content,
 	})
 	if err != nil {
@@ -233,7 +239,9 @@ func channelURL(channel string) string {
 		return ""
 	}
 	id := strings.TrimPrefix(name, "-")
-	if id != "" && strings.IndexFunc(id, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+	// id 为空说明 name 是 "-"（非法频道标识），同样不构造；原实现此处
+	// 判 id != ""，会把 "https://t.me/-" 当合法链接返回
+	if id == "" || strings.IndexFunc(id, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
 		return ""
 	}
 	return "https://t.me/" + name

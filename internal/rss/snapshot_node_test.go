@@ -34,11 +34,18 @@ func TestHTMLToNodes(t *testing.T) {
 		{"a 保留 href", `<p><a href="https://e.com/x">链接</a></p>`,
 			`[{"tag":"p","children":[{"tag":"a","attrs":{"href":"https://e.com/x"},"children":["链接"]}]}]`},
 		{"a 无 href 展开为文本", `<p><a>裸锚</a></p>`, `[{"tag":"p","children":["裸锚"]}]`},
+		// 与 img 同策略：非 http(s) href（相对/javascript:/锚点）进 Telegraph 成坏链，
+		// 展开为文本保留信息（issue #12 CR）
+		{"a 相对/javascript href 展开为文本", `<p><a href="/rel">相对</a><a href="javascript:void(0)">脚本</a><a href="#top">锚</a></p>`,
+			`[{"tag":"p","children":["相对","脚本","锚"]}]`},
 		{"b/strong/i/em 保留", `<p><b>1</b><strong>2</strong><i>3</i><em>4</em></p>`,
 			`[{"tag":"p","children":[{"tag":"b","children":["1"]},{"tag":"strong","children":["2"]},{"tag":"i","children":["3"]},{"tag":"em","children":["4"]}]}]`},
 		{"img 懒加载取 data-src", `<p><img src="data:image/gif;base64,R0" data-src="https://e.com/real.jpg"></p>`,
 			`[{"tag":"p","children":[{"tag":"img","attrs":{"src":"https://e.com/real.jpg"}}]}]`},
 		{"img 无任何 src 丢弃", `<p><img alt="无图"></p>`, `[{"tag":"p"}]`},
+		// data-src 非 http(s) 时回退 src（占位 data-src + 合法 src 的懒加载变体不丢图）
+		{"img data-src 无效回退 src", `<p><img data-src="/lazy/rel.jpg" src="https://e.com/real.jpg"></p>`,
+			`[{"tag":"p","children":[{"tag":"img","attrs":{"src":"https://e.com/real.jpg"}}]}]`},
 		// 非 http(s) scheme 的图建出 Telegraph 坏图，整体丢弃；不做相对 URL 解析（base 歧义）（issue #12）
 		{"img data: src 丢弃", `<p>前文<img src="data:image/png;base64,iVBOR">后文</p>`,
 			`[{"tag":"p","children":["前文","后文"]}]`},
@@ -108,6 +115,46 @@ func TestTruncateContentWithinLimit(t *testing.T) {
 	nodes := []any{telegraph.Node{Tag: "p", Children: []any{"短内容"}}}
 	out := truncateContent(nodes, "https://e.com/orig", maxContentBytes)
 	assert.JSONEq(t, nodesJSON(t, nodes), nodesJSON(t, out), "未超限不动刀、不加提示节点")
+}
+
+// 边界回归：used 恰好顶满 budget 时，末节点与提示节点间的逗号也必须计入，
+// 最终序列化不得超过 limit（原 -2 实现会输出 limit+1 字节被 Telegraph 拒收）
+func TestTruncateContentExactBudgetBoundary(t *testing.T) {
+	noticeJSON, err := json.Marshal(truncationNotice("https://e.com/o"))
+	require.NoError(t, err)
+	budget := maxContentBytes - len(noticeJSON) - 3 // 与实现同口径
+	wrap := len(`{"tag":"p","children":[""]}`)      // p 骨架自身开销
+
+	n1 := telegraph.Node{Tag: "p", Children: []any{"首段"}}
+	n1b, err := json.Marshal(n1)
+	require.NoError(t, err)
+	// n2 恰好把 used 顶到 budget：used = len(n1)+1逗号+len(n2)
+	n2Size := budget - len(n1b) - 1
+	n2 := telegraph.Node{Tag: "p", Children: []any{strings.Repeat("a", n2Size-wrap)}}
+	require.Equal(t, n2Size, mustMarshalLen(t, n2))
+
+	nodes := []any{n1, n2, telegraph.Node{Tag: "p", Children: []any{strings.Repeat("b", 70000)}}}
+	out := truncateContent(nodes, "https://e.com/o", maxContentBytes)
+	b, err := json.Marshal(out)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(b), maxContentBytes, "恰好顶满 budget 也不得超限")
+	assert.Contains(t, string(b), "查看原文")
+}
+
+func mustMarshalLen(t *testing.T, v any) int {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return len(b)
+}
+
+// cutUTF8 不得留下残缺多字节首字节（lead byte 也是 RuneStart）：
+// 截在 "a中" 的中间时，半截的 中 必须整体丢弃，否则 JSON 序列化产出 U+FFFD
+func TestCutUTF8(t *testing.T) {
+	assert.Equal(t, "a", string(cutUTF8([]byte("a中中中"), 2)))
+	assert.Equal(t, "a中", string(cutUTF8([]byte("a中中中"), 4)))
+	assert.Equal(t, "", string(cutUTF8([]byte("中"), 1)), "首字节即截断时整体为空")
+	assert.Equal(t, "abc", string(cutUTF8([]byte("abc"), 10)), "未超限原样返回")
 }
 
 // 极端兜底：首个节点单独就超预算时，节点内按 rune 截文本，页面保留正文开头

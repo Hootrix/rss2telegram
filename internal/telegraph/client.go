@@ -83,6 +83,11 @@ func (c *Client) call(ctx context.Context, method string, req any, out any) erro
 		return fmt.Errorf("telegraph %s: %w", method, err)
 	}
 	defer resp.Body.Close()
+	// 非 2xx 直接失败：避免网关/CDN 返回的 HTML 错误页走进 JSON decode 报错，
+	// 语义更直白（ok:false 的 API 错误仍由下方 apiResp 处理）
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("telegraph %s: http status %d", method, resp.StatusCode)
+	}
 	var apiResp apiResponse
 	// 响应体上限 1MB：createPage 带 return_content=false 时远小于此，防异常响应吃内存
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&apiResp); err != nil {

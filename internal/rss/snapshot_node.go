@@ -137,15 +137,29 @@ func convertNode(n *html.Node, inline bool) []any {
 	attrs := map[string]string{}
 	switch tag {
 	case "a":
-		if href := attrValue(n, "href"); href != "" {
+		// 与 img 同策略过滤 scheme：非 http(s) 地址（相对/javascript:/锚点）
+		// 进 Telegraph 即成坏链——feed 模式不经 readability 绝对化，展开为文本
+		// 保留信息、宁缺毋坏（issue #12）。原实现仅判空：
+		// if href := attrValue(n, "href"); href != "" {
+		// 	attrs["href"] = href
+		// } else {
+		// 	return convertChildren(n, inline)
+		// }
+		if href := attrValue(n, "href"); isHTTPURL(href) {
 			attrs["href"] = href
 		} else {
-			return convertChildren(n, inline) // 无 href 的锚点等价于行内文本
+			return convertChildren(n, inline) // 无/非法 href 的锚点等价于行内文本
 		}
 	case "img":
-		// 懒加载常见模式：src 为占位图而真实地址在 data-src
+		// 懒加载常见模式：src 为占位图而真实地址在 data-src；
+		// data-src 非 http(s) 时回退 src，不因 data-src 坏而丢整图。
+		// 原实现仅在 data-src 为空时回退：
+		// src := attrValue(n, "data-src")
+		// if src == "" {
+		// 	src = attrValue(n, "src")
+		// }
 		src := attrValue(n, "data-src")
-		if src == "" {
+		if !isHTTPURL(src) {
 			src = attrValue(n, "src")
 		}
 		// 非 http(s) 的图（data:/相对///cdn）原样进 Telegraph 只会成坏图，整体丢弃；
@@ -259,7 +273,10 @@ func truncateContent(nodes []any, origURL string, limit int) []any {
 	}
 
 	// 最终数组 [n1..nk,notice] 的开销 = 1"[" + Σ节点 + k 逗号 + notice + 1"]"
-	budget := limit - len(noticeJSON) - 2
+	// [bugfix] 末节点与 notice 之间还有一个逗号，原 -2 少算它：used 恰好顶到
+	// budget 时输出 limit+1 字节，被 Telegraph 拒收导致整页降级。原值保留备查：
+	// budget := limit - len(noticeJSON) - 2
+	budget := limit - len(noticeJSON) - 3
 
 	var out []any
 	used := 0
@@ -350,12 +367,20 @@ func fitText(s string, max int) string {
 }
 
 // cutUTF8 按字节上限裁剪并回退到 rune 边界，避免切出半个字符
+// [bugfix] utf8.RuneStart 对多字节首字节同样为 true，截断点落在
+// lead+continuation 之间时原实现只删 continuation，留下残缺 lead byte，
+// JSON 序列化产出 U+FFFD；改为删到恢复合法 UTF-8 前缀（输入本身合法，
+// 最多回退一个 rune 的字节数）。原实现保留备查：
+//
+//	for len(out) > 0 && !utf8.RuneStart(out[len(out)-1]) {
+//		out = out[:len(out)-1]
+//	}
 func cutUTF8(b []byte, max int) []byte {
 	if len(b) <= max {
 		return b
 	}
 	out := b[:max]
-	for len(out) > 0 && !utf8.RuneStart(out[len(out)-1]) {
+	for len(out) > 0 && !utf8.Valid(out) {
 		out = out[:len(out)-1]
 	}
 	return out

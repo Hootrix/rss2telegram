@@ -475,4 +475,5 @@ func TestChannelURL(t *testing.T) {
 	assert.Empty(t, channelURL("-1001234567890"), "纯数字 ID（含 -100xxx）无公开用户名，不构造 author_url")
 	assert.Empty(t, channelURL("1234567890"))
 	assert.Empty(t, channelURL("@"))
+	assert.Empty(t, channelURL("-"), "裸连字符是非法频道标识，不构造")
 }
