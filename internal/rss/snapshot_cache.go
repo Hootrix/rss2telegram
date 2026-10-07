@@ -24,6 +24,9 @@ type snapshotPageParams struct {
 	Title      string
 	Content    []any
 	AuthorName string
+	// Backfilled 表示 author_url 已回填过消息链接：多频道场景首个成功回填
+	// 即锁定，后续频道不再重复 editPage（外部 CR：串行调用白做且放大调用量）
+	Backfilled bool
 }
 
 type cacheEntry struct {
@@ -101,6 +104,15 @@ func (c *SnapshotCache) set(key string, page snapshotPageParams) {
 		}
 		c.order.Remove(oldest)
 		delete(c.entries, oldest.Value.(*cacheEntry).key)
+	}
+}
+
+// markBackfilled 置位回填完成标记（幂等）；条目已被淘汰/不存在时 no-op
+func (c *SnapshotCache) markBackfilled(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[key]; ok {
+		el.Value.(*cacheEntry).page.Backfilled = true
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	neturl "net/url"
 	"strings"
 	"time"
 
@@ -114,11 +115,24 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 		return s.settle(ctx, item, fmt.Errorf("createPage %s: %w", item.Link, err))
 	}
 
+	// 页面 path：官方域名下 TrimPrefix 即得；前缀未命中（假服务器/域名变化）
+	// 时取 URL path 段兜底，避免把整段 URL 当 path 发给 editPage（外部 CR）。
+	// 原实现只 TrimPrefix：
+	// Path: strings.TrimPrefix(url, telegraphPagePrefix),
+	path := strings.TrimPrefix(url, telegraphPagePrefix)
+	if path == url {
+		if u, perr := neturl.Parse(url); perr == nil {
+			if p := strings.TrimPrefix(u.Path, "/"); p != "" {
+				path = p
+			}
+		}
+	}
+
 	// 只缓存成功：降级值不入缓存，避免一次临时失败被永久固化。
 	// 缓存完整建页参数（而非仅 URL）：editPage 全量替换语义下回填 author_url 需原样重提交
 	s.cache.set(key, snapshotPageParams{
 		URL:        url,
-		Path:       strings.TrimPrefix(url, telegraphPagePrefix),
+		Path:       path,
 		Title:      title,
 		Content:    content,
 		AuthorName: authorName,
@@ -129,11 +143,16 @@ func (s *SnapshotService) Snapshot(ctx context.Context, feed config.FeedConfig, 
 // BackfillAuthor 将快照页 author_url 回填为消息链接（t.me/<channel>/<msg_id>）。
 // 尽力而为：未建页/降级（降级值不入缓存，天然 miss）与缓存缺失（进程重启前的旧条目）
 // 静默跳过返回 nil；editPage 失败返回错误由调用方记日志，不影响已推送的消息。
-// 多频道场景每次覆盖（最后成功者生效——单页只装得下一个消息链接）
+//
+// 多频道语义（外部 CR 修订）：由"每次覆盖、最后成功者生效"改为"首个成功回填即锁定"——
+// editPage 串行 ≤10s 计入 feed 预算，前 N-1 次调用全是白做且放大 Telegraph 调用量，
+// first_push 批量期更易撞限流（被限流的建页降级标 seen 后永久无快照）；
+// 缓存 Backfilled 置位后跳过，首个回填失败不置位、允许后续频道重试
 func (s *SnapshotService) BackfillAuthor(ctx context.Context, feed config.FeedConfig, item *gofeed.Item, msgLink string) error {
 	// 与 Snapshot 同一 key：降级（fetch 失败等）不入缓存，get 必 miss → 跳过
-	page, ok := s.cache.get(feed.Name + "|" + generateItemID(item))
-	if !ok {
+	key := feed.Name + "|" + generateItemID(item)
+	page, ok := s.cache.get(key)
+	if !ok || page.Backfilled {
 		return nil
 	}
 
@@ -147,6 +166,7 @@ func (s *SnapshotService) BackfillAuthor(ctx context.Context, feed config.FeedCo
 	}); err != nil {
 		return fmt.Errorf("editPage %s: %w", page.URL, err)
 	}
+	s.cache.markBackfilled(key)
 	return nil
 }
 
@@ -197,6 +217,8 @@ func feedContentNodes(item *gofeed.Item) ([]any, error) {
 
 // validateNodes 正文质量统一校验（page/feed 两路径，2026-10-08 纯图帖豁免）：
 //   - 乱码必拦，含图不豁免（乱码图帖页面同样不可读）
+//     注意短文本下 FFFD 占比分母极小（4 字含 1 个即 25%），拦截偏敏感——
+//     符合文档"乱码不豁免"口径，属有意的保守拦截
 //   - 含 ≥1 张有效图豁免字数下限（纯图帖建页；有效性由转换层保证——
 //     非 http(s) 图已在 htmlToNodes 丢弃，这里的 img 节点天然全部有效）
 //   - 无图走 ValidateText：纯文本不足 200 rune 判过短
@@ -211,10 +233,26 @@ func validateNodes(nodes []any) error {
 	return extractor.ValidateText(plain)
 }
 
-// hasImageNode 判断根级节点数组是否含图；转换层只产出根级 img（Telegraph 平级结构）
+// hasImageNode 递归判断节点树是否含图。img 常嵌在 p/figure/div/a 等容器内
+// （RSS 纯图帖最常见写法就是 <p><img></p>），只查根级会把这类帖误判为
+// 无图短文而降级（外部 CR 实测修复）。
+// 原实现只查根级——注释"转换层只产出根级 img"不成立：
+//
+//	for _, n := range nodes {
+//		if node, ok := n.(telegraph.Node); ok && node.Tag == "img" {
+//			return true
+//		}
+//	}
 func hasImageNode(nodes []any) bool {
 	for _, n := range nodes {
-		if node, ok := n.(telegraph.Node); ok && node.Tag == "img" {
+		node, ok := n.(telegraph.Node)
+		if !ok {
+			continue
+		}
+		if node.Tag == "img" {
+			return true
+		}
+		if hasImageNode(node.Children) {
 			return true
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -154,8 +155,42 @@ type pageResult struct {
 	URL string `json:"url"`
 }
 
-// CreatePage 发布页面返回 URL；建页不持全局锁，可并发调用
+// isTokenInvalidError 判断 Telegraph 返回的凭证失效类错误（ACCESS_TOKEN_INVALID 等）。
+// 格式合法但实际失效的 token 会让每次建页降级、且只能手动删文件恢复（外部 CR），
+// 检出后由调用方触发 refreshToken 重建重试
+func isTokenInvalidError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "access_token")
+}
+
+// refreshToken 清除内存与文件中的失效 token 并匿名重建（持锁，并发下串行重建）。
+// 文件删除失败仅记日志：内存 token 已清，最坏重建后落盘失败也只是重启再建
+func (c *Client) refreshToken(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.token = ""
+	if c.tokenPath != "" {
+		if err := os.Remove(c.tokenPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("telegraph: remove stale token file failed: %v", err)
+		}
+	}
+	_, err := c.createAccountLocked(ctx)
+	return err
+}
+
+// CreatePage 发布页面返回 URL；建页不持全局锁，可并发调用。
+// 凭证失效（ACCESS_TOKEN_INVALID 类错误）时重建 token 并重试一次
 func (c *Client) CreatePage(ctx context.Context, page Page) (string, error) {
+	url, err := c.doCreatePage(ctx, page)
+	if err == nil || !isTokenInvalidError(err) {
+		return url, err
+	}
+	if rerr := c.refreshToken(ctx); rerr != nil {
+		return "", fmt.Errorf("telegraph createPage: token refresh: %w (after %v)", rerr, err)
+	}
+	return c.doCreatePage(ctx, page)
+}
+
+func (c *Client) doCreatePage(ctx context.Context, page Page) (string, error) {
 	tok, err := c.accessToken(ctx)
 	if err != nil {
 		return "", err
@@ -177,7 +212,19 @@ func (c *Client) CreatePage(ctx context.Context, page Page) (string, error) {
 // EditPage 编辑已发布页面。editPage 为全量替换语义（2026-10-07 实测真实 API）：
 // title/content 必传（缺失报 TITLE_REQUIRED/CONTENT_REQUIRED），author_name/author_url
 // 不传即被清空——调用方必须带上建页时的全部参数（issue #12 author_url 回填）
+// 回填路径同样享受失效重建重试：凭证过期不应让 author_url 永久停在频道主页
 func (c *Client) EditPage(ctx context.Context, path string, page Page) error {
+	err := c.doEditPage(ctx, path, page)
+	if err == nil || !isTokenInvalidError(err) {
+		return err
+	}
+	if rerr := c.refreshToken(ctx); rerr != nil {
+		return fmt.Errorf("telegraph editPage: token refresh: %w (after %v)", rerr, err)
+	}
+	return c.doEditPage(ctx, path, page)
+}
+
+func (c *Client) doEditPage(ctx context.Context, path string, page Page) error {
 	tok, err := c.accessToken(ctx)
 	if err != nil {
 		return err

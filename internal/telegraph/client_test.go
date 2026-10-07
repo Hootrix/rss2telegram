@@ -23,6 +23,7 @@ type fakeTelegraph struct {
 	pages       atomic.Int64
 	edits       atomic.Int64
 	apiErr      atomic.Value // string，非空时 createPage/editPage 返回该 API 错误
+	badTokens   sync.Map     // 失效 token 集合：携带即回 ACCESS_TOKEN_INVALID（外部 CR 自愈测试）
 	mu          sync.Mutex
 	lastPage    map[string]any
 	lastEdit    map[string]any
@@ -56,6 +57,12 @@ func newFakeTelegraph(t *testing.T) (*fakeTelegraph, *httptest.Server) {
 		ft.mu.Lock()
 		ft.lastPage = req
 		ft.mu.Unlock()
+		if tok, _ := req["access_token"].(string); tok != "" {
+			if _, bad := ft.badTokens.Load(tok); bad {
+				writeJSON(w, map[string]any{"ok": false, "error": "ACCESS_TOKEN_INVALID"})
+				return
+			}
+		}
 		if msg, ok := ft.apiErr.Load().(string); ok && msg != "" {
 			writeJSON(w, map[string]any{"ok": false, "error": msg})
 			return
@@ -242,4 +249,49 @@ func TestEditPageAPIError(t *testing.T) {
 	err := c.EditPage(context.Background(), "Test-10-01", Page{Title: "t", Content: []any{"x"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "editPage")
+}
+
+// token 失效自愈（外部 CR）：格式合法但已失效的 token 会让每次建页降级，
+// 且只能手动删文件恢复。检出 ACCESS_TOKEN_INVALID 后应清凭证重建并重试一次
+func TestInvalidTokenRefreshesAndRetries(t *testing.T) {
+	ft, srv := newFakeTelegraph(t)
+	dir := t.TempDir()
+	c := newTestClient(t, dir, srv.URL)
+
+	// 首次建页拿到 TOKEN-1 并落盘
+	_, err := c.CreatePage(context.Background(), Page{Title: "t1"})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), ft.accounts.Load())
+
+	// TOKEN-1 失效：createPage 应自动清凭证、建 TOKEN-2、重试成功
+	ft.badTokens.Store("TOKEN-1", true)
+	url, err := c.CreatePage(context.Background(), Page{Title: "t2"})
+	require.NoError(t, err, "失效 token 应自愈而非降级")
+	assert.Equal(t, "https://telegra.ph/Test-10-01", url)
+	assert.Equal(t, int64(2), ft.accounts.Load(), "失效后应重建一次账号")
+	assert.Equal(t, int64(2), ft.pages.Load(), "重试后建页应成功")
+
+	// 新 token 已落盘：新实例直接复用，不再回退到失效的 TOKEN-1
+	c2 := newTestClient(t, dir, srv.URL)
+	_, err = c2.CreatePage(context.Background(), Page{Title: "t3"})
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), ft.accounts.Load(), "不应再建第三次账号")
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	assert.Equal(t, "TOKEN-2", ft.lastPage["access_token"])
+}
+
+// 失效重建后重试仍失败（新 token 也被拒）：错误照常返回，不无限重试
+func TestInvalidTokenRetryStillFails(t *testing.T) {
+	ft, srv := newFakeTelegraph(t)
+	c := newTestClient(t, t.TempDir(), srv.URL)
+
+	// 所有 token 都失效：首次用 TOKEN-1 被拒，重建 TOKEN-2 也被拒
+	ft.badTokens.Store("TOKEN-1", true)
+	ft.badTokens.Store("TOKEN-2", true)
+
+	_, err := c.CreatePage(context.Background(), Page{Title: "t"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ACCESS_TOKEN_INVALID")
+	assert.Equal(t, int64(2), ft.accounts.Load(), "重建一次后不再追加重建")
 }

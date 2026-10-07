@@ -462,7 +462,9 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 
 		// [issue #12] 快照阶段：配置了 snapshot 的 feed 在渲染前建快照，
 		// {telegraph} 降级值已在编排器内决定（快照失败=原文链接，无 link=空串）。
-		// 失败语义与下方发送阶段一致：父预算耗尽延后下轮（不上报），退出取消上报
+		// 失败语义与下方发送阶段一致：父预算耗尽延后下轮（不上报），退出取消上报。
+		// 已知边角：快照先于 formatMessage——消息最终渲染为空被跳过时该页白建
+		// （概率低：模板为空串才触发，可接受，见外部 CR）
 		teleURL, err := h.snapshotForItem(ctx, feedConfig, item)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -656,7 +658,8 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 // backfillSnapshotLink 发送成功后将快照页 author_url 回填为消息链接（issue #12）。
 // 尽力而为：仅公开频道（channelURL 判定）回填；私有频道（纯数字 ID）跳过；
 // 未启用快照/编排器缺位/回填失败均不影响已推送消息，失败仅记日志。
-// 多频道场景每次覆盖——单页只装得下一个消息链接，最后成功者生效
+// 多频道场景由编排层缓存 Backfilled 位去重：首个成功回填锁定（外部 CR，
+// 原"最后覆盖"语义下前 N-1 次 editPage 白做且放大 Telegraph 调用量）
 func (h *RssHandler) backfillSnapshotLink(ctx context.Context, feed config.FeedConfig, item *gofeed.Item, channel string, msgID int64) {
 	if h.snapshot == nil || feed.Snapshot == "" || msgID <= 0 {
 		return

@@ -1,11 +1,11 @@
 package extractor
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -52,10 +52,13 @@ func (e *Extractor) FetchAndExtract(ctx context.Context, rawURL string) (string,
 	subCtx, cancel := context.WithTimeout(ctx, e.fetchTimeout)
 	defer cancel()
 
-	pageURL, err := url.Parse(rawURL)
-	if err != nil {
-		return "", fmt.Errorf("extract %s: parse url: %w", rawURL, err)
-	}
+	// [外部 CR] 原实现对 rawURL 做 url.Parse 供 readability 当基准地址，
+	// 但 http.Client 会跟随跳转，基准必须是跳转后的 resp.Request.URL，
+	// 故该预解析不再需要（NewRequestWithContext 自带 URL 校验）：
+	// pageURL, err := url.Parse(rawURL)
+	// if err != nil {
+	// 	return "", fmt.Errorf("extract %s: parse url: %w", rawURL, err)
+	// }
 
 	req, err := http.NewRequestWithContext(subCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -89,12 +92,17 @@ func (e *Extractor) FetchAndExtract(ctx context.Context, rawURL string) (string,
 	}
 
 	// 响应头 + 页面 meta 判定编码，统一转 UTF-8 后再解析（确定性，CR3-#1）
-	transcoded, err := charset.NewReader(strings.NewReader(string(data)), ct)
+	// [外部 CR] bytes.NewReader 零拷贝；原实现 string(data) 对 ≤5MB body 多复制一份：
+	// transcoded, err := charset.NewReader(strings.NewReader(string(data)), ct)
+	transcoded, err := charset.NewReader(bytes.NewReader(data), ct)
 	if err != nil {
 		return "", fmt.Errorf("extract %s: determine charset: %w", rawURL, err)
 	}
 
-	article, err := readability.FromReader(transcoded, pageURL)
+	// 基准地址取跳转后的最终 URL：短链/feedburner/http→https/路径改写很常见，
+	// 用跳转前地址会让 readability 把相对图片与链接补到错误基址（外部 CR）。
+	// 原实现用跳转前地址：readability.FromReader(transcoded, pageURL)
+	article, err := readability.FromReader(transcoded, resp.Request.URL)
 	if err != nil {
 		return "", fmt.Errorf("extract %s: readability: %w", rawURL, err)
 	}

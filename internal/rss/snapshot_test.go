@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -190,6 +191,23 @@ func TestSnapshotFeedSourceImageOnlyPost(t *testing.T) {
 		require.NoError(t, mErr)
 		assert.Contains(t, string(content), "tfsmy.chengdu.gov.cn", "图节点须入页")
 	})
+
+	// 图嵌在容器内同样豁免（外部 CR 阻断级修复）：RSS 纯图帖最常见写法就是
+	// <p>文<img></p> / <figure><img></figure>，根级判定曾把这类帖误判降级
+	for i, html := range []string{
+		`<p>原文地址<img src="https://e.com/a.jpg"></p>`,
+		`<figure><img src="https://e.com/a.jpg"></figure>`,
+		`<div><img src="https://e.com/a.jpg"></div>`,
+		`<a href="https://e.com"><img src="https://e.com/a.jpg"></a>`,
+	} {
+		t.Run(fmt.Sprintf("嵌套图豁免 #%d", i), func(t *testing.T) {
+			before := pub.calls.Load()
+			url, err := run(fmt.Sprintf("g-img-nested-%d", i), html)
+			require.NoError(t, err)
+			assert.Equal(t, "https://telegra.ph/ok-1", url, "容器内嵌图也应豁免字数下限")
+			assert.Equal(t, before+1, pub.calls.Load())
+		})
+	}
 
 	t.Run("data: 图不算有效图 仍降级", func(t *testing.T) {
 		before := pub.calls.Load()
@@ -453,8 +471,15 @@ func TestBackfillAuthorEditError(t *testing.T) {
 	assert.Contains(t, err.Error(), "editPage")
 }
 
-// 多频道覆盖语义：第二次回填覆盖第一次（单页只装得下一个消息链接）
-func TestBackfillAuthorLastWriteWins(t *testing.T) {
+// 多频道去重语义（外部 CR 修订）：由"每次覆盖、最后成功者生效"改为"首个成功
+// 回填即锁定"——editPage 串行计入 feed 预算，前 N-1 次白做且放大 Telegraph 调用量；
+// 首个回填失败不置位，允许后续频道重试
+// 原断言（最后覆盖）保留备查：
+//
+//	require.NoError(t, svc.BackfillAuthor(ctx, feed, item, "https://t.me/chan/1"))
+//	require.NoError(t, svc.BackfillAuthor(ctx, feed, item, "https://t.me/chan2/2"))
+//	assert.Equal(t, int32(2), pub.editCalls.Load())
+func TestBackfillAuthorFirstWriteWins(t *testing.T) {
 	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
 	svc := newSnapSvc(&fakeFetcher{html: fullBodyHTML}, pub)
 	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
@@ -464,7 +489,48 @@ func TestBackfillAuthorLastWriteWins(t *testing.T) {
 
 	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan/1"))
 	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan2/2"))
+	assert.Equal(t, int32(1), pub.editCalls.Load(), "首个成功回填后后续频道跳过 editPage")
+
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	require.Len(t, pub.edits, 1)
+	assert.Equal(t, "https://t.me/chan/1", pub.edits[0].page.AuthorURL, "锁定首个成功回填的链接")
+}
+
+// 首个回填失败不置位：后续频道（或下轮）仍可重试回填
+func TestBackfillAuthorRetryAfterFailure(t *testing.T) {
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1", editErr: errors.New("telegraph editPage: api error")}
+	svc := newSnapSvc(&fakeFetcher{html: fullBodyHTML}, pub)
+	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
+
+	_, err := svc.Snapshot(context.Background(), feed, item)
+	require.NoError(t, err)
+
+	require.Error(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan/1"))
+
+	pub.editErr = nil // 恢复后重试应成功
+	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan2/2"))
 	assert.Equal(t, int32(2), pub.editCalls.Load())
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	assert.Equal(t, "https://t.me/chan2/2", pub.edits[1].page.AuthorURL)
+}
+
+// 页面 path 兜底：createPage 返回 URL 非 telegra.ph 前缀（假服务器/域名变化）时
+// 取 URL path 段，不把整段 URL 当 path 发给 editPage（外部 CR）
+func TestSnapshotPathFallbackToURLPath(t *testing.T) {
+	pub := &fakePublisher{url: "http://fake.local/pg-7"}
+	svc := newSnapSvc(&fakeFetcher{html: fullBodyHTML}, pub)
+	feed, item := snapFeed("f", "@chan"), snapItem("标题", "https://e.com/a", "g1")
+
+	_, err := svc.Snapshot(context.Background(), feed, item)
+	require.NoError(t, err)
+
+	require.NoError(t, svc.BackfillAuthor(context.Background(), feed, item, "https://t.me/chan/1"))
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	require.Len(t, pub.edits, 1)
+	assert.Equal(t, "pg-7", pub.edits[0].path, "path 应从 URL path 段兜底解析")
 }
 
 // ---- author_url 构造（边界表：@name 去掉 @；裸名直接拼；纯数字 ID 不构造）----

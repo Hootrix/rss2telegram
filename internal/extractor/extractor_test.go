@@ -2,6 +2,7 @@ package extractor
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -124,6 +125,27 @@ func TestFetchAndExtractMojibakeUndeclared(t *testing.T) {
 	html, err := e.FetchAndExtract(context.Background(), srv.URL+"/mojibake")
 	require.NoError(t, err)
 	assert.NotEmpty(t, html)
+}
+
+// 跳转后基准地址必须取最终 URL（外部 CR）：短链/路径改写常见，用跳转前地址
+// 会让 readability 把相对图片/链接补到错误基址
+func TestFetchAndExtractRedirectBaseURL(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/old", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/2026/10/real.html", http.StatusFound)
+	})
+	mux.HandleFunc("/2026/10/real.html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// 正文里放相对路径图片：正确基准 → /2026/10/pic.jpg；错误基准 → /pic.jpg
+		_, _ = fmt.Fprint(w, articleHTML("跳转页", longText(15)+`<img src="pic.jpg">`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	e := newTestExtractor(5 * time.Second)
+	html, err := e.FetchAndExtract(context.Background(), srv.URL+"/old")
+	require.NoError(t, err)
+	assert.Contains(t, html, srv.URL+"/2026/10/pic.jpg", "相对地址必须按跳转后的 URL 补全")
 }
 
 func TestFetchAndExtractSubTimeout(t *testing.T) {
