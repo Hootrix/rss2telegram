@@ -164,6 +164,72 @@ func TestSnapshotFeedSourceDegrades(t *testing.T) {
 	assert.Equal(t, int32(0), pub.calls.Load(), "内容失败不应建页")
 }
 
+// 纯图帖豁免字数下限（issue #12 需求变更 2026-10-08）：
+// 正文不足 200 rune 但含 ≥1 张有效 http(s) 图仍建页（tianfu「原文地址+图」型）；
+// 乱码校验不豁免；data: 图被转换层丢弃不算有效图
+func TestSnapshotFeedSourceImageOnlyPost(t *testing.T) {
+	fetcher := &fakeFetcher{}
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(fetcher, pub)
+
+	// 每个子测试用独立 GUID：同 key 缓存会让后续子测试命中首建页面，测不到校验
+	run := func(guid, content string) (string, error) {
+		return svc.Snapshot(context.Background(), snapFeedSourceFeed("f", "@chan"),
+			snapItemContent("高温预警", "https://e.com/a", guid, content, ""))
+	}
+
+	t.Run("短文+http图 建页", func(t *testing.T) {
+		url, err := run("g-img-ok", `<p>原文地址</p><img src="https://tfsmy.chengdu.gov.cn/img/a.jpg">`)
+		require.NoError(t, err)
+		assert.Equal(t, "https://telegra.ph/ok-1", url)
+		assert.Equal(t, int32(0), fetcher.calls.Load(), "feed 模式不得抓原文")
+		pub.mu.Lock()
+		defer pub.mu.Unlock()
+		require.Len(t, pub.pages, 1, "纯图帖必须建页")
+		content, mErr := json.Marshal(pub.pages[0].Content)
+		require.NoError(t, mErr)
+		assert.Contains(t, string(content), "tfsmy.chengdu.gov.cn", "图节点须入页")
+	})
+
+	t.Run("data: 图不算有效图 仍降级", func(t *testing.T) {
+		before := pub.calls.Load()
+		url, err := run("g-img-data", `<p>原文地址</p><img src="data:image/png;base64,AAAA">`)
+		require.NoError(t, err)
+		assert.Equal(t, "https://e.com/a", url, "无有效图的短文必须降级")
+		assert.Equal(t, before, pub.calls.Load())
+	})
+
+	t.Run("乱码+图 仍降级", func(t *testing.T) {
+		before := pub.calls.Load()
+		url, err := run("g-img-moji", `<p>`+strings.Repeat("�", 50)+strings.Repeat("正", 50)+`</p><img src="https://e.com/i.jpg">`)
+		require.NoError(t, err)
+		assert.Equal(t, "https://e.com/a", url, "乱码校验不得被图豁免")
+		assert.Equal(t, before, pub.calls.Load())
+	})
+}
+
+// page 模式同样豁免：校验统一在 nodes 层后短正文+图放行（两路径规则一致）
+func TestSnapshotPageSourceImageOnlyAllowed(t *testing.T) {
+	fetcher := &fakeFetcher{html: `<p>原文地址</p><img src="https://e.com/pic.jpg">`}
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(fetcher, pub)
+
+	url, err := svc.Snapshot(context.Background(), snapFeed("f", "@chan"), snapItem("图帖", "https://e.com/a", "g1"))
+	require.NoError(t, err)
+	assert.Equal(t, "https://telegra.ph/ok-1", url)
+}
+
+// page 模式短正文无图：rss 层校验拦下降级（校验自 extractor 移交后的等价迁移）
+func TestSnapshotPageSourceShortDegrades(t *testing.T) {
+	fetcher := &fakeFetcher{html: `<p>太短了</p>`}
+	pub := &fakePublisher{url: "https://telegra.ph/ok-1"}
+	svc := newSnapSvc(fetcher, pub)
+
+	url, err := svc.Snapshot(context.Background(), snapFeed("f", "@chan"), snapItem("短文", "https://e.com/a", "g1"))
+	require.NoError(t, err, "短正文必须降级照发而非报错")
+	assert.Equal(t, "https://e.com/a", url)
+}
+
 // feed 模式父 ctx 取消于 createPage 阶段：延后语义与 page 模式一致（返回错误，不降级）
 func TestSnapshotFeedSourceParentCancelAtCreatePage(t *testing.T) {
 	fetcher := &fakeFetcher{}

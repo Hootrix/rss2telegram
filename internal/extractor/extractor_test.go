@@ -79,13 +79,20 @@ func TestFetchAndExtractBodyTooLarge(t *testing.T) {
 	assert.Contains(t, err.Error(), "too large")
 }
 
+// [2026-10-08 契约变更] 字数/乱码校验移交 rss 层（nodes 层校验需数图，纯图帖豁免
+// 字数下限，见 docs/superpowers/specs/2026-10-08-issues12-telegraph-image-only-snapshot.md），
+// FetchAndExtract 只负责抓取+转码+readability，正文质量不再在此失败。
+// 旧断言保留备查：
+// _, err := e.FetchAndExtract(context.Background(), srv.URL+"/short")
+// require.Error(t, err)
+// assert.Contains(t, err.Error(), "too short")
 func TestFetchAndExtractShortContent(t *testing.T) {
 	srv := servePage(t, "text/html; charset=utf-8", []byte(articleHTML("短", "太短了")))
 
 	e := newTestExtractor(5 * time.Second)
-	_, err := e.FetchAndExtract(context.Background(), srv.URL+"/short")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "too short")
+	html, err := e.FetchAndExtract(context.Background(), srv.URL+"/short")
+	require.NoError(t, err, "正文过短不再在 extractor 层失败，由 rss 层校验拦截")
+	assert.Contains(t, html, "太短了", "提取结果照常返回，交上层判定")
 }
 
 func TestFetchAndExtractGBKDeclared(t *testing.T) {
@@ -101,17 +108,22 @@ func TestFetchAndExtractGBKDeclared(t *testing.T) {
 	assert.Contains(t, html, "生活缴费")
 }
 
+// [2026-10-08 契约变更] 乱码校验同样移交 rss 层（见 TestFetchAndExtractShortContent 注释），
+// 旧断言保留备查：
+// _, err = e.FetchAndExtract(context.Background(), srv.URL+"/mojibake")
+// require.Error(t, err)
+// assert.Contains(t, err.Error(), "mojibake")
 func TestFetchAndExtractMojibakeUndeclared(t *testing.T) {
 	// GBK 字节但无任何编码声明：解析阶段被替换为 U+FFFD（合法 UTF-8），
-	// 必须靠占比阈值识别乱码并失败，而不是发布乱码快照
+	// 转码产物照常返回，占比阈值识别交给 rss 层 ValidateMojibake
 	gbk, err := simplifiedchinese.GBK.NewEncoder().String(articleHTML("成都头条", longText(12)))
 	require.NoError(t, err)
 	srv := servePage(t, "text/html", []byte(gbk))
 
 	e := newTestExtractor(5 * time.Second)
-	_, err = e.FetchAndExtract(context.Background(), srv.URL+"/mojibake")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "mojibake")
+	html, err := e.FetchAndExtract(context.Background(), srv.URL+"/mojibake")
+	require.NoError(t, err)
+	assert.NotEmpty(t, html)
 }
 
 func TestFetchAndExtractSubTimeout(t *testing.T) {
@@ -184,4 +196,13 @@ func TestValidateText(t *testing.T) {
 		exactlyOnePct := strings.Repeat("正", 198) + "��" // 2/200 = 1%，阈值严格大于才判乱码
 		require.NoError(t, ValidateText(exactlyOnePct))
 	})
+}
+
+// ValidateMojibake 单独导出（2026-10-08 纯图帖豁免）：rss 层 nodes 校验先拦乱码
+// 再按"有图豁免字数"放行，字数下限不在此函数内（短文本含 FFFD 才会失败）
+func TestValidateMojibake(t *testing.T) {
+	require.NoError(t, ValidateMojibake(""), "空串无乱码概念，字数归 ValidateText 管")
+	require.NoError(t, ValidateMojibake("原文地址"), "短文本无 FFFD 不拦")
+	require.Error(t, ValidateMojibake(strings.Repeat("�", 50)+strings.Repeat("正", 50)), "占比 50% 判乱码")
+	require.NoError(t, ValidateMojibake(strings.Repeat("正", 198)+"��"), "恰好 1% 通过（严格大于才判）")
 }

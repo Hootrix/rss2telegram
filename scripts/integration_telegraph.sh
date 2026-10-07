@@ -41,6 +41,15 @@ feeds:
       📰 *{title}*
       🔗 [快照]({telegraph})
       🌐 [原文]({link})
+  - name: smoke-img-feed
+    url: http://127.0.0.1:$PORT/s/rss_img.xml
+    channels: ["@smoke_ch"]
+    snapshot: telegraph
+    snapshot_source: feed
+    first_push: true
+    template: |
+      🖼 *{title}*
+      🔗 [快照]({telegraph})
 EOF
 
 echo "==> 启动主程序（假 Telegram/Telegraph 注入）"
@@ -49,10 +58,12 @@ TELEGRAPH_API_URL="http://127.0.0.1:$PORT" \
   "$WORK/rss2telegram" -config "$WORK/config/config.yaml" &
 BOT_PID=$!
 
-# 轮询等待首条推送落地（check_interval=2s，快照全链路本地 <1s）；
+# 轮询等待两条推送全部落地（check_interval=2s，快照全链路本地 <1s，
+# 但同频道发送间隔 3s，第二条消息晚于首条约 3s）；
 # edits.jsonl 也纳入等待：回填发生在 sendMessage 之后，晚于 sent.jsonl 落地
-for _ in $(seq 1 15); do
-  [ -s "$WORK/sent.jsonl" ] && [ -s "$WORK/pages.jsonl" ] && [ -s "$WORK/edits.jsonl" ] && break
+lines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
+for _ in $(seq 1 20); do
+  [ "$(lines "$WORK/sent.jsonl")" -ge 2 ] && [ "$(lines "$WORK/pages.jsonl")" -ge 2 ] && [ "$(lines "$WORK/edits.jsonl")" -ge 2 ] && break
   sleep 1
 done
 sleep 1 # 等日志落盘
@@ -62,20 +73,33 @@ wait $BOT_PID 2>/dev/null || true
 echo "==> 校验推送与建页记录"
 FAIL=0
 
-# 推送消息包含假 Telegraph 快照链接
-if grep -q 'telegra.ph/smoke-1' "$WORK/sent.jsonl"; then
-  echo "PASS: 消息包含快照链接"
-else
-  echo "FAIL: 消息未包含快照链接"; cat "$WORK/sent.jsonl"; FAIL=1
-fi
+# 两 feed 并发处理，pages/sent/edits 行序不定：计数断言用行数（lines 已在等待段定义），
+# 内容断言一律按文件级 grep
 
-# 建页请求含标题/作者（feed 名）/频道主页链接
-PAGE=$(head -1 "$WORK/pages.jsonl")
-for expect in '快照冒烟文章' 'smoke-feed' 'https://t.me/smoke_ch'; do
-  if grep -qF "$expect" <<<"$PAGE"; then
-    echo "PASS: 建页含 $expect"
+# 消息包含各自快照链接（page 模式长文页 + feed 模式纯图页）
+for expect in 'telegra.ph/smoke-1' 'telegra.ph/smoke-2'; do
+  if grep -qF "$expect" "$WORK/sent.jsonl"; then
+    echo "PASS: 消息包含 $expect"
   else
-    echo "FAIL: 建页缺少 $expect"; FAIL=1
+    echo "FAIL: 消息未包含 $expect"; cat "$WORK/sent.jsonl"; FAIL=1
+  fi
+done
+
+# 长文页（page 模式）：标题/作者（feed 名）/频道主页链接
+for expect in '快照冒烟文章' 'smoke-feed' 'https://t.me/smoke_ch'; do
+  if grep -qF "$expect" "$WORK/pages.jsonl"; then
+    echo "PASS: 长文建页含 $expect"
+  else
+    echo "FAIL: 长文建页缺少 $expect"; FAIL=1
+  fi
+done
+
+# 纯图页（feed 模式豁免字数下限，issue #12 需求变更）：标题/图片入页/作者
+for expect in '纯图冒烟文章' 'https://example.com/pic.jpg' 'smoke-img-feed'; do
+  if grep -qF "$expect" "$WORK/pages.jsonl"; then
+    echo "PASS: 纯图建页含 $expect"
+  else
+    echo "FAIL: 纯图建页缺少 $expect"; cat "$WORK/pages.jsonl"; FAIL=1
   fi
 done
 
@@ -87,28 +111,30 @@ else
   echo "FAIL: telegraph token 未持久化"; FAIL=1
 fi
 
-# 只建一页（同 feed 同文章缓存命中，仅一个频道）
-if [ "$(wc -l < "$WORK/pages.jsonl" | tr -d ' ')" = "1" ]; then
-  echo "PASS: 只建一页"
+# 恰好两页两消息（同 feed 同文章缓存命中；editPage 只重提交不新建页）
+if [ "$(lines "$WORK/pages.jsonl")" = "2" ]; then
+  echo "PASS: 恰好建两页"
 else
-  echo "FAIL: 建页数异常"; FAIL=1
+  echo "FAIL: 建页数异常"; cat "$WORK/pages.jsonl"; FAIL=1
+fi
+if [ "$(lines "$WORK/sent.jsonl")" = "2" ]; then
+  echo "PASS: 恰好两条消息"
+else
+  echo "FAIL: 消息数异常"; cat "$WORK/sent.jsonl"; FAIL=1
 fi
 
 # author_url 回填（issue #12）：editPage 请求定位到所建页面，author_url 为消息链接
 # 假 Telegram 固定返回 message_id=1 → 链接为 t.me/smoke_ch/1；
 # path 与真实 API 一致不带前导斜杠（缓存 Path 已 TrimPrefix 页面 URL 前缀）
-EDIT=$(head -1 "$WORK/edits.jsonl")
-for expect in '"path":"smoke-1"' '"author_url":"https://t.me/smoke_ch/1"' '快照冒烟文章'; do
-  if grep -qF "$expect" <<<"$EDIT"; then
+for expect in '"path":"smoke-1"' '"path":"smoke-2"' '"author_url":"https://t.me/smoke_ch/1"'; do
+  if grep -qF "$expect" "$WORK/edits.jsonl"; then
     echo "PASS: 回填请求含 $expect"
   else
     echo "FAIL: 回填请求缺少 $expect"; cat "$WORK/edits.jsonl" 2>/dev/null; FAIL=1
   fi
 done
-
-# 回填仅重提交不新建页（editPage 不进 pages.jsonl 已由"只建一页"隐含，这里显式断言恰好一次编辑）
-if [ "$(wc -l < "$WORK/edits.jsonl" | tr -d ' ')" = "1" ]; then
-  echo "PASS: 恰好一次回填"
+if [ "$(lines "$WORK/edits.jsonl")" = "2" ]; then
+  echo "PASS: 恰好两次回填"
 else
   echo "FAIL: 回填次数异常"; cat "$WORK/edits.jsonl"; FAIL=1
 fi

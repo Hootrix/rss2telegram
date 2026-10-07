@@ -102,15 +102,17 @@ func (e *Extractor) FetchAndExtract(ctx context.Context, rawURL string) (string,
 		return "", fmt.Errorf("extract %s: no article content", rawURL)
 	}
 
-	var text strings.Builder
-	if err := article.RenderText(&text); err != nil {
-		return "", fmt.Errorf("extract %s: render text: %w", rawURL, err)
-	}
-	plain := text.String()
-
-	if err := ValidateText(plain); err != nil {
-		return "", fmt.Errorf("extract %s: %w", rawURL, err)
-	}
+	// [2026-10-08 契约变更] 正文质量校验（乱码/字数）移交 rss 层 nodes 校验：
+	// 纯图帖豁免字数下限需在节点层数图，此处拿不到节点；抓取类失败语义不变。
+	// 旧校验代码保留备查：
+	// var text strings.Builder
+	// if err := article.RenderText(&text); err != nil {
+	//     return "", fmt.Errorf("extract %s: render text: %w", rawURL, err)
+	// }
+	// plain := text.String()
+	// if err := ValidateText(plain); err != nil {
+	//     return "", fmt.Errorf("extract %s: %w", rawURL, err)
+	// }
 
 	var htmlOut strings.Builder
 	if err := article.RenderHTML(&htmlOut); err != nil {
@@ -119,11 +121,23 @@ func (e *Extractor) FetchAndExtract(ctx context.Context, rawURL string) (string,
 	return htmlOut.String(), nil
 }
 
-// ValidateText 对正文纯文本做质量校验：U+FFFD 占比超 1% 判乱码，纯文本不足 200 rune 判过短。
-// 抓原文（page）与 feed 来源两条路径共用，失败口径一致（issue #12 snapshot_source）
-func ValidateText(plain string) error {
+// ValidateMojibake 乱码校验单独导出（2026-10-08 纯图帖豁免）：
+// U+FFFD 占比超 1% 判乱码，不含字数下限——rss 层 nodes 校验先拦乱码
+// （含图不豁免），再按"有图豁免字数"放行，字数归 ValidateText
+func ValidateMojibake(plain string) error {
 	if replacementRatio(plain) > maxReplacementRatio {
 		return fmt.Errorf("mojibake detected (U+FFFD ratio over 1%%)")
+	}
+	return nil
+}
+
+// ValidateText 对正文纯文本做质量校验：U+FFFD 占比超 1% 判乱码，纯文本不足 200 rune 判过短。
+// [2026-10-08] 两条快照路径的校验已统一挪至 rss 层 validateNodes（纯图帖豁免字数下限，
+// 见 docs/superpowers/specs/2026-10-08-issues12-telegraph-image-only-snapshot.md），
+// 此函数保留组合语义供独立校验场景使用
+func ValidateText(plain string) error {
+	if err := ValidateMojibake(plain); err != nil {
+		return err
 	}
 	if n := runeCount(plain); n < minTextRunes {
 		return fmt.Errorf("text too short (%d runes)", n)

@@ -145,11 +145,12 @@ func (s *SnapshotService) BackfillAuthor(ctx context.Context, feed config.FeedCo
 }
 
 // sourceNodes 取快照正文并转为 Telegraph 节点，按 feed.SnapshotSource 分派（issue #12）：
-//   - page（默认）：抓原文 + readability，行为不变
+//   - page（默认）：抓原文 + readability
 //   - feed：取 RSS item 正文（Content 优先，空取 Description），零网络抓取；
-//     不过 readability（RSS 正文已是正文片段，洗片段只有洗坏风险），
-//     质量校验与 page 同阈值（extractor.ValidateText）
+//     不过 readability（RSS 正文已是正文片段，洗片段只有洗坏风险）
 //
+// 两路径正文质量统一由 validateNodes 校验（2026-10-08 前在 extractor 内，
+// 移交 rss 层是为纯图帖豁免字数下限——节点层才能数图）。
 // 失败统一由调用方 settle：feed 内容问题不回退抓原文（选 feed 的典型场景抓原文本就无效）
 func (s *SnapshotService) sourceNodes(ctx context.Context, feed config.FeedConfig, item *gofeed.Item) ([]any, error) {
 	if feed.SnapshotSource == config.SnapshotSourceFeed {
@@ -164,11 +165,15 @@ func (s *SnapshotService) sourceNodes(ctx context.Context, feed config.FeedConfi
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", item.Link, err)
 	}
-	return htmlToNodes(html), nil
+	nodes := htmlToNodes(html)
+	if err := validateNodes(nodes); err != nil {
+		return nil, fmt.Errorf("validate %s: %w", item.Link, err)
+	}
+	return nodes, nil
 }
 
-// feedContentNodes 从 RSS item 取正文 HTML 转节点并校验：
-// 纯图帖/摘要型误配（正文 <200 rune）由 ValidateText 拦截，错误信息带 rune 数便于排查
+// feedContentNodes 从 RSS item 取正文 HTML 转节点并交统一校验：
+// 摘要型误配（无图短文）由 validateNodes 拦截，错误信息带 rune 数便于排查
 func feedContentNodes(item *gofeed.Item) ([]any, error) {
 	raw := item.Content
 	if raw == "" {
@@ -178,10 +183,36 @@ func feedContentNodes(item *gofeed.Item) ([]any, error) {
 		return nil, errEmptyFeedContent
 	}
 	nodes := htmlToNodes(raw)
-	if err := extractor.ValidateText(nodesPlainText(nodes)); err != nil {
+	if err := validateNodes(nodes); err != nil {
 		return nil, err
 	}
 	return nodes, nil
+}
+
+// validateNodes 正文质量统一校验（page/feed 两路径，2026-10-08 纯图帖豁免）：
+//   - 乱码必拦，含图不豁免（乱码图帖页面同样不可读）
+//   - 含 ≥1 张有效图豁免字数下限（纯图帖建页；有效性由转换层保证——
+//     非 http(s) 图已在 htmlToNodes 丢弃，这里的 img 节点天然全部有效）
+//   - 无图走 ValidateText：纯文本不足 200 rune 判过短
+func validateNodes(nodes []any) error {
+	plain := nodesPlainText(nodes)
+	if err := extractor.ValidateMojibake(plain); err != nil {
+		return err
+	}
+	if hasImageNode(nodes) {
+		return nil
+	}
+	return extractor.ValidateText(plain)
+}
+
+// hasImageNode 判断根级节点数组是否含图；转换层只产出根级 img（Telegraph 平级结构）
+func hasImageNode(nodes []any) bool {
+	for _, n := range nodes {
+		if node, ok := n.(telegraph.Node); ok && node.Tag == "img" {
+			return true
+		}
+	}
+	return false
 }
 
 // settle 统一失败结算：父取消 → 延后（错误）；否则降级照发（原文链接 + 日志）
