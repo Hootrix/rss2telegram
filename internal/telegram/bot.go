@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -200,8 +201,10 @@ func (b *Bot) Send(channel string, message string) error {
 }
 */
 
-// Send 发送消息并返回成功消息的 message_id（issue #12：快照页 author_url 回填
-// 消息链接用）；markdown 降级重发场景取最终成功那次的 message_id
+// [issue #13] 旧版 Send（纯文本路径）整体替换为下方带 photo 分支的新实现，
+// 旧逻辑完整保留备查。其文档注释：发送消息并返回成功消息的 message_id（issue #12：
+// 快照页 author_url 回填消息链接用）；markdown 降级重发场景取最终成功那次的 message_id
+/*
 func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64, error) {
 	if channel == "" {
 		return 0, errors.New("telegram: empty channel")
@@ -234,6 +237,102 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 		return 0, b.sendError(ctx, err)
 	}
 	return int64(sent.ID), nil
+}
+*/
+
+// Send 发送消息并返回成功消息的 message_id（issue #12：快照页 author_url 回填
+// 消息链接用）；markdown 降级重发场景取最终成功那次的 message_id
+// [issue #13] 新增 photo 分支：multipart 上传、caption parse 400 → captionPlain 重试、
+// 400/413 → 置空 photo 降级全文文本、其余错误保留状态交外层重试
+func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64, error) {
+	if channel == "" {
+		return 0, errors.New("telegram: empty channel")
+	}
+	if message == nil || message.text == "" {
+		return 0, errors.New("telegram: empty message")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("telegram send: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	sender, err := b.contextualBot(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("create telegram sender: %w", err)
+	}
+	recipient := newChannelRecipient(channel)
+
+	// [issue #13] photo 路径，失败分类按序判定：
+	// 1. 成功 → 返回
+	// 2. parse entities（且未 plain）→ captionPlain 重试一次 photo，结果回到 3/4 判定
+	// 3. 400/413 → 图片永久失败（尺寸/格式/权限/实体过大），置空 photo 当场降级文本
+	// 4. 其余（网络/5xx/429/ctx）→ 交 sendWithRetry 重试，photo 与 captionPlain 状态保留
+	if len(message.photo) > 0 {
+		sent, err := sendPhotoOnce(sender, recipient, message)
+		if err == nil {
+			return int64(sent.ID), nil
+		}
+		if isParseEntitiesError(err) && !message.captionPlain {
+			message.captionPlain = true
+			log.Printf("photo caption parse failed, retrying photo with plain caption")
+			sent, err = sendPhotoOnce(sender, recipient, message)
+			if err == nil {
+				return int64(sent.ID), nil
+			}
+		}
+		if isPhotoPermanentError(err) {
+			log.Printf("photo send failed permanently, falling back to text message: %v", err)
+			message.photo = nil // 存活于 Message：外层文本重试不再撞图片 400
+		} else {
+			return 0, b.sendError(ctx, err)
+		}
+	}
+
+	text, options := message.text, &tele.SendOptions{}
+	if message.plain {
+		text = tgmd.Unescape(text)
+	} else {
+		options.ParseMode = tele.ModeMarkdown
+	}
+	sent, err := sender.Send(recipient, text, options)
+	if err != nil && !message.plain && isParseEntitiesError(err) {
+		message.plain = true
+		log.Printf("markdown parse failed, falling back to plain text")
+		sent, err = sender.Send(recipient, tgmd.Unescape(message.text))
+	}
+	if err != nil {
+		return 0, b.sendError(ctx, err)
+	}
+	return int64(sent.ID), nil
+}
+
+// sendPhotoOnce 单次 photo 发送尝试。每次新建 reader 与 Photo 实例：
+// reader 读过即耗尽；telebot Photo.Send 会回写 receiver（*p = *msg.Photo），
+// 复用实例会污染重试。caption 构造：先按 captionPlain 反转义再截断
+// （反转义会改变长度，先截后转义可能超限）
+func sendPhotoOnce(sender *tele.Bot, recipient tele.Recipient, message *Message) (*tele.Message, error) {
+	caption := message.text
+	if message.captionPlain {
+		caption = tgmd.Unescape(caption)
+	}
+	caption = truncateCaption(caption)
+	options := &tele.SendOptions{}
+	if !message.captionPlain {
+		options.ParseMode = tele.ModeMarkdown
+	}
+	photo := &tele.Photo{File: tele.FromReader(bytes.NewReader(message.photo)), Caption: caption}
+	return sender.Send(recipient, photo, options)
+}
+
+// isPhotoPermanentError 图片层面永久失败（尺寸/格式/权限/实体过大）：
+// 400 与 413 按错误码字符串匹配——与 isParseEntitiesError 同惯例，
+// telebot 对非 sentinel 错误返回 "telegram: ... (400)" 形态的 fmt 错误，
+// 类型断言永远落空。注意必须在 parse entities 判定之后调用。
+// 补充：v3.1.3 的 sentinel ErrTooLarge = NewError(400, "Request Entity Too Large")，
+// 真实 413 会被 telebot 改写成 "(400)" 文本，由 (400) 分支兜住；(413) 分支属纵深防御
+func isPhotoPermanentError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "(400)") || strings.Contains(msg, "(413)")
 }
 
 // Raw 内部的 Background 不接收调用方取消，独立发送实例复用连接池并注入本次 context
