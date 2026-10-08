@@ -25,21 +25,26 @@ feeds:
     url: "https://example.com/rss"
     channels:
       - "@test_push"
-    snapshot: telegraph  # 可选，缺省不启用；其他值启动报错
+    snapshot: telegraph  # 可选，缺省不启用；只能填 telegraph，其他值启动报错
+    # snapshot_source 正文来源（可选，需先启用 snapshot，否则校验报错）：
+    #   缺省/page：请求 item.Link 原文，readability 提取正文后建页
+    #   feed：直接用 RSS item 正文（见下方 fulltext-feed 示例）
     template: |
       📰 *{title}*
 
       🔗 [快照]({telegraph})
       🌐 [原文]({link})
 
-  # 全文输出型 RSS 源：正文取 RSS item（content:encoded 优先，空取 description），
-  # 跳过原文抓取，不受反爬/JS 渲染影响；要求源输出全文且图片为绝对 http(s) 地址
+  # 全文输出型 RSS 源（snapshot_source: feed）：正文取 RSS item 的
+  # content:encoded（空则退回 description），不抓原文、不过 readability。
+  # 适合源本身输出全文、或原文有反爬/需 JS 渲染/readability 洗坏正文的场景；
+  # 要求正文里的图片是绝对 http(s) 地址，相对/data: 图会被丢弃
   - name: "fulltext-feed"
     url: "https://example.com/fulltext.xml"
     channels:
       - "@test_push"
     snapshot: telegraph
-    snapshot_source: feed  # 可选，缺省 page（抓原文）；需同时启用 snapshot
+    snapshot_source: feed  # 只能填 page/feed；摘要型源误配会因正文过短降级为原文链接
     template: |
       📰 *{title}*
 
