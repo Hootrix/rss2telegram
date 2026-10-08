@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/Hootrix/rss2telegram/internal/config"
+	"github.com/Hootrix/rss2telegram/internal/extractor"
 	"github.com/Hootrix/rss2telegram/internal/rss"
 	"github.com/Hootrix/rss2telegram/internal/storage"
 	"github.com/Hootrix/rss2telegram/internal/telegram"
+	"github.com/Hootrix/rss2telegram/internal/telegraph"
 )
 
 func main() {
@@ -74,7 +76,10 @@ func main() {
 	}
 
 	// 创建 RSS 处理器
-	rssHandler := rss.NewRssHandler(cfg, bot, store)
+	// [issue #12] Telegraph 快照组件：token 懒加载，未配置 snapshot 的 feed 零开销
+	tgClient := telegraph.NewClient(dataDir, "", nil)
+	snapshotSvc := rss.NewSnapshotService(extractor.New(nil), tgClient, rss.NewSnapshotCache(0, 0))
+	rssHandler := rss.NewRssHandler(cfg, bot, store, snapshotSvc)
 
 	// 注册配置变更回调
 	cfgManager.OnConfigChange(func(newCfg *config.Config) {

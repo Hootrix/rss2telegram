@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,10 +27,11 @@ import (
 
 type RssHandler struct {
 	sync.RWMutex
-	parser  *gofeed.Parser
-	config  *config.Config
-	bot     TelegramBot
-	storage *storage.Storage
+	parser   *gofeed.Parser
+	config   *config.Config
+	bot      TelegramBot
+	storage  *storage.Storage
+	snapshot Snapshotter
 	// sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
 	waitFn     func(context.Context, time.Duration) error
 	nowFn      func() time.Time
@@ -43,7 +45,16 @@ type RssHandler struct {
 
 type TelegramBot interface {
 	// Send(channel string, message string) error
-	Send(context.Context, string, *telegram.Message) error
+	// [issue #12] 返回 msgID 供快照页 author_url 回填消息链接
+	Send(context.Context, string, *telegram.Message) (int64, error)
+}
+
+// Snapshotter 快照编排抽象（*SnapshotService 实现）；
+// nil 时配置了 snapshot 的 feed 也只跳过快照不 panic
+type Snapshotter interface {
+	Snapshot(ctx context.Context, feed config.FeedConfig, item *gofeed.Item) (string, error)
+	// BackfillAuthor 发送成功后将快照页 author_url 更新为 msgLink（issue #12，尽力而为）
+	BackfillAuthor(ctx context.Context, feed config.FeedConfig, item *gofeed.Item, msgLink string) error
 }
 
 type channelSendState struct {
@@ -52,7 +63,7 @@ type channelSendState struct {
 	nextSend time.Time
 }
 
-func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) *RssHandler {
+func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage, snapshot Snapshotter) *RssHandler {
 	parser := gofeed.NewParser()
 	// ParseURLWithContext 可取消请求；并发读取前初始化 SDK 惰性字段，避免竞争写入
 	parser.Client = &http.Client{Timeout: maxBlockingBudget}
@@ -61,10 +72,11 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage) 
 	parser.JSONTranslator = &gofeed.DefaultJSONTranslator{}
 	return &RssHandler{
 		// parser: gofeed.NewParser(),
-		parser:  parser,
-		config:  cfg,
-		bot:     bot,
-		storage: store,
+		parser:   parser,
+		config:   cfg,
+		bot:      bot,
+		storage:  store,
+		snapshot: snapshot,
 		// sleepFn: time.Sleep,
 		nowFn:      time.Now,
 		sendStates: make(map[string]*channelSendState),
@@ -447,7 +459,22 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 	// 发送后的全 feed sleep 已在上方旧代码保留，节流仅由共享频道状态负责
 	for _, item := range newItems {
 		itemID := generateItemID(item)
-		message := h.formatMessage(item, feedConfig.Template)
+
+		// [issue #12] 快照阶段：配置了 snapshot 的 feed 在渲染前建快照，
+		// {telegraph} 降级值已在编排器内决定（快照失败=原文链接，无 link=空串）。
+		// 失败语义与下方发送阶段一致：父预算耗尽延后下轮（不上报），退出取消上报。
+		// 已知边角：快照先于 formatMessage——消息最终渲染为空被跳过时该页白建
+		// （概率低：模板为空串才触发，可接受，见外部 CR）
+		teleURL, err := h.snapshotForItem(ctx, feedConfig, item)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("Feed %s budget exhausted during snapshot, deferring remaining items to next check", feedConfig.Name)
+				return nil
+			}
+			return fmt.Errorf("snapshot feed items: %w", err)
+		}
+
+		message := h.formatMessage(item, feedConfig.Template, teleURL)
 		if message == "" {
 			continue
 		}
@@ -467,10 +494,12 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 			if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
 				continue
 			}
-			if h.sendWithRetry(ctx, channel, message, item.Title) {
+			if msgID, ok := h.sendWithRetry(ctx, channel, message, item.Title); ok {
 				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
 					log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
 				}
+				// [issue #12] 快照页 author_url 回填为消息链接（公开频道，尽力而为）
+				h.backfillSnapshotLink(ctx, feedConfig, item, channel, msgID)
 			}
 		}
 	}
@@ -574,7 +603,9 @@ func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
 }
 */
 
-func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, itemTitle string) bool {
+// sendWithRetry 带重试发送单条消息，返回成功消息的 message_id（失败为 0）与是否成功。
+// msgID 供快照页 author_url 回填消息链接（issue #12），非快照路径可忽略
+func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, itemTitle string) (int64, bool) {
 	budget := blockingBudget(h.messageBudget)
 	deadline := h.now().Add(budget)
 	ctx, cancel := context.WithTimeout(parent, budget)
@@ -582,24 +613,24 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 	state := h.channelState(channel)
 	if !claimChannel(ctx, state) {
 		log.Printf("Deferring item '%s' to channel %s: channel busy or cancelled", itemTitle, channel)
-		return false
+		return 0, false
 	}
 	defer func() { <-state.gate }()
 	delivery := telegram.NewMessage(message)
 	for attempt, floodCount := 0, 0; ; {
 		if !h.waitForSend(ctx, state, deadline, channel, itemTitle) {
-			return false
+			return 0, false
 		}
-		err := h.bot.Send(ctx, channel, delivery)
+		msgID, err := h.bot.Send(ctx, channel, delivery)
 		if err == nil {
 			state.nextSend = h.now().Add(sendInterval)
 			log.Printf("Successfully sent message to channel %s: %s", channel, itemTitle)
-			return true
+			return msgID, true
 		}
 		if ctx.Err() != nil {
 			// 之前静默返回，线上无法区分退出/超时与真实失败
 			log.Printf("Deferring item '%s' to channel %s: %v", itemTitle, channel, ctx.Err())
-			return false
+			return 0, false
 		}
 		var rate *telegram.RateLimitError
 		if errors.As(err, &rate) && rate != nil {
@@ -607,20 +638,38 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 			floodCount++
 			if floodCount > maxFloodRetries {
 				log.Printf("Failed to send item '%s' to channel %s after %d flood retries: %v", itemTitle, channel, maxFloodRetries, err)
-				return false
+				return 0, false
 			}
 			continue
 		}
 		attempt++
 		if attempt >= maxSendRetries {
 			log.Printf("Failed to send item '%s' to channel %s after %d retries: %v", itemTitle, channel, maxSendRetries, err)
-			return false
+			return 0, false
 		}
 		log.Printf("Error sending item '%s' to channel %s (retry %d/%d): %v", itemTitle, channel, attempt, maxSendRetries, err)
 		if !h.wait(ctx, backoffWithJitter(attempt-1), deadline) {
 			log.Printf("Deferring item '%s' to channel %s: backoff exceeds remaining budget or cancelled", itemTitle, channel)
-			return false
+			return 0, false
 		}
+	}
+}
+
+// backfillSnapshotLink 发送成功后将快照页 author_url 回填为消息链接（issue #12）。
+// 尽力而为：仅公开频道（channelURL 判定）回填；私有频道（纯数字 ID）跳过；
+// 未启用快照/编排器缺位/回填失败均不影响已推送消息，失败仅记日志。
+// 多频道场景由编排层缓存 Backfilled 位去重：首个成功回填锁定（外部 CR，
+// 原"最后覆盖"语义下前 N-1 次 editPage 白做且放大 Telegraph 调用量）
+func (h *RssHandler) backfillSnapshotLink(ctx context.Context, feed config.FeedConfig, item *gofeed.Item, channel string, msgID int64) {
+	if h.snapshot == nil || feed.Snapshot == "" || msgID <= 0 {
+		return
+	}
+	if channelURL(channel) == "" {
+		return // 私有频道无公开 t.me 消息链接
+	}
+	msgLink := "https://t.me/" + strings.TrimPrefix(channel, "@") + "/" + strconv.FormatInt(msgID, 10)
+	if err := h.snapshot.BackfillAuthor(ctx, feed, item, msgLink); err != nil {
+		log.Printf("snapshot backfill author_url failed, feed %s item %q: %v", feed.Name, item.Title, err)
 	}
 }
 
@@ -723,8 +772,18 @@ func backoffWithJitter(attempt int) time.Duration {
 	return time.Second*time.Duration(1<<attempt) + time.Duration(rand.Int63n(int64(500*time.Millisecond)))
 }
 
+// snapshotForItem 对配置了 snapshot 的 feed 建快照；未启用或编排器缺位返回空串
+func (h *RssHandler) snapshotForItem(ctx context.Context, feedConfig config.FeedConfig, item *gofeed.Item) (string, error) {
+	// Validate() 已保证非空 snapshot 只能是 telegraph，无需再比对枚举值
+	if feedConfig.Snapshot == "" || h.snapshot == nil {
+		return "", nil
+	}
+	return h.snapshot.Snapshot(ctx, feedConfig, item)
+}
+
 // 格式化消息
-func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
+// [issue #12] telegraphURL 为快照编排结果：成功=页面 URL，降级=原文链接，无 link=空串
+func (h *RssHandler) formatMessage(item *gofeed.Item, template string, telegraphURL string) string {
 	if template == "" {
 		template = "{title}\n\n{link}" // 默认模板
 	}
@@ -774,6 +833,9 @@ func (h *RssHandler) formatMessage(item *gofeed.Item, template string) string {
 			}
 		case "link":
 			content = item.Link
+		case "telegraph":
+			// URL 数据域，不做 Markdown 转义；空串时模板自行决定兜底（default 操作链）
+			content = telegraphURL
 		case "pubDate":
 			if item.PublishedParsed != nil {
 				content = item.PublishedParsed.Format("2006-01-02 15:04:05")

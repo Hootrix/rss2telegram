@@ -1,4 +1,6 @@
 **.bloom
 config/*.yaml
+config/rss2telegram-data/
 docs/
 CLAUDE.md
+.vscode/
