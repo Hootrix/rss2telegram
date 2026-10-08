@@ -547,3 +547,22 @@ func TestTruncateCaption(t *testing.T) {
 		assert.Equal(t, strings.Repeat("a", 1023)+"\x80", truncateCaption(in))
 	})
 }
+
+// issue #13：Message 携带可选图片字节；空字节等价普通文本消息
+func TestNewPhotoMessage(t *testing.T) {
+	t.Run("有图", func(t *testing.T) {
+		m := NewPhotoMessage("caption", []byte{1, 2, 3})
+		assert.True(t, m.HasPhoto())
+		assert.Equal(t, "caption", m.Text())
+	})
+	t.Run("空字节退回文本消息", func(t *testing.T) {
+		m := NewPhotoMessage("text", nil)
+		assert.False(t, m.HasPhoto())
+		assert.Equal(t, "text", m.Text())
+	})
+	t.Run("NewMessage 无图（回归）", func(t *testing.T) {
+		m := NewMessage("text")
+		assert.False(t, m.HasPhoto())
+		assert.Equal(t, "text", m.Text())
+	})
+}

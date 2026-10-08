@@ -27,15 +27,40 @@ type Bot struct {
 
 // Message 由单个消息任务独占，重试保留纯文本降级状态，不按频道缓存解析失败
 // 原文本保持不变，发送纯文本时才反转义
+//
+//	type Message struct {
+//		text  string
+//		plain bool
+//	}
 type Message struct {
-	text  string
+	// text 恒为完整文本不截断：photo 降级后文本路径用全文
+	text string
+	// plain 文本路径的 markdown 降级（既有）
 	plain bool
+	// photo 非空 → sendPhoto；图片永久失败降级时置 nil。
+	// 多频道共享同一底层数组，只读；需修改字节必须先复制（issue #13）
+	photo []byte
+	// captionPlain caption 的 markdown 降级，与 plain 分离：
+	// caption 解析失败常由 1024 截断切断实体引起，是 caption 独有问题；
+	// 共用 plain 会让图片失败降级后的全文无辜走 plain、丢失格式（issue #13）
+	captionPlain bool
 }
 
 func NewMessage(text string) *Message { return &Message{text: text} }
 
+// NewPhotoMessage photo 为空字节时等价 NewMessage（调用方免判空）
+func NewPhotoMessage(text string, photo []byte) *Message {
+	if len(photo) == 0 {
+		return NewMessage(text)
+	}
+	return &Message{text: text, photo: photo}
+}
+
 // Text 只读访问原始消息文本，供跨包（rss 集成测试等）断言内容
 func (m *Message) Text() string { return m.text }
+
+// HasPhoto 只读访问是否仍为图片消息，供跨包断言发送/降级路径（issue #13）
+func (m *Message) HasPhoto() bool { return len(m.photo) > 0 }
 
 // RateLimitError 表示 Telegram 429 限速，携带服务端指示的等待时长。
 // 独立成项目内类型：handler 层用 errors.As 识别即可，无需 import telebot
