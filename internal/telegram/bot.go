@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Hootrix/rss2telegram/internal/tgmd"
 
@@ -270,4 +271,73 @@ func (e *maskedError) Unwrap() error { return e.err }
 func isParseEntitiesError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "can't parse entities") && strings.Contains(msg, "(400)")
+}
+
+// ---- caption 截断（issue #13）----
+
+// maxCaptionUnits Telegram caption 上限，按 UTF-16 码元计（BMP 字符=1，emoji 等 ≥U+10000=2）
+const maxCaptionUnits = 1024
+
+// minNewlineFallbackUnits 换行回退阈值：最后一个换行前的码元数达此值才回退（取上限一半）
+const minNewlineFallbackUnits = maxCaptionUnits / 2
+
+// utf16Units 单个 rune 占用的 UTF-16 码元数
+func utf16Units(r rune) int {
+	if r >= 0x10000 {
+		return 2
+	}
+	return 1
+}
+
+// truncateCaption 超限时按 rune 边界累加 UTF-16 码元截断（逐 rune 推进天然不劈开代理对），
+// 并优先回退到最后一个换行（其前文码元数 ≥ minNewlineFallbackUnits 时）——legacy Markdown
+// 实体基本不跨行，按行截可大幅降低"切断 [Media](url) 等实体 → captionPlain 降级"的概率。
+// 截的是实体解析前原文，Telegram 校验解析后长度（语法字符被消耗只会更短），1024 保守安全
+func truncateCaption(s string) string {
+	total := 0
+	for _, r := range s {
+		total += utf16Units(r)
+	}
+	if total <= maxCaptionUnits {
+		return s
+	}
+
+	// 修复：旧实现用 range 迭代，遇无效 UTF-8 字节产出宽度 1 的 U+FFFD，
+	// 但 len(string(r)) 返回 3，码元累加与字节宽度不一致 → hardEnd 可越过 len(s)，
+	// s[:hardEnd] panic（复现：1023 个 a + "\x80" + "x" → slice bounds [:1026]）
+	// 旧实现保留备查：
+	// units, hardEnd := 0, 0
+	// for i, r := range s {
+	// 	u := utf16Units(r)
+	// 	if units+u > maxCaptionUnits {
+	// 		break
+	// 	}
+	// 	units += u
+	// 	hardEnd = i + len(string(r))
+	// }
+	// truncated := s[:hardEnd]
+	// 改用 DecodeRuneInString 取真实字节宽度（无效字节 size=1），推进与截断点同源，不再越界；
+	// U+FFFD 属 BMP 仍计 1 码元，两遍循环口径一致
+	units, hardEnd, i := 0, 0, 0
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if units+utf16Units(r) > maxCaptionUnits {
+			break
+		}
+		units += utf16Units(r)
+		i += size
+		hardEnd = i
+	}
+	truncated := s[:hardEnd]
+
+	if idx := strings.LastIndexByte(truncated, '\n'); idx >= 0 {
+		nlUnits := 0
+		for _, r := range truncated[:idx] {
+			nlUnits += utf16Units(r)
+		}
+		if nlUnits >= minNewlineFallbackUnits {
+			truncated = truncated[:idx]
+		}
+	}
+	return strings.TrimRight(truncated, " \t\n\r")
 }

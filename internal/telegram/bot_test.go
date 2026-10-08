@@ -502,3 +502,48 @@ func TestSendReturnsFinalMessageIDOnPlainFallback(t *testing.T) {
 	require.Len(t, fake.sends_(), 2, "前置：确实走了降级重发")
 	assert.Equal(t, int64(888), id, "取最终成功那次的 message_id")
 }
+
+// issue #13：caption 按 UTF-16 码元计上限 1024，rune 边界截断 + 换行回退
+func TestTruncateCaption(t *testing.T) {
+	t.Run("未超限原样返回", func(t *testing.T) {
+		assert.Equal(t, "hello", truncateCaption("hello"))
+		assert.Equal(t, strings.Repeat("新", 1024), truncateCaption(strings.Repeat("新", 1024)))
+	})
+	t.Run("纯 ASCII 超限硬截断", func(t *testing.T) {
+		assert.Equal(t, strings.Repeat("a", 1024), truncateCaption(strings.Repeat("a", 2000)))
+	})
+	t.Run("汉字每字计 1 码元", func(t *testing.T) {
+		assert.Equal(t, strings.Repeat("新", 1024), truncateCaption(strings.Repeat("新", 2000)))
+	})
+	t.Run("emoji 计 2 码元且不劈开", func(t *testing.T) {
+		// 512 个 emoji = 1024 码元，恰满；再放一个 BMP 字符应被丢弃
+		in := strings.Repeat("🎉", 512) + "a"
+		assert.Equal(t, strings.Repeat("🎉", 512), truncateCaption(in))
+		// 511 emoji + "a" = 1023 码元，放不下下一个 2 码元 emoji：保留 511+a，emoji 不被劈半
+		in2 := strings.Repeat("🎉", 511) + "a" + "🎉"
+		assert.Equal(t, strings.Repeat("🎉", 511)+"a", truncateCaption(in2))
+	})
+	t.Run("换行位于 512 码元以上回退到换行", func(t *testing.T) {
+		in := strings.Repeat("a", 600) + "\n" + strings.Repeat("b", 600)
+		assert.Equal(t, strings.Repeat("a", 600), truncateCaption(in))
+	})
+	t.Run("换行位于 512 码元以下保持硬截断", func(t *testing.T) {
+		in := strings.Repeat("a", 100) + "\n" + strings.Repeat("b", 1000)
+		assert.Equal(t, strings.Repeat("a", 100)+"\n"+strings.Repeat("b", 923), truncateCaption(in))
+	})
+	t.Run("截断后去尾部空白", func(t *testing.T) {
+		// 1023 a + 空格 = 1024 码元截住，尾部空格 TrimRight 掉
+		in := strings.Repeat("a", 1023) + "  \n\n" + strings.Repeat("b", 100)
+		assert.Equal(t, strings.Repeat("a", 1023), truncateCaption(in))
+	})
+	t.Run("换行恰在 512 码元处等值回退", func(t *testing.T) {
+		// 锁定 >= 等值边界：换行前恰好 512 码元仍触发回退
+		in := strings.Repeat("a", 512) + "\n" + strings.Repeat("b", 1000)
+		assert.Equal(t, strings.Repeat("a", 512), truncateCaption(in))
+	})
+	t.Run("无效 UTF-8 不 panic 且按宽度 1 计", func(t *testing.T) {
+		// 修复前：range 产出 U+FFFD（宽 1）但 len(string(r))==3，hardEnd 越界 panic [:1026]
+		in := strings.Repeat("a", 1023) + "\x80" + "x"
+		assert.Equal(t, strings.Repeat("a", 1023)+"\x80", truncateCaption(in))
+	})
+}
