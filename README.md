@@ -160,9 +160,9 @@ $ docker logs -f rss2telegram
 
 配置 `media: photo` 的 feed 以图片消息（`sendPhoto`）推送：图片作为消息主体，`template` 渲染结果作为图片下方 caption：
 
-- 图片来源优先级：RSS item 的 `enclosure`（`image/*`，SVG/GIF 除外）> 正文（`content`）中的第一张图 > 摘要（`description`）中的第一张图，最多按序尝试 3 个候选
+- 图片来源优先级：RSS item 的 `enclosure`（`image/*`，SVG/GIF 除外）> 正文（`content`）中的图片 > 摘要（`description`）中的图片，按序收集最多 3 个候选（正文图收满 3 个后不再取摘要图）、逐个尝试下载
 - 图片由**本程序所在主机下载后上传**（需主机能访问图床），支持 jpeg/png/webp，单张 ≤ 10MB
-- 超长图（宽+高 > 10000 或长宽比 > 20）、GIF/SVG、下载失败时该条自动回退普通文本推送
+- 超长图（宽+高 > 10000 或长宽比 > 20）、短边 < 50px 的小图（追踪像素/图标）、GIF/SVG、下载失败时该条自动回退普通文本推送
 - caption 上限 1024 字符（Telegram 限制，纯文本消息为 4096），超长自动截断；建议把 `{link}` 放在 `{description}` 之前，避免链接被截掉
 - 可与 `snapshot: telegraph` 叠加（先建快照，再发图片消息，caption 中 `{telegraph}` 可用）
 
