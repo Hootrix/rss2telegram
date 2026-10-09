@@ -45,6 +45,10 @@ type Message struct {
 	// caption 解析失败常由 1024 截断切断实体引起，是 caption 独有问题；
 	// 共用 plain 会让图片失败降级后的全文无辜走 plain、丢失格式（issue #13）
 	captionPlain bool
+	// photoTransientFails 图片瞬态失败累计次数（跨同 Message 的多次 Send，
+	// 即 sendWithRetry 的重试轮次；不跨频道不跨轮——Message 每 (item,channel)
+	// 每轮新建）。达 maxPhotoTransientFails 后置空 photo 降级文本（外部 CR 保险丝）
+	photoTransientFails int
 }
 
 func NewMessage(text string) *Message { return &Message{text: text} }
@@ -286,7 +290,16 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 		if isPhotoPermanentError(err) {
 			log.Printf("photo send failed permanently, falling back to text message: %v", err)
 			message.photo = nil // 存活于 Message：外层文本重试不再撞图片 400
+		} else if message.photoTransientFails >= maxPhotoTransientFails-1 {
+			// 保险丝（外部 CR）：图片持续瞬态失败（大图+慢上行最常见）会耗尽
+			// sendWithRetry 的 2min 预算后 defer 不标 seen，该文章按从旧到新
+			// 每轮重占预算 → 该 feed 其余文章永久饿死。达阈值后放弃图片降级
+			// 全文，文本成功即标 seen 解卡——对 spec §5 顺序 4「保留重试」的
+			// 假设边界（longfeed 图 ≤2MB）补强，语义与 captionPlain 有限降级同构
+			log.Printf("photo transiently failed %d times, giving up photo and falling back to text: %v", message.photoTransientFails+1, err)
+			message.photo = nil
 		} else {
+			message.photoTransientFails++
 			return 0, b.sendError(ctx, err)
 		}
 	}
@@ -407,6 +420,10 @@ const maxCaptionUnits = 1024
 
 // minNewlineFallbackUnits 换行回退阈值：最后一个换行前的码元数达此值才回退（取上限一半）
 const minNewlineFallbackUnits = maxCaptionUnits / 2
+
+// maxPhotoTransientFails 图片瞬态失败保险丝阈值：同一条消息累计达此次数后
+// 放弃图片降级文本（防持续瞬态失败耗尽重试预算卡死 feed，见 Send 内注释）
+const maxPhotoTransientFails = 2
 
 // utf16Units 单个 rune 占用的 UTF-16 码元数
 func utf16Units(r rune) int {

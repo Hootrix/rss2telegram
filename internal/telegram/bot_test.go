@@ -753,6 +753,35 @@ func TestSendPhotoTransientErrorKeepsPhoto(t *testing.T) {
 	assert.Empty(t, fake.sends_(), "不应降级发文本")
 }
 
+// 外部 CR 保险丝：图片瞬态失败累计达 maxPhotoTransientFails 后放弃图片降级文本——
+// 持续瞬态失败（大图+慢上行）否则会耗尽 sendWithRetry 预算 defer 不标 seen，
+// 该文章每轮重占预算卡死整个 feed；降级文本成功即标 seen 解卡
+func TestSendPhotoTransientFuse(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.photoFail500 = true // sendPhoto 恒 500，sendMessage 正常
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoMessage("*标题*", testPNG(t, 100, 100))
+	// 第一次 Send：瞬态失败，photo 保留（模拟 sendWithRetry 首轮失败后 backoff 重试）
+	_, err = bot.Send(context.Background(), "@chan", m)
+	assert.Error(t, err)
+	assert.True(t, m.HasPhoto(), "首次瞬态失败仍保留 photo")
+	assert.Empty(t, fake.sends_())
+
+	// 第二次 Send（同 Message，即外层重试）：达阈值 → 放弃图片降级全文文本
+	msgID, err := bot.Send(context.Background(), "@chan", m)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	assert.False(t, m.HasPhoto(), "达阈值后不再持图")
+	assert.Len(t, fake.photos_(), 2, "photo 恰尝试两次（1 次初始 + 1 次重试后触发保险丝）")
+	sends := fake.sends_()
+	require.Len(t, sends, 1)
+	assert.Equal(t, "*标题*", sends[0]["text"], "降级为全文且带 markdown")
+}
+
 // issue #13：连续两次 Send，第二次 multipart 仍为完整字节（reader 不复用）
 func TestSendPhotoFreshReaderEachAttempt(t *testing.T) {
 	fake := newFakeTG(false)
