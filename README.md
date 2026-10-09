@@ -66,6 +66,7 @@ $ docker logs -f rss2telegram
 - `channels`: 要推送到的 Telegram 频道列表（格式：@channel_name）
 - `snapshot`: 可选快照后端，缺省不启用；目前仅支持 `telegraph`，详见 [全文快照](#全文快照)
 - `snapshot_source`: 可选快照正文来源，缺省 `page`（抓原文）；`feed` 表示正文直接取 RSS item（全文输出型源用），详见 [全文快照](#全文快照)；需同时启用 `snapshot`
+- `media`: 可选媒体推送模式，缺省不启用；目前仅支持 `photo`（图片为主体，template 渲染结果为图片 caption），详见 [图片推送](#图片推送)
 - `template`: 消息模板，支持 Markdown 格式，可用变量：
   - `{title}`: 标题
   - `{link}`: 链接
@@ -154,6 +155,16 @@ $ docker logs -f rss2telegram
 - **防盗链图对纯图帖影响最大**：Referer 防盗链的图在 Telegraph 页面可能不显示（无法转存），纯图帖 worst case 页面只剩标题与短文本
 - **首刷限流**: `first_push` 批量建页若触发 Telegraph 限流，被限流的文章降级照发并标记已推送，该批文章将没有快照
 - **作者链接**: 消息发送成功后自动把 Telegraph 页面作者链接回填为该条消息的链接（`t.me/<频道>/<消息ID>`，仅公开频道）；回填失败或纯数字频道 ID 时保留频道主页/不填。回填为尽力而为：进程重启前所建的旧快照页（缓存丢失）不回填
+
+## 图片推送
+
+配置 `media: photo` 的 feed 以图片消息（`sendPhoto`）推送：图片作为消息主体，`template` 渲染结果作为图片下方 caption：
+
+- 图片来源优先级：RSS item 的 `enclosure`（`image/*`，SVG/GIF 除外）> 正文（`content`）中的图片 > 摘要（`description`）中的图片，按序收集最多 3 个候选（正文图收满 3 个后不再取摘要图）、逐个尝试下载
+- 图片由**本程序所在主机下载后上传**（需主机能访问图床），支持 jpeg/png/webp，单张 ≤ 10MB
+- 超长图（宽+高 > 10000 或长宽比 > 20）、短边 < 50px 的小图（追踪像素/图标）、GIF/SVG、下载失败时该条自动回退普通文本推送
+- caption 上限 1024 字符（Telegram 限制，纯文本消息为 4096），超长自动截断；建议把 `{link}` 放在 `{description}` 之前，避免链接被截掉
+- 可与 `snapshot: telegraph` 叠加（先建快照，再发图片消息，caption 中 `{telegraph}` 可用）
 
 ## 许可证
 

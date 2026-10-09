@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // 回归测试：issue#3 —— 编辑器"写临时文件 + rename 覆盖"的原子保存方式必须触发配置重载
@@ -227,4 +229,28 @@ func TestConfigIgnoresSiblingFileChanges(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("过滤逻辑误伤目标文件：配置本体修改未触发重载")
 	}
+}
+
+// issue #13：media 枚举校验——空=不启用，photo=图片推送，其他值报错
+// 注：newFeed 返回 *Config——Validate 为指针接收者，Go 不允许对不可寻址的
+// 返回值直接调用指针方法（newFeed("").Validate() 编译不过），故返回指针
+func TestValidateMediaEnum(t *testing.T) {
+	newFeed := func(media string) *Config {
+		return &Config{
+			Telegram: TelegramConfig{BotToken: "t", CheckInterval: 1},
+			Feeds:    []FeedConfig{{Name: "f", URL: "https://e.com/rss", Channels: []string{"@c"}, Media: media}},
+		}
+	}
+
+	t.Run("空串合法（默认不启用）", func(t *testing.T) {
+		assert.NoError(t, newFeed("").Validate())
+	})
+	t.Run("photo 合法", func(t *testing.T) {
+		assert.NoError(t, newFeed("photo").Validate())
+	})
+	t.Run("非法值报错", func(t *testing.T) {
+		err := newFeed("video").Validate()
+		assert.ErrorContains(t, err, `invalid media "video"`)
+		assert.ErrorContains(t, err, `"photo"`)
+	})
 }

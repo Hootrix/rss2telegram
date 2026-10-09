@@ -50,3 +50,17 @@ feeds:
 
       🔗 [快照]({telegraph})
       🌐 [原文]({link})
+
+  # 图片推送 feed（media: photo，issue #13）：图片为主体，template 渲染结果为图片下方 caption；
+  # 图片来源 enclosure > 正文/摘要中的第一张图（最多尝试 3 个候选），由本程序下载后上传，
+  # 需主机能访问图床；无图/下载失败/格式尺寸不符（GIF、SVG、宽+高>10000、长宽比>20、
+  # 短边<50px 小图、>10MB）时该条自动回退普通文本推送
+  - name: "photo-feed"
+    url: "https://example.com/photo.xml"
+    channels:
+      - "@test_push"
+    media: photo  # 可选，缺省不启用；只能填 photo，其他值启动报错
+    template: |
+      📰 *{title}*
+
+      🔗 [阅读原文]({link})

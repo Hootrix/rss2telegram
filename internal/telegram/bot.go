@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Hootrix/rss2telegram/internal/tgmd"
 
@@ -26,15 +28,44 @@ type Bot struct {
 
 // Message 由单个消息任务独占，重试保留纯文本降级状态，不按频道缓存解析失败
 // 原文本保持不变，发送纯文本时才反转义
+//
+//	type Message struct {
+//		text  string
+//		plain bool
+//	}
 type Message struct {
-	text  string
+	// text 恒为完整文本不截断：photo 降级后文本路径用全文
+	text string
+	// plain 文本路径的 markdown 降级（既有）
 	plain bool
+	// photo 非空 → sendPhoto；图片永久失败降级时置 nil。
+	// 多频道共享同一底层数组，只读；需修改字节必须先复制（issue #13）
+	photo []byte
+	// captionPlain caption 的 markdown 降级，与 plain 分离：
+	// caption 解析失败常由 1024 截断切断实体引起，是 caption 独有问题；
+	// 共用 plain 会让图片失败降级后的全文无辜走 plain、丢失格式（issue #13）
+	captionPlain bool
+	// photoTransientFails 图片瞬态失败累计次数（跨同 Message 的多次 Send，
+	// 即 sendWithRetry 的重试轮次；不跨频道不跨轮——Message 每 (item,channel)
+	// 每轮新建）。达 maxPhotoTransientFails 后置空 photo 降级文本（外部 CR 保险丝）
+	photoTransientFails int
 }
 
 func NewMessage(text string) *Message { return &Message{text: text} }
 
+// NewPhotoMessage photo 为空字节时等价 NewMessage（调用方免判空）
+func NewPhotoMessage(text string, photo []byte) *Message {
+	if len(photo) == 0 {
+		return NewMessage(text)
+	}
+	return &Message{text: text, photo: photo}
+}
+
 // Text 只读访问原始消息文本，供跨包（rss 集成测试等）断言内容
 func (m *Message) Text() string { return m.text }
+
+// HasPhoto 只读访问是否仍为图片消息，供跨包断言发送/降级路径（issue #13）
+func (m *Message) HasPhoto() bool { return len(m.photo) > 0 }
 
 // RateLimitError 表示 Telegram 429 限速，携带服务端指示的等待时长。
 // 独立成项目内类型：handler 层用 errors.As 识别即可，无需 import telebot
@@ -174,8 +205,10 @@ func (b *Bot) Send(channel string, message string) error {
 }
 */
 
-// Send 发送消息并返回成功消息的 message_id（issue #12：快照页 author_url 回填
-// 消息链接用）；markdown 降级重发场景取最终成功那次的 message_id
+// [issue #13] 旧版 Send（纯文本路径）整体替换为下方带 photo 分支的新实现，
+// 旧逻辑完整保留备查。其文档注释：发送消息并返回成功消息的 message_id（issue #12：
+// 快照页 author_url 回填消息链接用）；markdown 降级重发场景取最终成功那次的 message_id
+/*
 func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64, error) {
 	if channel == "" {
 		return 0, errors.New("telegram: empty channel")
@@ -208,6 +241,114 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 		return 0, b.sendError(ctx, err)
 	}
 	return int64(sent.ID), nil
+}
+*/
+
+// Send 发送消息并返回成功消息的 message_id（issue #12：快照页 author_url 回填
+// 消息链接用）；markdown 降级重发场景取最终成功那次的 message_id
+// [issue #13] 新增 photo 分支：multipart 上传、caption parse 400 → captionPlain 重试、
+// 400/413 → 置空 photo 降级全文文本、其余错误保留状态交外层重试
+// 重试放大（photo 路径）：单次 Send 最坏 4 次 API（photo md → photo plain →
+// text md → text plain，其中最多 2 次 ≤10MB 上传）；叠加外层 8 次 Send（普通 3 + flood 5）
+// 最坏 32 次调用 / 16 次上传，仅瞬态错误持续叠加时出现（纯文本现状最坏 16 次，可接受）
+func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64, error) {
+	if channel == "" {
+		return 0, errors.New("telegram: empty channel")
+	}
+	if message == nil || message.text == "" {
+		return 0, errors.New("telegram: empty message")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("telegram send: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	sender, err := b.contextualBot(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("create telegram sender: %w", err)
+	}
+	recipient := newChannelRecipient(channel)
+
+	// [issue #13] photo 路径，失败分类按序判定：
+	// 1. 成功 → 返回
+	// 2. parse entities（且未 plain）→ captionPlain 重试一次 photo，结果回到 3/4 判定
+	// 3. 400/413 → 图片永久失败（尺寸/格式/权限/实体过大），置空 photo 当场降级文本
+	// 4. 其余（网络/5xx/429/ctx）→ 交 sendWithRetry 重试，photo 与 captionPlain 状态保留
+	if len(message.photo) > 0 {
+		sent, err := sendPhotoOnce(sender, recipient, message)
+		if err == nil {
+			return int64(sent.ID), nil
+		}
+		if isParseEntitiesError(err) && !message.captionPlain {
+			message.captionPlain = true
+			log.Printf("photo caption parse failed, retrying photo with plain caption")
+			sent, err = sendPhotoOnce(sender, recipient, message)
+			if err == nil {
+				return int64(sent.ID), nil
+			}
+		}
+		if isPhotoPermanentError(err) {
+			log.Printf("photo send failed permanently, falling back to text message: %v", err)
+			message.photo = nil // 存活于 Message：外层文本重试不再撞图片 400
+		} else if message.photoTransientFails >= maxPhotoTransientFails-1 {
+			// 保险丝（外部 CR）：图片持续瞬态失败（大图+慢上行最常见）会耗尽
+			// sendWithRetry 的 2min 预算后 defer 不标 seen，该文章按从旧到新
+			// 每轮重占预算 → 该 feed 其余文章永久饿死。达阈值后放弃图片降级
+			// 全文，文本成功即标 seen 解卡——对 spec §5 顺序 4「保留重试」的
+			// 假设边界（目标 feed 图 ≤2MB）补强，语义与 captionPlain 有限降级同构
+			log.Printf("photo transiently failed %d times, giving up photo and falling back to text: %v", message.photoTransientFails+1, err)
+			message.photo = nil
+		} else {
+			message.photoTransientFails++
+			return 0, b.sendError(ctx, err)
+		}
+	}
+
+	text, options := message.text, &tele.SendOptions{}
+	if message.plain {
+		text = tgmd.Unescape(text)
+	} else {
+		options.ParseMode = tele.ModeMarkdown
+	}
+	sent, err := sender.Send(recipient, text, options)
+	if err != nil && !message.plain && isParseEntitiesError(err) {
+		message.plain = true
+		log.Printf("markdown parse failed, falling back to plain text")
+		sent, err = sender.Send(recipient, tgmd.Unescape(message.text))
+	}
+	if err != nil {
+		return 0, b.sendError(ctx, err)
+	}
+	return int64(sent.ID), nil
+}
+
+// sendPhotoOnce 单次 photo 发送尝试。每次新建 reader 与 Photo 实例：
+// reader 读过即耗尽；telebot Photo.Send 会回写 receiver（*p = *msg.Photo），
+// 复用实例会污染重试。caption 构造：先按 captionPlain 反转义再截断
+// （反转义会改变长度，先截后转义可能超限）
+func sendPhotoOnce(sender *tele.Bot, recipient tele.Recipient, message *Message) (*tele.Message, error) {
+	caption := message.text
+	if message.captionPlain {
+		caption = tgmd.Unescape(caption)
+	}
+	caption = truncateCaption(caption)
+	options := &tele.SendOptions{}
+	if !message.captionPlain {
+		options.ParseMode = tele.ModeMarkdown
+	}
+	photo := &tele.Photo{File: tele.FromReader(bytes.NewReader(message.photo)), Caption: caption}
+	return sender.Send(recipient, photo, options)
+}
+
+// isPhotoPermanentError 图片层面永久失败（尺寸/格式/权限/实体过大）：
+// 400 与 413 按错误码字符串匹配——与 isParseEntitiesError 同惯例，
+// telebot 对非 sentinel 错误返回 "telegram: ... (400)" 形态的 fmt 错误，
+// 类型断言永远落空。注意必须在 parse entities 判定之后调用。
+// 补充：v3.1.3 的 sentinel ErrTooLarge = NewError(400, "Request Entity Too Large")，
+// 真实 413 会被 telebot 改写成 "(400)" 文本，由 (400) 分支兜住；(413) 分支属纵深防御
+func isPhotoPermanentError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "(400)") || strings.Contains(msg, "(413)")
 }
 
 // Raw 内部的 Background 不接收调用方取消，独立发送实例复用连接池并注入本次 context
@@ -270,4 +411,77 @@ func (e *maskedError) Unwrap() error { return e.err }
 func isParseEntitiesError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "can't parse entities") && strings.Contains(msg, "(400)")
+}
+
+// ---- caption 截断（issue #13）----
+
+// maxCaptionUnits Telegram caption 上限，按 UTF-16 码元计（BMP 字符=1，emoji 等 ≥U+10000=2）
+const maxCaptionUnits = 1024
+
+// minNewlineFallbackUnits 换行回退阈值：最后一个换行前的码元数达此值才回退（取上限一半）
+const minNewlineFallbackUnits = maxCaptionUnits / 2
+
+// maxPhotoTransientFails 图片瞬态失败保险丝阈值：同一条消息累计达此次数后
+// 放弃图片降级文本（防持续瞬态失败耗尽重试预算卡死 feed，见 Send 内注释）
+const maxPhotoTransientFails = 2
+
+// utf16Units 单个 rune 占用的 UTF-16 码元数
+func utf16Units(r rune) int {
+	if r >= 0x10000 {
+		return 2
+	}
+	return 1
+}
+
+// truncateCaption 超限时按 rune 边界累加 UTF-16 码元截断（逐 rune 推进天然不劈开代理对），
+// 并优先回退到最后一个换行（其前文码元数 ≥ minNewlineFallbackUnits 时）——legacy Markdown
+// 实体基本不跨行，按行截可大幅降低"切断 [Media](url) 等实体 → captionPlain 降级"的概率。
+// 截的是实体解析前原文，Telegram 校验解析后长度（语法字符被消耗只会更短），1024 保守安全
+func truncateCaption(s string) string {
+	total := 0
+	for _, r := range s {
+		total += utf16Units(r)
+	}
+	if total <= maxCaptionUnits {
+		return s
+	}
+
+	// 修复：旧实现用 range 迭代，遇无效 UTF-8 字节产出宽度 1 的 U+FFFD，
+	// 但 len(string(r)) 返回 3，码元累加与字节宽度不一致 → hardEnd 可越过 len(s)，
+	// s[:hardEnd] panic（复现：1023 个 a + "\x80" + "x" → slice bounds [:1026]）
+	// 旧实现保留备查：
+	// units, hardEnd := 0, 0
+	// for i, r := range s {
+	// 	u := utf16Units(r)
+	// 	if units+u > maxCaptionUnits {
+	// 		break
+	// 	}
+	// 	units += u
+	// 	hardEnd = i + len(string(r))
+	// }
+	// truncated := s[:hardEnd]
+	// 改用 DecodeRuneInString 取真实字节宽度（无效字节 size=1），推进与截断点同源，不再越界；
+	// U+FFFD 属 BMP 仍计 1 码元，两遍循环口径一致
+	units, hardEnd, i := 0, 0, 0
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if units+utf16Units(r) > maxCaptionUnits {
+			break
+		}
+		units += utf16Units(r)
+		i += size
+		hardEnd = i
+	}
+	truncated := s[:hardEnd]
+
+	if idx := strings.LastIndexByte(truncated, '\n'); idx >= 0 {
+		nlUnits := 0
+		for _, r := range truncated[:idx] {
+			nlUnits += utf16Units(r)
+		}
+		if nlUnits >= minNewlineFallbackUnits {
+			truncated = truncated[:idx]
+		}
+	}
+	return strings.TrimRight(truncated, " \t\n\r")
 }

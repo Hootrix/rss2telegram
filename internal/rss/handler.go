@@ -32,6 +32,9 @@ type RssHandler struct {
 	bot      TelegramBot
 	storage  *storage.Storage
 	snapshot Snapshotter
+	// 图片下载器（issue #13）；nil 时 media=photo 的 feed 也只降级文本不 panic
+	// （直接字面量构造的测试 handler 即此形态）
+	photoFetcher PhotoFetcher
 	// sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
 	waitFn     func(context.Context, time.Duration) error
 	nowFn      func() time.Time
@@ -72,11 +75,12 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage, 
 	parser.JSONTranslator = &gofeed.DefaultJSONTranslator{}
 	return &RssHandler{
 		// parser: gofeed.NewParser(),
-		parser:   parser,
-		config:   cfg,
-		bot:      bot,
-		storage:  store,
-		snapshot: snapshot,
+		parser:       parser,
+		config:       cfg,
+		bot:          bot,
+		storage:      store,
+		snapshot:     snapshot,
+		photoFetcher: newHTTPPhotoFetcher(),
 		// sleepFn: time.Sleep,
 		nowFn:      time.Now,
 		sendStates: make(map[string]*channelSendState),
@@ -476,8 +480,11 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 
 		message := h.formatMessage(item, feedConfig.Template, teleURL)
 		if message == "" {
-			continue
+			continue // 既有行为；放在下载之前，空消息不白下载（issue #13）
 		}
+		// [issue #13] 图片推送：每 item 下载一次，频道间只读共享；
+		// Message 每 (item, channel) 新建——photo 降级状态不得跨频道串味
+		photo := h.photoForItem(ctx, feedConfig, item)
 		for _, channel := range feedConfig.Channels {
 			// if err := ctx.Err(); err != nil {
 			// 	return fmt.Errorf("send feed items: %w", err)
@@ -494,7 +501,9 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 			if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
 				continue
 			}
-			if msgID, ok := h.sendWithRetry(ctx, channel, message, item.Title); ok {
+			// delivery := telegram.NewMessage(message) // 旧 sendWithRetry(ctx, channel, message, item.Title)
+			delivery := telegram.NewPhotoMessage(message, photo)
+			if msgID, ok := h.sendWithRetry(ctx, channel, delivery, item.Title); ok {
 				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
 					log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
 				}
@@ -605,7 +614,10 @@ func (h *RssHandler) sendWithRetry(channel, message, itemTitle string) bool {
 
 // sendWithRetry 带重试发送单条消息，返回成功消息的 message_id（失败为 0）与是否成功。
 // msgID 供快照页 author_url 回填消息链接（issue #12），非快照路径可忽略
-func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, itemTitle string) (int64, bool) {
+// func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, itemTitle string) (int64, bool) {
+// [issue #13] message string → delivery *telegram.Message：photo 模式需在
+// processFeed 层构造（含图片字节），photo 降级状态随 Message 跨重试保留
+func (h *RssHandler) sendWithRetry(parent context.Context, channel string, delivery *telegram.Message, itemTitle string) (int64, bool) {
 	budget := blockingBudget(h.messageBudget)
 	deadline := h.now().Add(budget)
 	ctx, cancel := context.WithTimeout(parent, budget)
@@ -616,7 +628,7 @@ func (h *RssHandler) sendWithRetry(parent context.Context, channel, message, ite
 		return 0, false
 	}
 	defer func() { <-state.gate }()
-	delivery := telegram.NewMessage(message)
+	// delivery := telegram.NewMessage(message) // 旧：string 参数在此构造；已移至 processFeed（issue #13）
 	for attempt, floodCount := 0, 0; ; {
 		if !h.waitForSend(ctx, state, deadline, channel, itemTitle) {
 			return 0, false
@@ -779,6 +791,38 @@ func (h *RssHandler) snapshotForItem(ctx context.Context, feedConfig config.Feed
 		return "", nil
 	}
 	return h.snapshot.Snapshot(ctx, feedConfig, item)
+}
+
+// photoForItem [issue #13] 仅 media=photo 时按候选顺序下载图片，首个通过
+// 校验者胜出；全部失败返回 nil（只记日志不中断推送，该条以文本形式发出并
+// 照常标 seen——下载不重试，换取不阻塞推送）。
+// 图片字节每 item 只下载一次，频道间只读共享
+func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedConfig, item *gofeed.Item) []byte {
+	if feedConfig.Media != config.MediaPhoto || h.photoFetcher == nil {
+		return nil
+	}
+	// 候选为空时显式记日志：运维才能区分「无候选图」与「配置遗漏」（静默穿过则两条都查不到）
+	candidates := photoCandidates(item)
+	if len(candidates) == 0 {
+		log.Printf("photo mode: no image candidates, feed %s item %q", feedConfig.Name, item.Title)
+		return nil
+	}
+	for _, u := range candidates {
+		if ctx.Err() != nil {
+			return nil // 预算耗尽/退出：交由频道循环既有的 ctx 检查处理（首次进入循环的防线）
+		}
+		data, err := h.photoFetcher.Fetch(ctx, u)
+		if err != nil {
+			log.Printf("photo fetch failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, err)
+			// 取消/预算耗尽：立即返回不再试下一候选，避免"看起来还要重试"的误导日志
+			if ctx.Err() != nil {
+				return nil
+			}
+			continue
+		}
+		return data
+	}
+	return nil
 }
 
 // 格式化消息

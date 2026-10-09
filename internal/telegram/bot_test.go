@@ -1,10 +1,13 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,15 +24,27 @@ import (
 // getChat、以及 sendMessage。所有 sendMessage 的原始 JSON body 被逐条记录，
 // 供断言降级行为（首次带 parse_mode 400 → 二次纯文本）
 type fakeTG struct {
-	mu              sync.Mutex
-	sends           []map[string]any // 每次 sendMessage 的 body
-	failFirst       bool             // 首次 sendMessage 返回 parse entities 400
-	flood429        bool             // 每次 sendMessage 返回 429 + retry_after（issue #6 线上报文形态）
-	floodNo429      bool             // 每次 sendMessage 返回 429 但无 retry_after 参数
-	floodRetryAfter int64
-	msgID           int64 // 成功响应携带的 message_id；0 = 固定返回 1（回填测试用）
-	getChatHits     int   // getChat 被调用次数（issue #6 后应为 0）
-	server          *httptest.Server
+	mu                  sync.Mutex
+	sends               []map[string]any // 每次 sendMessage 的 body
+	failFirst           bool             // 首次 sendMessage 返回 parse entities 400
+	flood429            bool             // 每次 sendMessage 返回 429 + retry_after（issue #6 线上报文形态）
+	floodNo429          bool             // 每次 sendMessage 返回 429 但无 retry_after 参数
+	floodRetryAfter     int64
+	msgID               int64       // 成功响应携带的 message_id；0 = 固定返回 1（回填测试用）
+	getChatHits         int         // getChat 被调用次数（issue #6 后应为 0）
+	photos              []photoSend // 每次 sendPhoto 的字段与图片字节
+	photoFail400        bool        // sendPhoto 恒返回 400（图片永久失败）
+	photoFail413        bool        // sendPhoto 恒返回 413（实体过大）
+	photoFail500        bool        // sendPhoto 恒返回 500（瞬态失败）
+	photoFailCaption400 bool        // sendPhoto 首次返回 parse entities 400
+	server              *httptest.Server
+}
+
+// photoSend 记录一次 sendPhoto 请求的关键字段，供断言 multipart 内容与降级行为
+type photoSend struct {
+	caption   string
+	parseMode string // "" = 请求未带 parse_mode
+	photo     []byte
 }
 
 func newFakeTG(failFirst bool) *fakeTG {
@@ -54,6 +69,65 @@ func newFakeTG(failFirst bool) *fakeTG {
 				"ok": true,
 				"result": map[string]any{
 					"id": -1009999, "type": "channel", "title": "it", "username": "it_test",
+				},
+			})
+		case "sendPhoto":
+			// telebot FromReader 走 multipart：字段 + 名为 photo 的文件部分。
+			// 注意 v3.1.3 FromReader 不设置 fileName → CreateFormFile 产出 filename=""，
+			// Go 服务端 ReadForm 将无 filename 的部件归为表单值而非文件，
+			// 故优先取文件部件、取不到再回退 FormValue("photo")。两服务端判定规则不同：
+			// 真实 Telegram（tdlib HttpReader）以 multipart 里 filename 键是否存在区分文件
+			// 与普通参数——telebot FromReader 写出 filename=""（键存在、值为空），真实 TG
+			// 按文件处理；Go 服务端要求 filename 非空才归文件部件，落为表单值 → 需回退
+			ps := photoSend{}
+			if err := r.ParseMultipartForm(32 << 20); err == nil && r.MultipartForm != nil {
+				ps.caption = r.FormValue("caption")
+				ps.parseMode = r.FormValue("parse_mode")
+				if files := r.MultipartForm.File["photo"]; len(files) > 0 {
+					fh, _ := files[0].Open()
+					b, _ := io.ReadAll(fh)
+					_ = fh.Close()
+					ps.photo = b
+				} else if v := r.FormValue("photo"); v != "" {
+					ps.photo = []byte(v)
+				}
+			}
+			f.mu.Lock()
+			f.photos = append(f.photos, ps)
+			photoFail400 := f.photoFail400
+			photoFail413 := f.photoFail413
+			photoFail500 := f.photoFail500
+			failCaption := f.photoFailCaption400 && len(f.photos) == 1
+			f.mu.Unlock()
+
+			if photoFail500 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":500,"description":"Internal Server Error"}`))
+				return
+			}
+			if failCaption {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 150"}`))
+				return
+			}
+			if photoFail413 {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":413,"description":"Request Entity Too Large"}`))
+				return
+			}
+			if photoFail400 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: PHOTO_INVALID_DIMENSIONS"}`))
+				return
+			}
+			// 实测 sendPhoto 响应形态：result.photo 为尺寸数组，telebot 取最高清档
+			writeFakeJSON(w, map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"message_id": 1,
+					"chat":       map[string]any{"id": -1009999, "type": "channel"},
+					"date":       1,
+					"photo":      []map[string]any{{"file_id": "ph1", "file_unique_id": "u1", "width": 100, "height": 100}},
 				},
 			})
 		case "sendMessage":
@@ -123,6 +197,12 @@ func (f *fakeTG) sends_() []map[string]any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]map[string]any{}, f.sends...)
+}
+
+func (f *fakeTG) photos_() []photoSend {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]photoSend{}, f.photos...)
 }
 
 func writeFakeJSON(w http.ResponseWriter, v any) {
@@ -501,4 +581,278 @@ func TestSendReturnsFinalMessageIDOnPlainFallback(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, fake.sends_(), 2, "前置：确实走了降级重发")
 	assert.Equal(t, int64(888), id, "取最终成功那次的 message_id")
+}
+
+// issue #13：caption 按 UTF-16 码元计上限 1024，rune 边界截断 + 换行回退
+func TestTruncateCaption(t *testing.T) {
+	t.Run("未超限原样返回", func(t *testing.T) {
+		assert.Equal(t, "hello", truncateCaption("hello"))
+		assert.Equal(t, strings.Repeat("新", 1024), truncateCaption(strings.Repeat("新", 1024)))
+	})
+	t.Run("纯 ASCII 超限硬截断", func(t *testing.T) {
+		assert.Equal(t, strings.Repeat("a", 1024), truncateCaption(strings.Repeat("a", 2000)))
+	})
+	t.Run("汉字每字计 1 码元", func(t *testing.T) {
+		assert.Equal(t, strings.Repeat("新", 1024), truncateCaption(strings.Repeat("新", 2000)))
+	})
+	t.Run("emoji 计 2 码元且不劈开", func(t *testing.T) {
+		// 512 个 emoji = 1024 码元，恰满；再放一个 BMP 字符应被丢弃
+		in := strings.Repeat("🎉", 512) + "a"
+		assert.Equal(t, strings.Repeat("🎉", 512), truncateCaption(in))
+		// 511 emoji + "a" = 1023 码元，放不下下一个 2 码元 emoji：保留 511+a，emoji 不被劈半
+		in2 := strings.Repeat("🎉", 511) + "a" + "🎉"
+		assert.Equal(t, strings.Repeat("🎉", 511)+"a", truncateCaption(in2))
+	})
+	t.Run("换行位于 512 码元以上回退到换行", func(t *testing.T) {
+		in := strings.Repeat("a", 600) + "\n" + strings.Repeat("b", 600)
+		assert.Equal(t, strings.Repeat("a", 600), truncateCaption(in))
+	})
+	t.Run("换行位于 512 码元以下保持硬截断", func(t *testing.T) {
+		in := strings.Repeat("a", 100) + "\n" + strings.Repeat("b", 1000)
+		assert.Equal(t, strings.Repeat("a", 100)+"\n"+strings.Repeat("b", 923), truncateCaption(in))
+	})
+	t.Run("截断后去尾部空白", func(t *testing.T) {
+		// 1023 a + 空格 = 1024 码元截住，尾部空格 TrimRight 掉
+		in := strings.Repeat("a", 1023) + "  \n\n" + strings.Repeat("b", 100)
+		assert.Equal(t, strings.Repeat("a", 1023), truncateCaption(in))
+	})
+	t.Run("换行恰在 512 码元处等值回退", func(t *testing.T) {
+		// 锁定 >= 等值边界：换行前恰好 512 码元仍触发回退
+		in := strings.Repeat("a", 512) + "\n" + strings.Repeat("b", 1000)
+		assert.Equal(t, strings.Repeat("a", 512), truncateCaption(in))
+	})
+	t.Run("无效 UTF-8 不 panic 且按宽度 1 计", func(t *testing.T) {
+		// 修复前：range 产出 U+FFFD（宽 1）但 len(string(r))==3，hardEnd 越界 panic [:1026]
+		in := strings.Repeat("a", 1023) + "\x80" + "x"
+		assert.Equal(t, strings.Repeat("a", 1023)+"\x80", truncateCaption(in))
+	})
+}
+
+// issue #13：Message 携带可选图片字节；空字节等价普通文本消息
+func TestNewPhotoMessage(t *testing.T) {
+	t.Run("有图", func(t *testing.T) {
+		m := NewPhotoMessage("caption", []byte{1, 2, 3})
+		assert.True(t, m.HasPhoto())
+		assert.Equal(t, "caption", m.Text())
+	})
+	t.Run("空字节退回文本消息", func(t *testing.T) {
+		m := NewPhotoMessage("text", nil)
+		assert.False(t, m.HasPhoto())
+		assert.Equal(t, "text", m.Text())
+	})
+	t.Run("NewMessage 无图（回归）", func(t *testing.T) {
+		m := NewMessage("text")
+		assert.False(t, m.HasPhoto())
+		assert.Equal(t, "text", m.Text())
+	})
+}
+
+// testPNG 生成 n×n 灰度 PNG 字节（photo 测试用，尺寸不影响 bot 层断言）
+func testPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, image.NewGray(image.Rect(0, 0, w, h))))
+	return buf.Bytes()
+}
+
+// issue #13：photo 成功路径——multipart 内图片字节与原图一致、caption 与 parse_mode 正确
+func TestSendPhotoSuccess(t *testing.T) {
+	fake := newFakeTG(false)
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	img := testPNG(t, 100, 100)
+	msgID, err := bot.Send(context.Background(), "@chan", NewPhotoMessage("*标题*", img))
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	photos := fake.photos_()
+	require.Len(t, photos, 1)
+	assert.Equal(t, "*标题*", photos[0].caption)
+	assert.Equal(t, "Markdown", photos[0].parseMode)
+	assert.Equal(t, img, photos[0].photo, "multipart 内图片字节应与原图一致")
+}
+
+// issue #13 顺序 2：caption parse 400 → 反转义后重试 photo（无 parse_mode），图片保留
+func TestSendPhotoCaptionParseFallback(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.photoFailCaption400 = true
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	img := testPNG(t, 100, 100)
+	m := NewPhotoMessage(`\[转义]标题`, img)
+	_, err = bot.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	photos := fake.photos_()
+	require.Len(t, photos, 2)
+	assert.Equal(t, "Markdown", photos[0].parseMode)
+	assert.Equal(t, "", photos[1].parseMode, "plain 重试不应带 parse_mode")
+	assert.Equal(t, `[转义]标题`, photos[1].caption, "plain 重试应反转义")
+	assert.True(t, m.HasPhoto(), "caption 问题不丢图")
+}
+
+// issue #13 顺序 3：图片 400 → 丢弃图片降级 sendMessage，全文带 markdown（plain 与 captionPlain 分离）
+func TestSendPhotoPermanent400FallsBackToText(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.photoFail400 = true
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoMessage("*全文标题*", testPNG(t, 100, 100))
+	msgID, err := bot.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	assert.Len(t, fake.photos_(), 1, "photo 只尝试一次")
+	sends := fake.sends_()
+	require.Len(t, sends, 1)
+	assert.Equal(t, "*全文标题*", sends[0]["text"], "降级文本应为全文")
+	assert.Equal(t, "Markdown", sends[0]["parse_mode"], "降级文本不受 captionPlain 影响")
+	assert.False(t, m.HasPhoto(), "图片永久失败后 Message 不再持图")
+}
+
+// issue #13 顺序 3：413 同样降级文本
+func TestSendPhoto413FallsBackToText(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.photoFail413 = true
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoMessage("t", testPNG(t, 100, 100))
+	_, err = bot.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	assert.False(t, m.HasPhoto())
+	assert.Len(t, fake.sends_(), 1)
+}
+
+// issue #13 顺序 4：瞬态错误（500）返回错误且图片保留，交外层重试
+func TestSendPhotoTransientErrorKeepsPhoto(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.photoFail500 = true
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoMessage("t", testPNG(t, 100, 100))
+	_, err = bot.Send(context.Background(), "@chan", m)
+
+	assert.Error(t, err)
+	assert.True(t, m.HasPhoto(), "瞬态错误不丢图，外层重试仍走 photo")
+	assert.Empty(t, fake.sends_(), "不应降级发文本")
+}
+
+// 外部 CR 保险丝：图片瞬态失败累计达 maxPhotoTransientFails 后放弃图片降级文本——
+// 持续瞬态失败（大图+慢上行）否则会耗尽 sendWithRetry 预算 defer 不标 seen，
+// 该文章每轮重占预算卡死整个 feed；降级文本成功即标 seen 解卡
+func TestSendPhotoTransientFuse(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.photoFail500 = true // sendPhoto 恒 500，sendMessage 正常
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoMessage("*标题*", testPNG(t, 100, 100))
+	// 第一次 Send：瞬态失败，photo 保留（模拟 sendWithRetry 首轮失败后 backoff 重试）
+	_, err = bot.Send(context.Background(), "@chan", m)
+	assert.Error(t, err)
+	assert.True(t, m.HasPhoto(), "首次瞬态失败仍保留 photo")
+	assert.Empty(t, fake.sends_())
+
+	// 第二次 Send（同 Message，即外层重试）：达阈值 → 放弃图片降级全文文本
+	msgID, err := bot.Send(context.Background(), "@chan", m)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	assert.False(t, m.HasPhoto(), "达阈值后不再持图")
+	assert.Len(t, fake.photos_(), 2, "photo 恰尝试两次（1 次初始 + 1 次重试后触发保险丝）")
+	sends := fake.sends_()
+	require.Len(t, sends, 1)
+	assert.Equal(t, "*标题*", sends[0]["text"], "降级为全文且带 markdown")
+}
+
+// issue #13：连续两次 Send，第二次 multipart 仍为完整字节（reader 不复用）
+func TestSendPhotoFreshReaderEachAttempt(t *testing.T) {
+	fake := newFakeTG(false)
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	img := testPNG(t, 100, 100)
+	m := NewPhotoMessage("t", img)
+	_, err1 := bot.Send(context.Background(), "@chan", m)
+	// 同一 Message 实例再发一次：模拟外层 sendWithRetry 用同一条消息重试的真实场景
+	_, err2 := bot.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err1)
+	require.NoError(t, err2)
+	photos := fake.photos_()
+	require.Len(t, photos, 2)
+	assert.Equal(t, img, photos[1].photo, "第二次上传必须是完整字节")
+}
+
+// issue #13 组合边界：photo 400 永久失败降级文本后，文本路径自身仍要能走
+// markdown → parse 400 → 纯文本重发的完整降级链（photo 降级不得吞掉文本降级）
+func TestSendPhotoFallbackTextPlainCombo(t *testing.T) {
+	fake := newFakeTG(true) // sendMessage 首次返回 parse entities 400
+	fake.photoFail400 = true
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoMessage(`\[组合]标题 \*4.35米`, testPNG(t, 100, 100))
+	msgID, err := bot.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	assert.Len(t, fake.photos_(), 1, "图片永久失败只尝试一次 photo")
+	assert.False(t, m.HasPhoto())
+	sends := fake.sends_()
+	require.Len(t, sends, 2, "photo 降级后文本应走 markdown → 纯文本两级")
+	assert.Equal(t, "Markdown", sends[0]["parse_mode"])
+	_, hasParseMode := sends[1]["parse_mode"]
+	assert.False(t, hasParseMode, "文本降级重发不应带 parse_mode")
+	assert.Equal(t, "[组合]标题 *4.35米", sends[1]["text"], "最终文本应为反转义全文")
+}
+
+// issue #13 组合边界：caption md parse 400 → photo plain 重试恰逢图片永久 400 →
+// 降级全文文本。锁死时序：captionPlain 已置 true 但 plain 未动，
+// 降级文本必须仍带 Markdown 且为反转义前的全文原文
+func TestSendPhotoCaptionPlainThenPermanentFallsBackWithMarkdown(t *testing.T) {
+	fake := newFakeTG(false)
+	fake.photoFailCaption400 = true
+	fake.photoFail400 = true
+	defer fake.server.Close()
+	t.Setenv("TELEGRAM_API_URL", fake.server.URL)
+	bot, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoMessage(`\[标题]正文`, testPNG(t, 100, 100))
+	msgID, err := bot.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	photos := fake.photos_()
+	require.Len(t, photos, 2, "caption parse 重试一次，共两次 photo")
+	assert.Equal(t, "Markdown", photos[0].parseMode)
+	assert.Equal(t, "", photos[1].parseMode, "caption plain 重试不带 parse_mode")
+	assert.Equal(t, "[标题]正文", photos[1].caption)
+	assert.False(t, m.HasPhoto())
+	sends := fake.sends_()
+	require.Len(t, sends, 1, "图片永久失败后只发一次文本")
+	assert.Equal(t, "Markdown", sends[0]["parse_mode"], "captionPlain 不得污染 plain，全文仍走 markdown")
+	assert.Equal(t, `\[标题]正文`, sends[0]["text"], "降级文本为反转义前的全文原文")
 }

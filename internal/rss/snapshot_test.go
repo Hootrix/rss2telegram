@@ -171,7 +171,7 @@ func TestSnapshotFeedSourceDegrades(t *testing.T) {
 }
 
 // 纯图帖豁免字数下限（issue #12 需求变更 2026-10-08）：
-// 正文不足 200 rune 但含 ≥1 张有效 http(s) 图仍建页（tianfu「原文地址+图」型）；
+// 正文不足 200 rune 但含 ≥1 张有效 http(s) 图仍建页（「原文地址+图」型长文源）；
 // 乱码校验不豁免；data: 图被转换层丢弃不算有效图
 func TestSnapshotFeedSourceImageOnlyPost(t *testing.T) {
 	fetcher := &fakeFetcher{}
@@ -185,7 +185,7 @@ func TestSnapshotFeedSourceImageOnlyPost(t *testing.T) {
 	}
 
 	t.Run("短文+http图 建页", func(t *testing.T) {
-		url, err := run("g-img-ok", `<p>原文地址</p><img src="https://tfsmy.chengdu.gov.cn/img/a.jpg">`)
+		url, err := run("g-img-ok", `<p>原文地址</p><img src="https://img.example.com/img/a.jpg">`)
 		require.NoError(t, err)
 		assert.Equal(t, "https://telegra.ph/ok-1", url)
 		assert.Equal(t, int32(0), fetcher.calls.Load(), "feed 模式不得抓原文")
@@ -194,7 +194,7 @@ func TestSnapshotFeedSourceImageOnlyPost(t *testing.T) {
 		require.Len(t, pub.pages, 1, "纯图帖必须建页")
 		content, mErr := json.Marshal(pub.pages[0].Content)
 		require.NoError(t, mErr)
-		assert.Contains(t, string(content), "tfsmy.chengdu.gov.cn", "图节点须入页")
+		assert.Contains(t, string(content), "img.example.com", "图节点须入页")
 	})
 
 	// 图嵌在容器内同样豁免（外部 CR 阻断级修复）：RSS 纯图帖最常见写法就是

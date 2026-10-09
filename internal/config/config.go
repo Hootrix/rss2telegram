@@ -35,6 +35,9 @@ type FeedConfig struct {
 	// 快照正文来源：page（默认）= 抓原文 + readability；feed = 取 RSS item 正文，
 	// 跳过原文抓取（全文输出型 RSS 源用，SPA/反爬站点由 RSS 生成层保证全文）（issue #12）
 	SnapshotSource string `yaml:"snapshot_source"`
+	// 图片推送模式枚举：空 = 不启用（纯文本）；photo = sendPhoto，
+	// template 渲染结果作为图片 caption（issue #13）
+	Media string `yaml:"media"`
 }
 
 const (
@@ -43,6 +46,9 @@ const (
 	// 快照正文来源枚举（issue #12）：将来新来源（如外部渲染端点）作为新值扩展
 	SnapshotSourcePage = "page"
 	SnapshotSourceFeed = "feed"
+
+	// 图片推送模式枚举（issue #13）：将来新模式（如 video）作为新值扩展
+	MediaPhoto = "photo"
 )
 
 // Validate 验证配置的合法性
@@ -112,6 +118,11 @@ func (c *Config) Validate() error {
 		if feed.SnapshotSource != "" && feed.Snapshot == "" {
 			return fmt.Errorf("feed %s: snapshot_source %q requires snapshot %q to be enabled",
 				feed.Name, feed.SnapshotSource, SnapshotTelegraph)
+		}
+
+		// 图片推送模式：字符串枚举，仅允许空串或已实现的模式（issue #13）
+		if feed.Media != "" && feed.Media != MediaPhoto {
+			return fmt.Errorf("feed %s: invalid media %q (only %q is supported)", feed.Name, feed.Media, MediaPhoto)
 		}
 	}
 

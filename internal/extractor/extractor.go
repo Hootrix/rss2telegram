@@ -29,7 +29,10 @@ const (
 	// 纯 JS 站点（SPA 空壳）提取结果过短自然落入此路径
 	minTextRunes = 200
 
-	userAgent = "Mozilla/5.0 (compatible; rss2telegram/1.0; +https://github.com/Hootrix/rss2telegram)"
+	// UserAgent 对外导出：rss 包图片下载复用同一 UA（issue #13），
+	// 避免两处常量漂移。旧未导出名保留备查：
+	// userAgent = "Mozilla/5.0 (compatible; rss2telegram/1.0; +https://github.com/Hootrix/rss2telegram)"
+	UserAgent = "Mozilla/5.0 (compatible; rss2telegram/1.0; +https://github.com/Hootrix/rss2telegram)"
 )
 
 // Extractor 抓原文 + readability 提取正文，产出正文 HTML 供快照编排转换
@@ -64,7 +67,7 @@ func (e *Extractor) FetchAndExtract(ctx context.Context, rawURL string) (string,
 	if err != nil {
 		return "", fmt.Errorf("extract %s: %w", rawURL, err)
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", UserAgent)
 
 	resp, err := e.hc.Do(req)
 	if err != nil {

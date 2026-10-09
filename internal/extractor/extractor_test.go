@@ -16,7 +16,7 @@ import (
 
 // 构造一段足够长(>200 rune)的中文正文，保证通过长度校验
 func longText(repeat int) string {
-	return strings.Repeat("成都天府市民云是一个方便市民办事的城市服务移动平台，提供社保公积金查询与生活缴费。", repeat)
+	return strings.Repeat("城市生活服务平台是一个方便市民办事的移动应用，提供社保公积金查询与生活缴费。", repeat)
 }
 
 func articleHTML(title, body string) string {
@@ -54,7 +54,7 @@ func TestFetchAndExtractOK(t *testing.T) {
 	require.NoError(t, err)
 	// 返回的是 readability 清理后的正文 HTML，包含标题与正文段落
 	assert.Contains(t, html, "测试标题")
-	assert.Contains(t, html, "城市服务移动平台")
+	assert.Contains(t, html, "城市生活服务平台")
 }
 
 func TestFetchAndExtractNonHTMLContentType(t *testing.T) {

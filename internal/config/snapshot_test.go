@@ -77,8 +77,8 @@ telegram:
   bot_token: t
   check_interval: 60
 feeds:
-  - name: tianfu
-    url: https://rss.hhtjim.com/tianfu.xml
+  - name: image-feed
+    url: https://example.com/feed.xml
     channels: ["@my_channel"]
     snapshot: telegraph
     snapshot_source: feed
