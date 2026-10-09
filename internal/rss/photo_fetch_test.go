@@ -69,6 +69,22 @@ func TestValidatePhoto(t *testing.T) {
 		webp := append([]byte("RIFF\x00\x00\x00\x00WEBPVP8 "), make([]byte, 32)...)
 		assert.NoError(t, validatePhoto(webp))
 	})
+	// issue #16：尺寸/比例超限须返回可判别的 photoDimensionError（handler 据此触发切片），
+	// 其余失败类别必须不可误判
+	t.Run("w+h 超限返回可切片的 dimension 错误", func(t *testing.T) {
+		err := validatePhoto(encodeGray(t, 1080, 10492, true))
+		assert.True(t, isDimensionError(err), "w+h 超限应可切片: %v", err)
+	})
+	t.Run("比例超限返回可切片的 dimension 错误", func(t *testing.T) {
+		err := validatePhoto(encodeGray(t, 60, 1260, false))
+		assert.True(t, isDimensionError(err), "比例超限应可切片: %v", err)
+	})
+	t.Run("短边过小不可切片（切片只会更小）", func(t *testing.T) {
+		assert.False(t, isDimensionError(validatePhoto(encodeGray(t, 100, 49, false))))
+	})
+	t.Run("非尺寸失败不可切片", func(t *testing.T) {
+		assert.False(t, isDimensionError(validatePhoto([]byte("<html>x</html>"))))
+	})
 }
 
 // issue #13：httpPhotoFetcher.Fetch——状态码/大小/嗅探/UA/超时

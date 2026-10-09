@@ -5,6 +5,7 @@ package rss
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -38,7 +39,7 @@ type PhotoFetcher interface {
 	Fetch(ctx context.Context, rawURL string) ([]byte, error)
 }
 
-// httpPhotoFetcher 标准实现：GET → 状态码/大小/嗅探格式/尺寸预检
+// httpPhotoFetcher 标准实现：GET → 状态码/大小上限（校验由调用方负责，issue #16）
 type httpPhotoFetcher struct {
 	hc           *http.Client
 	fetchTimeout time.Duration // 测试可缩短
@@ -51,6 +52,19 @@ func newHTTPPhotoFetcher() *httpPhotoFetcher {
 
 // 编译期断言实现满足接口：签名漂移前移暴露，不必等 T8 handler 注入
 var _ PhotoFetcher = (*httpPhotoFetcher)(nil)
+
+// photoDimensionError 尺寸/比例超 Telegram sendPhoto 硬限制（issue #16）：
+// 可通过本地切片修复的失败类别，handler 据此触发 slicePhoto。
+// 短边过小不属此类——切片只会更小，不可修复
+type photoDimensionError struct{ reason string }
+
+func (e *photoDimensionError) Error() string { return "photo dimensions: " + e.reason }
+
+// isDimensionError 判定校验失败是否属尺寸类（可切片）
+func isDimensionError(err error) bool {
+	var d *photoDimensionError
+	return errors.As(err, &d)
+}
 
 // validatePhoto 上传前校验（纯函数）：
 // 格式白名单以字节嗅探为准（http.DetectContentType），不信任响应头 Content-Type
@@ -75,7 +89,10 @@ func validatePhoto(data []byte) error {
 	}
 	w, h := cfg.Width, cfg.Height
 	if w+h > maxPhotoSideSum {
-		return fmt.Errorf("photo dimensions %dx%d exceed w+h limit %d", w, h, maxPhotoSideSum)
+		// [issue #16] 普通 fmt.Errorf 无法判别，换可切片的尺寸类错误；
+		// 旧实现保留备查：
+		// return fmt.Errorf("photo dimensions %dx%d exceed w+h limit %d", w, h, maxPhotoSideSum)
+		return &photoDimensionError{fmt.Sprintf("%dx%d exceed w+h limit %d", w, h, maxPhotoSideSum)}
 	}
 	maxSide, minSide := w, h
 	if minSide > maxSide {
@@ -86,12 +103,16 @@ func validatePhoto(data []byte) error {
 	}
 	// 整数比较避免浮点：max > 20*min
 	if maxSide > maxPhotoRatio*minSide {
-		return fmt.Errorf("photo aspect ratio %d:%d exceeds %d", w, h, maxPhotoRatio)
+		// [issue #16] 同 w+h：比例超限可切片，换可判别的尺寸类错误；
+		// 旧实现保留备查：
+		// return fmt.Errorf("photo aspect ratio %d:%d exceeds %d", w, h, maxPhotoRatio)
+		return &photoDimensionError{fmt.Sprintf("%d:%d exceeds %d", w, h, maxPhotoRatio)}
 	}
 	return nil
 }
 
-// Fetch 下载 rawURL 并校验；任何失败返回 error（不重试，调用方按候选回退）。
+// Fetch 下载 rawURL：GET → 状态码/大小上限（校验由调用方负责，issue #16）。
+// 任何失败返回 error（不重试，调用方按候选回退）。
 // URL 来自 feed 内容，会请求任意 http(s) 地址（可达内网）：feed 由运维配置、
 // 视为可信，不做私网拦截
 // TODO: 若开放给不可信 feed 需补私网 IP 拦截（spec 边界表，issue #13）
@@ -126,8 +147,12 @@ func (f *httpPhotoFetcher) Fetch(ctx context.Context, rawURL string) ([]byte, er
 	if len(data) > maxPhotoBytes {
 		return nil, fmt.Errorf("photo fetch %s: body exceeds %d bytes", rawURL, maxPhotoBytes)
 	}
-	if err := validatePhoto(data); err != nil {
-		return nil, fmt.Errorf("photo fetch %s: %w", rawURL, err)
-	}
+	// [issue #16] 校验职责移出 Fetch：切片需拿到「尺寸超限图」的原始字节，
+	// 旧实现在此 validatePhoto 失败即丢字节，handler 无法触发切片。
+	// validatePhoto/isDimensionError 改由 handler.photoForItem 在 Fetch 之后调用。
+	// 旧实现保留备查：
+	// if err := validatePhoto(data); err != nil {
+	// 	return nil, fmt.Errorf("photo fetch %s: %w", rawURL, err)
+	// }
 	return data, nil
 }

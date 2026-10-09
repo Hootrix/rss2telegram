@@ -948,7 +948,8 @@ func newPhotoTestHandler(t *testing.T, channels []string, bot TelegramBot, fetch
 }
 
 func TestProcessFeedPhotoMode(t *testing.T) {
-	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47} // mock 不校验内容，占位字节即可
+	// [issue #16] validatePhoto 已移至 handler 路径，stub 需通过校验（短边 ≥50）
+	pngBytes := encodeGray(t, 60, 50, false)
 
 	t.Run("下载成功收到 photo 消息", func(t *testing.T) {
 		bot := &photoBot{}
