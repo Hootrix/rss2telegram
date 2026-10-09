@@ -295,7 +295,7 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 			// sendWithRetry 的 2min 预算后 defer 不标 seen，该文章按从旧到新
 			// 每轮重占预算 → 该 feed 其余文章永久饿死。达阈值后放弃图片降级
 			// 全文，文本成功即标 seen 解卡——对 spec §5 顺序 4「保留重试」的
-			// 假设边界（longfeed 图 ≤2MB）补强，语义与 captionPlain 有限降级同构
+			// 假设边界（目标 feed 图 ≤2MB）补强，语义与 captionPlain 有限降级同构
 			log.Printf("photo transiently failed %d times, giving up photo and falling back to text: %v", message.photoTransientFails+1, err)
 			message.photo = nil
 		} else {

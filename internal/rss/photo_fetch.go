@@ -103,7 +103,7 @@ func (f *httpPhotoFetcher) Fetch(ctx context.Context, rawURL string) ([]byte, er
 	if err != nil {
 		return nil, fmt.Errorf("photo fetch %s: new request: %w", rawURL, err)
 	}
-	// 与 extractor 同 UA；不带 Referer（实测无 Referer 可取目标图床图片）
+	// 与 extractor 同 UA；不带 Referer（实测目标图床无 Referer 可取）
 	req.Header.Set("User-Agent", extractor.UserAgent)
 
 	resp, err := f.hc.Do(req)

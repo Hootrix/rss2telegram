@@ -76,7 +76,7 @@ func TestPhotoCandidates(t *testing.T) {
 		assert.Equal(t, []string{"https://c.com/abs.png"}, photoCandidates(item))
 	})
 
-	t.Run("longfeed 结构：banner 重复出现去重", func(t *testing.T) {
+	t.Run("长文结构：banner 重复出现去重", func(t *testing.T) {
 		// 长文 feed 常见形态：description 转义 HTML，同一 banner 重复
 		item := &gofeed.Item{Description: `<p><img src="https://img.example.com/banner.png" width="690"/></p><p>正文</p><img src="https://img.example.com/banner.png"/>`}
 		assert.Equal(t, []string{"https://img.example.com/banner.png"}, photoCandidates(item))
