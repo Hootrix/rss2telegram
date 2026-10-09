@@ -850,3 +850,195 @@ func TestProcessFeedsSharedChannelCooldown(t *testing.T) {
 	calls, _ = bot.snapshot()
 	assert.Equal(t, 3, calls, "成功标记 seen 后不应重复推送")
 }
+
+// ---- issue #13：media: photo 的 processFeed 集成 ----
+
+// mockPhotoFetcher 按 URL 返回预设字节/错误，记录调用序
+type mockPhotoFetcher struct {
+	mu     sync.Mutex
+	calls  []string
+	stub   map[string][]byte
+	errFor map[string]error
+}
+
+func (f *mockPhotoFetcher) Fetch(_ context.Context, rawURL string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, rawURL)
+	if err, ok := f.errFor[rawURL]; ok {
+		return nil, err
+	}
+	if b, ok := f.stub[rawURL]; ok {
+		return b, nil
+	}
+	return nil, fmt.Errorf("no stub for %s", rawURL)
+}
+
+func (f *mockPhotoFetcher) snapshot() ([]string, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string{}, f.calls...), len(f.calls)
+}
+
+// cancelingFetcher 首次 Fetch 调用时取消 ctx 并返回错误，
+// 用于触发 photoForItem 的「失败后 ctx 取消立即返回」分支。
+// 无锁：processFeed 的 item 处理串行调用 Fetch，无并发（带锁的
+// mockPhotoFetcher 面向潜在并发场景，此处单用例单 feed 不需要）
+type cancelingFetcher struct {
+	cancel func()
+	calls  int
+}
+
+func (f *cancelingFetcher) Fetch(ctx context.Context, _ string) ([]byte, error) {
+	f.calls++
+	f.cancel()
+	return nil, ctx.Err()
+}
+
+// photoBot 记录每次收到的消息形态（HasPhoto/Text/频道），返回成功
+type photoBot struct {
+	mu       sync.Mutex
+	messages []struct {
+		channel  string
+		hasPhoto bool
+		text     string
+	}
+}
+
+func (b *photoBot) Send(_ context.Context, channel string, m *telegram.Message) (int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.messages = append(b.messages, struct {
+		channel  string
+		hasPhoto bool
+		text     string
+	}{channel, m.HasPhoto(), m.Text()})
+	return 1, nil
+}
+
+// newPhotoTestHandler 起 RSS 假源（description 含两张图）+ media=photo 的 handler；
+// template 可覆盖（空渲染用例需要）
+func newPhotoTestHandler(t *testing.T, channels []string, bot TelegramBot, fetcher PhotoFetcher, template string) *RssHandler {
+	t.Helper()
+	const feedXML = `<?xml version="1.0"?><rss version="2.0"><channel><title>test</title><link>https://example.com/</link><description>d</description>` +
+		`<item><title>photo item</title><guid>p-1</guid><description>&lt;img src="https://img.example.com/first.png"/&gt;&lt;p&gt;甲&lt;/p&gt;&lt;img src="https://img.example.com/second.png"/&gt;&lt;p&gt;乙&lt;/p&gt;</description></item>` +
+		`</channel></rss>`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, feedXML)
+	}))
+	t.Cleanup(server.Close)
+	store, err := storage.NewStorage(t.TempDir())
+	require.NoError(t, err)
+	if template == "" {
+		template = "{title}"
+	}
+	cfg := &config.Config{}
+	cfg.Feeds = append(cfg.Feeds, config.FeedConfig{
+		Name: "photo-feed", URL: server.URL, Channels: channels,
+		FirstPush: true, Media: config.MediaPhoto, Template: template,
+	})
+	h := NewRssHandler(cfg, bot, store, nil)
+	h.photoFetcher = fetcher // 覆盖默认 http 实现
+	return h
+}
+
+func TestProcessFeedPhotoMode(t *testing.T) {
+	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47} // mock 不校验内容，占位字节即可
+
+	t.Run("下载成功收到 photo 消息", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{"https://img.example.com/first.png": pngBytes}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasPhoto)
+		assert.Equal(t, "photo item", bot.messages[0].text)
+	})
+
+	t.Run("首候选失败次候选成功", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{
+			stub:   map[string][]byte{"https://img.example.com/second.png": pngBytes},
+			errFor: map[string]error{"https://img.example.com/first.png": errors.New("boom")},
+		}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasPhoto)
+		seq, calls := fetcher.snapshot()
+		assert.Equal(t, 2, calls)
+		assert.Equal(t, []string{"https://img.example.com/first.png", "https://img.example.com/second.png"}, seq)
+	})
+
+	t.Run("全部候选失败降级文本并照常推送", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{errFor: map[string]error{"https://img.example.com/first.png": errors.New("boom")}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.False(t, bot.messages[0].hasPhoto, "无图应发文本消息")
+		assert.Equal(t, "photo item", bot.messages[0].text)
+	})
+
+	t.Run("未配置 media 不调用 fetcher（回归）", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].Media = ""
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.False(t, bot.messages[0].hasPhoto)
+		_, calls := fetcher.snapshot()
+		assert.Zero(t, calls)
+	})
+
+	t.Run("多频道每 item 只下载一次", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{"https://img.example.com/first.png": pngBytes}}
+		h := newPhotoTestHandler(t, []string{"@a", "@b"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 2, "两频道各收到一条")
+		assert.True(t, bot.messages[0].hasPhoto)
+		assert.True(t, bot.messages[1].hasPhoto)
+		_, calls := fetcher.snapshot()
+		assert.Equal(t, 1, calls, "图片字节每 item 只下载一次")
+	})
+
+	t.Run("渲染为空跳过且不下载", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "{description|extract:zzz-绝对无匹配}")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		assert.Empty(t, bot.messages)
+		_, calls := fetcher.snapshot()
+		assert.Zero(t, calls, "空消息不应触发图片下载")
+	})
+
+	t.Run("ctx 取消即停止候选回退", func(t *testing.T) {
+		bot := &photoBot{}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel() // cancel 存入 fetcher 后 vet lostcancel 不覆盖，兜底释放防悬挂
+		// 首个候选的 Fetch 内部取消 ctx 后返回错误：photoForItem 应立即返回
+		// nil 不再试第二个候选（T8 返修语义），频道循环 ctx 检查随后上报取消
+		fetcher := &cancelingFetcher{cancel: cancel}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		err := h.processFeed(ctx, h.config.Feeds[0])
+
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.Empty(t, bot.messages, "取消后不应发送")
+		assert.Equal(t, 1, fetcher.calls, "取消后不再回退第二候选")
+	})
+}
