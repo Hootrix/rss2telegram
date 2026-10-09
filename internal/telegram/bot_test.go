@@ -75,7 +75,10 @@ func newFakeTG(failFirst bool) *fakeTG {
 			// telebot FromReader 走 multipart：字段 + 名为 photo 的文件部分。
 			// 注意 v3.1.3 FromReader 不设置 fileName → CreateFormFile 产出 filename=""，
 			// Go 服务端 ReadForm 将无 filename 的部件归为表单值而非文件，
-			// 故优先取文件部件、取不到再回退 FormValue("photo")（真实 Telegram 接受两种形态）
+			// 故优先取文件部件、取不到再回退 FormValue("photo")。两服务端判定规则不同：
+			// 真实 Telegram（tdlib HttpReader）以 multipart 里 filename 键是否存在区分文件
+			// 与普通参数——telebot FromReader 写出 filename=""（键存在、值为空），真实 TG
+			// 按文件处理；Go 服务端要求 filename 非空才归文件部件，落为表单值 → 需回退
 			ps := photoSend{}
 			if err := r.ParseMultipartForm(32 << 20); err == nil && r.MultipartForm != nil {
 				ps.caption = r.FormValue("caption")

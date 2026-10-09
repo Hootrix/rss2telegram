@@ -895,13 +895,17 @@ func (f *cancelingFetcher) Fetch(ctx context.Context, _ string) ([]byte, error) 
 	return nil, ctx.Err()
 }
 
-// photoBot 记录每次收到的消息形态（HasPhoto/Text/频道），返回成功
+// photoBot 记录每次收到的消息形态（HasPhoto/Text/频道/实例指针），返回成功。
+// msg 指针供断言「各频道收到独立 Message 实例」（spec §7）：锁住
+// NewPhotoMessage 在频道循环内的构造位置——挪到循环外会共享实例、
+// photo 降级状态跨频道串味，NotSame 断言此时必失败
 type photoBot struct {
 	mu       sync.Mutex
 	messages []struct {
 		channel  string
 		hasPhoto bool
 		text     string
+		msg      *telegram.Message
 	}
 }
 
@@ -912,7 +916,8 @@ func (b *photoBot) Send(_ context.Context, channel string, m *telegram.Message) 
 		channel  string
 		hasPhoto bool
 		text     string
-	}{channel, m.HasPhoto(), m.Text()})
+		msg      *telegram.Message
+	}{channel, m.HasPhoto(), m.Text(), m})
 	return 1, nil
 }
 
@@ -1010,6 +1015,7 @@ func TestProcessFeedPhotoMode(t *testing.T) {
 		require.Len(t, bot.messages, 2, "两频道各收到一条")
 		assert.True(t, bot.messages[0].hasPhoto)
 		assert.True(t, bot.messages[1].hasPhoto)
+		assert.NotSame(t, bot.messages[0].msg, bot.messages[1].msg, "各频道必须是独立 Message 实例（spec §7，降级状态不跨频道串味）")
 		_, calls := fetcher.snapshot()
 		assert.Equal(t, 1, calls, "图片字节每 item 只下载一次")
 	})
