@@ -484,7 +484,8 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 		}
 		// [issue #13] 图片推送：每 item 下载一次，频道间只读共享；
 		// Message 每 (item, channel) 新建——photo 降级状态不得跨频道串味
-		photo := h.photoForItem(ctx, feedConfig, item)
+		// photo := h.photoForItem(ctx, feedConfig, item) // 旧：返回 []byte，issue #16 起改载荷结构体
+		payload := h.photoForItem(ctx, feedConfig, item)
 		for _, channel := range feedConfig.Channels {
 			// if err := ctx.Err(); err != nil {
 			// 	return fmt.Errorf("send feed items: %w", err)
@@ -502,7 +503,8 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 				continue
 			}
 			// delivery := telegram.NewMessage(message) // 旧 sendWithRetry(ctx, channel, message, item.Title)
-			delivery := telegram.NewPhotoMessage(message, photo)
+			// delivery := telegram.NewPhotoMessage(message, photo) // 旧：单图构造，issue #16 起按载荷分派
+			delivery := newDelivery(message, payload)
 			if msgID, ok := h.sendWithRetry(ctx, channel, delivery, item.Title); ok {
 				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
 					log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
@@ -793,36 +795,107 @@ func (h *RssHandler) snapshotForItem(ctx context.Context, feedConfig config.Feed
 	return h.snapshot.Snapshot(ctx, feedConfig, item)
 }
 
-// photoForItem [issue #13] 仅 media=photo 时按候选顺序下载图片，首个通过
-// 校验者胜出；全部失败返回 nil（只记日志不中断推送，该条以文本形式发出并
-// 照常标 seen——下载不重试，换取不阻塞推送）。
+// photoPayload [issue #16] item 级图片载荷：单图与相册切片互斥，零值走纯文本
+type photoPayload struct {
+	photo     []byte   // 限内单图（或切片单片，数学上不可达，防御保留）
+	album     [][]byte // 切片 ≥2 张合规 JPEG
+	truncated bool     // 超 maxAlbumPhotos 截尾
+}
+
+// photoForItem [issue #13/16] 仅 media=photo 时按候选顺序下载图片：
+// Fetch 只负责下载（issue #16 起校验移出），validatePhoto 在此分类——
+// 尺寸类失败触发 slicePhoto 切片，成功即胜出（不回退后续候选）；
+// 切片失败/其他校验失败回退下一候选；全部失败返回零值（文本推送）。
 // 图片字节每 item 只下载一次，频道间只读共享
-func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedConfig, item *gofeed.Item) []byte {
+func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedConfig, item *gofeed.Item) photoPayload {
 	if feedConfig.Media != config.MediaPhoto || h.photoFetcher == nil {
-		return nil
+		return photoPayload{}
 	}
 	// 候选为空时显式记日志：运维才能区分「无候选图」与「配置遗漏」（静默穿过则两条都查不到）
 	candidates := photoCandidates(item)
 	if len(candidates) == 0 {
 		log.Printf("photo mode: no image candidates, feed %s item %q", feedConfig.Name, item.Title)
-		return nil
+		return photoPayload{}
 	}
 	for _, u := range candidates {
 		if ctx.Err() != nil {
-			return nil // 预算耗尽/退出：交由频道循环既有的 ctx 检查处理（首次进入循环的防线）
+			return photoPayload{} // 预算耗尽/退出：交由频道循环既有的 ctx 检查处理（首次进入循环的防线）
 		}
 		data, err := h.photoFetcher.Fetch(ctx, u)
 		if err != nil {
 			log.Printf("photo fetch failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, err)
 			// 取消/预算耗尽：立即返回不再试下一候选，避免"看起来还要重试"的误导日志
 			if ctx.Err() != nil {
-				return nil
+				return photoPayload{}
 			}
 			continue
 		}
-		return data
+		if err := validatePhoto(data); err != nil {
+			// [issue #16] 尺寸类失败先试切片本图，切片失败再回退下一候选
+			if isDimensionError(err) {
+				chunks, truncated, serr := slicePhoto(data)
+				if serr != nil {
+					log.Printf("photo slice failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, serr)
+					continue
+				}
+				if truncated {
+					log.Printf("photo sliced with tail dropped, feed %s item %q url %s: %d chunks", feedConfig.Name, item.Title, u, len(chunks))
+				}
+				// 切片触发契约保证 ≥2 片；单片防御性走单图路径
+				if len(chunks) >= 2 {
+					return photoPayload{album: chunks, truncated: truncated}
+				}
+				return photoPayload{photo: chunks[0]}
+			}
+			log.Printf("photo validate failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, err)
+			continue
+		}
+		return photoPayload{photo: data}
 	}
-	return nil
+	return photoPayload{}
+}
+
+// 旧 photoForItem（issue #13 版，返回 []byte、不做校验分类）整段注释保留备查；
+// issue #16 起被上方 photoPayload 版本替换：
+// func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedConfig, item *gofeed.Item) []byte {
+// 	if feedConfig.Media != config.MediaPhoto || h.photoFetcher == nil {
+// 		return nil
+// 	}
+// 	// 候选为空时显式记日志：运维才能区分「无候选图」与「配置遗漏」（静默穿过则两条都查不到）
+// 	candidates := photoCandidates(item)
+// 	if len(candidates) == 0 {
+// 		log.Printf("photo mode: no image candidates, feed %s item %q", feedConfig.Name, item.Title)
+// 		return nil
+// 	}
+// 	for _, u := range candidates {
+// 		if ctx.Err() != nil {
+// 			return nil // 预算耗尽/退出：交由频道循环既有的 ctx 检查处理（首次进入循环的防线）
+// 		}
+// 		data, err := h.photoFetcher.Fetch(ctx, u)
+// 		if err != nil {
+// 			log.Printf("photo fetch failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, err)
+// 			// 取消/预算耗尽：立即返回不再试下一候选，避免"看起来还要重试"的误导日志
+// 			if ctx.Err() != nil {
+// 				return nil
+// 			}
+// 			continue
+// 		}
+// 		return data
+// 	}
+// 	return nil
+// }
+
+// newDelivery [issue #16] 按载荷形态构造频道消息：相册 > 单图 > 纯文本；
+// 每 (item,channel) 调用一次保证 Message 实例独立（降级状态不跨频道串味）。
+// 截断附注拼进 text：caption 与相册失败后的文本降级都如实披露
+func newDelivery(text string, p photoPayload) *telegram.Message {
+	if p.truncated {
+		text += "\n\n（长图过长，已截断）"
+	}
+	if len(p.album) > 0 {
+		return telegram.NewPhotoAlbumMessage(text, p.album)
+	}
+	return telegram.NewPhotoMessage(text, p.photo)
 }
 
 // 格式化消息

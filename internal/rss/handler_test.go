@@ -902,10 +902,11 @@ func (f *cancelingFetcher) Fetch(ctx context.Context, _ string) ([]byte, error) 
 type photoBot struct {
 	mu       sync.Mutex
 	messages []struct {
-		channel  string
-		hasPhoto bool
-		text     string
-		msg      *telegram.Message
+		channel    string
+		hasPhoto   bool
+		albumCount int // [issue #16] 相册切片张数（AlbumCount()）
+		text       string
+		msg        *telegram.Message
 	}
 }
 
@@ -913,11 +914,12 @@ func (b *photoBot) Send(_ context.Context, channel string, m *telegram.Message) 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.messages = append(b.messages, struct {
-		channel  string
-		hasPhoto bool
-		text     string
-		msg      *telegram.Message
-	}{channel, m.HasPhoto(), m.Text(), m})
+		channel    string
+		hasPhoto   bool
+		albumCount int
+		text       string
+		msg        *telegram.Message
+	}{channel, m.HasPhoto(), m.AlbumCount(), m.Text(), m})
 	return 1, nil
 }
 
@@ -1047,5 +1049,68 @@ func TestProcessFeedPhotoMode(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Empty(t, bot.messages, "取消后不应发送")
 		assert.Equal(t, 1, fetcher.calls, "取消后不再回退第二候选")
+	})
+}
+
+// issue #16：超限长图切片相册端到端
+func TestProcessFeedPhotoAlbumMode(t *testing.T) {
+	t.Run("尺寸超限长图切片为相册", func(t *testing.T) {
+		// 200×9900：w+h=10100 超限 → 切 3 片合规 JPEG
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 200, 9900),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 3, bot.messages[0].albumCount)
+		assert.False(t, bot.messages[0].hasPhoto)
+		assert.NotContains(t, bot.messages[0].text, "已截断", "未截断不附注")
+	})
+
+	t.Run("超 10 片截尾附注截断提示", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 25000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 10, bot.messages[0].albumCount)
+		assert.Contains(t, bot.messages[0].text, "（长图过长，已截断）")
+	})
+
+	t.Run("w 无解切片失败回退下一候选", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			// 首候选：9600×1000 超限且片高区间为空 → 切片失败回退
+			"https://img.example.com/first.png":  encodeGrad(t, 9600, 1000),
+			"https://img.example.com/second.png": encodeGray(t, 60, 50, false),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasPhoto, "回退到次候选单图")
+		assert.Zero(t, bot.messages[0].albumCount)
+	})
+
+	t.Run("全候选切片失败降级文本", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 9600, 1000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.False(t, bot.messages[0].hasPhoto)
+		assert.Zero(t, bot.messages[0].albumCount)
 	})
 }

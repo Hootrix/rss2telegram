@@ -33,7 +33,7 @@ const (
 	minPhotoSide    = 50
 )
 
-// PhotoFetcher 下载并校验图片，返回可直接上传的字节；
+// PhotoFetcher 下载图片原始字节（校验由调用方负责，issue #16）；
 // 任何失败返回 error，由调用方降级文本（issue #13）
 type PhotoFetcher interface {
 	Fetch(ctx context.Context, rawURL string) ([]byte, error)

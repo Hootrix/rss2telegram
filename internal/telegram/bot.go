@@ -83,6 +83,9 @@ func (m *Message) HasPhoto() bool { return len(m.photo) > 0 }
 // HasAlbum 是否仍为相册消息（issue #16，跨包断言发送/降级路径用）
 func (m *Message) HasAlbum() bool { return len(m.photos) > 0 }
 
+// AlbumCount 相册切片张数（issue #16，跨包断言用）
+func (m *Message) AlbumCount() int { return len(m.photos) }
+
 // RateLimitError 表示 Telegram 429 限速，携带服务端指示的等待时长。
 // 独立成项目内类型：handler 层用 errors.As 识别即可，无需 import telebot
 type RateLimitError struct {
