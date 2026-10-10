@@ -39,7 +39,7 @@ type FeedConfig struct {
 	// template 渲染结果作为图片 caption（issue #13）
 	Media string `yaml:"media"`
 	// 相册预览切片上限（issue #16 用户反馈）：长图切片相册最多展示的片数；
-	// 0 = 默认 10；显式合法值 2-10（Telegram sendMediaGroup 硬上限）。
+	// 0 = 默认 10；显式合法值 1-10（1 = 顶部单切片单图预览，10 = sendMediaGroup 硬上限）。
 	// 仅 media=photo 时生效
 	PhotoSlices int `yaml:"photo_slices"`
 	// 超限长图行为（issue #16 用户反馈）：document（默认）= 整图发文件附件（完整
@@ -143,9 +143,10 @@ func (c *Config) Validate() error {
 
 		// 相册切片上限（issue #16 用户反馈）：仅 media=photo 时允许配置（对齐
 		// snapshot_source 依赖 snapshot 的校验关系——独立存在无意义且易被误以为生效）；
-		// 显式值限 2-10：1 片不成相册（单图直接发 sendPhoto），10 = sendMediaGroup 硬上限
-		if feed.PhotoSlices != 0 && (feed.Media != MediaPhoto || feed.PhotoSlices < 2 || feed.PhotoSlices > 10) {
-			return fmt.Errorf("feed %s: invalid photo_slices %d (only 2-10 with media %q is supported)", feed.Name, feed.PhotoSlices, MediaPhoto)
+		// 显式值限 1-10：1 = 单切片单图预览（handler 单片路由走 sendPhoto），
+		// 2-9 = 相册，10 = sendMediaGroup 硬上限
+		if feed.PhotoSlices != 0 && (feed.Media != MediaPhoto || feed.PhotoSlices < 1 || feed.PhotoSlices > 10) {
+			return fmt.Errorf("feed %s: invalid photo_slices %d (only 1-10 with media %q is supported)", feed.Name, feed.PhotoSlices, MediaPhoto)
 		}
 
 		// 超限长图行为（issue #16 用户反馈）：仅 media=photo 时允许配置；枚举校验

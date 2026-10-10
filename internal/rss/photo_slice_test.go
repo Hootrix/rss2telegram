@@ -141,6 +141,17 @@ func TestSlicePhoto(t *testing.T) {
 		assert.ErrorContains(t, err, "maxPieces")
 	})
 
+	t.Run("maxPieces=1 截取顶部单片", func(t *testing.T) {
+		// 100×5000：chunkMax=1280；n=4 > 1 → 顶部 1×1280，其余丢弃（photo_slices=1 定制）
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 5000), 1)
+		require.NoError(t, err)
+		assert.True(t, truncated)
+		require.Len(t, chunks, 1)
+		w, h := dims(t, chunks[0])
+		assert.Equal(t, 100, w)
+		assert.Equal(t, 1280, h)
+	})
+
 	t.Run("w 过大无合法片高区间降级", func(t *testing.T) {
 		// 9600×1000：chunkMax=min(400, 192000, 1280)=400 < chunkMin=480 → 区间空
 		_, _, err := slicePhoto(encodeGrad(t, 9600, 1000), maxAlbumPhotos)

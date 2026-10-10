@@ -1187,6 +1187,23 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		assert.NotContains(t, bot.messages[0].text, "已截断", "text 恒全文")
 	})
 
+	t.Run("photo_slices=1 单切片单图预览", func(t *testing.T) {
+		// 200×9900：needed=8 > 1 → crop 取顶部 1×1280 单图（sendMediaGroup 最少 2 张）
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 200, 9900),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoSlices = 1
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasPhoto, "单切片应走单图路径")
+		assert.Zero(t, bot.messages[0].albumCount)
+	})
+
 	t.Run("photo_slices 宽松时完整相册无附注", func(t *testing.T) {
 		// 100×5000：needed=⌈5000/1280⌉=4 ≤ photo_slices=4 → 完整 4 片相册，无截断附注
 		bot := &photoBot{}

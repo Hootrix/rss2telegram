@@ -901,6 +901,10 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 							continue
 						}
 						log.Printf("photo over-limit cropped preview, feed %s item %q url %s: %d/%d chunks", feedConfig.Name, item.Title, u, len(chunks), slices)
+						// [issue #16 定制] photo_slices=1 时单切片走单图（sendMediaGroup 最少 2 张）
+						if len(chunks) == 1 {
+							return photoPayload{photo: chunks[0], truncated: truncated}
+						}
 						return photoPayload{album: chunks, truncated: truncated}
 					}
 					log.Printf("photo over readable album limit, sending as document, feed %s item %q url %s (%dx%d)", feedConfig.Name, item.Title, u, dimErr.w, dimErr.h)

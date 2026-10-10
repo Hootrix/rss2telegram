@@ -257,7 +257,7 @@ func TestValidateMediaEnum(t *testing.T) {
 
 // issue #16 用户反馈：photo_slices/photo_overlimit 校验——
 // 仅 media=photo 的 feed 允许配置（对齐 snapshot_source 依赖 snapshot 的校验关系），
-// photo_slices 合法显式值 2-10（sendMediaGroup 硬上限 10，0=默认）
+// photo_slices 合法显式值 1-10（sendMediaGroup 硬上限 10，0=默认）
 func TestValidatePhotoAlbumConfig(t *testing.T) {
 	newFeed := func(mutate func(*FeedConfig)) *Config {
 		cfg := &Config{
@@ -275,13 +275,14 @@ func TestValidatePhotoAlbumConfig(t *testing.T) {
 		assert.Equal(t, 10, cfg.Feeds[0].EffectivePhotoSlices())
 	})
 
-	t.Run("photo_slices 合法边界 2 与 10 通过", func(t *testing.T) {
-		assert.NoError(t, newFeed(func(f *FeedConfig) { f.PhotoSlices = 2 }).Validate())
+	t.Run("photo_slices 合法边界 1 与 10 通过", func(t *testing.T) {
+		// [issue #16 定制] 1 = 单切片单图预览（顶部一片走 sendPhoto）
+		assert.NoError(t, newFeed(func(f *FeedConfig) { f.PhotoSlices = 1 }).Validate())
 		assert.NoError(t, newFeed(func(f *FeedConfig) { f.PhotoSlices = 10 }).Validate())
 	})
 
-	t.Run("photo_slices 越界 1 与 11 报错", func(t *testing.T) {
-		for _, v := range []int{1, 11} {
+	t.Run("photo_slices 越界 0 语义为默认，-1 与 11 报错", func(t *testing.T) {
+		for _, v := range []int{-1, 11} {
 			err := newFeed(func(f *FeedConfig) { f.PhotoSlices = v }).Validate()
 			assert.ErrorContains(t, err, "photo_slices", "值 %d 应报错", v)
 		}
