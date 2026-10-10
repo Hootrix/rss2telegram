@@ -1165,8 +1165,8 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		require.Len(t, bot.messages, 1)
 		assert.Equal(t, 10, bot.messages[0].albumCount, "crop 应取顶部 10 片")
 		assert.False(t, bot.messages[0].hasDoc, "crop 不再走文件附件")
-		assert.NotContains(t, bot.messages[0].text, "（长图过长，已截断）", "text 恒全文，附注不进 text")
-		assert.Equal(t, "（长图过长，已截断）", bot.messages[0].captionNote, "附注挂在 Message.CaptionNote")
+		assert.NotContains(t, bot.messages[0].text, "（长图过长，已截断）", "text 恒全文")
+		assert.Empty(t, bot.messages[0].captionNote, "三轮实测：截断附注已按用户要求移除")
 	})
 
 	t.Run("crop 配 photo_slices 压制片数", func(t *testing.T) {
@@ -1183,7 +1183,7 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 
 		require.Len(t, bot.messages, 1)
 		assert.Equal(t, 3, bot.messages[0].albumCount)
-		assert.Equal(t, "（长图过长，已截断）", bot.messages[0].captionNote)
+		assert.Empty(t, bot.messages[0].captionNote, "三轮实测：截断附注已移除")
 		assert.NotContains(t, bot.messages[0].text, "已截断", "text 恒全文")
 	})
 

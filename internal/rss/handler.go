@@ -965,14 +965,18 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 // [issue #16 二轮评审] 附注改为 SetCaptionNote 仅进 caption——text 恒为全文，
 // photo 永久失败降级纯文本时按 4096 发全文，附注不得污染。旧裸拼接实现保留备查：
 // text += "\n\n（长图过长，已截断）"（text 被污染且长 caption 下附注被截断吞掉）
+// [issue #16 三轮实测] 附注按用户要求移除（2026-10-10）：SetCaptionNote/附注常量
+// 不再于推送链路使用（infra 保留作通用能力），truncated 仅保留日志用途。
+// 旧附注实现保留备查：
+//
+//	if p.truncated {
+//		m := telegram.NewPhotoAlbumMessage(text, p.album)
+//		m.SetCaptionNote("（长图过长，已截断）")
+//		return m
+//	}
 func newDelivery(text string, p photoPayload) *telegram.Message {
 	if len(p.doc) > 0 {
 		return telegram.NewDocumentMessage(text, p.doc)
-	}
-	if p.truncated { // crop 预览相册注明截断（doc 判定在前，截断只可能伴随相册）
-		m := telegram.NewPhotoAlbumMessage(text, p.album)
-		m.SetCaptionNote("（长图过长，已截断）")
-		return m
 	}
 	if len(p.album) > 0 {
 		return telegram.NewPhotoAlbumMessage(text, p.album)
