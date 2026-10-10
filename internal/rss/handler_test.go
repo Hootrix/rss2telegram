@@ -1144,4 +1144,73 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		assert.Equal(t, 8, bot.messages[1].albumCount)
 		assert.NotSame(t, bot.messages[0].msg, bot.messages[1].msg, "各频道必须是独立 Message 实例（降级状态不跨频道串味）")
 	})
+
+	// [issue #16 用户反馈] photo_overlimit=crop：超限长图改发顶部切片相册预览 + 截断附注
+	t.Run("crop 超长图发顶部切片相册并注明截断", func(t *testing.T) {
+		// 100×25000：needed=⌈25000/1280⌉=20 > 10 → 默认走 doc；
+		// crop 改为取顶部 10×1280 相册 + caption 附注
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 25000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 10, bot.messages[0].albumCount, "crop 应取顶部 10 片")
+		assert.False(t, bot.messages[0].hasDoc, "crop 不再走文件附件")
+		assert.Contains(t, bot.messages[0].text, "（长图过长，已截断）", "crop 相册 caption 应注明截断")
+	})
+
+	t.Run("crop 配 photo_slices 压制片数", func(t *testing.T) {
+		// 200×9900：needed=8，photo_slices=3 → 8 > 3 超限 → crop 取顶部 3×1280 + 附注
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 200, 9900),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoSlices = 3
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 3, bot.messages[0].albumCount)
+		assert.Contains(t, bot.messages[0].text, "（长图过长，已截断）")
+	})
+
+	t.Run("photo_slices 宽松时完整相册无附注", func(t *testing.T) {
+		// 100×5000：needed=⌈5000/1280⌉=4 ≤ photo_slices=4 → 完整 4 片相册，无截断附注
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 5000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoSlices = 4
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 4, bot.messages[0].albumCount)
+		assert.NotContains(t, bot.messages[0].text, "已截断", "完整相册不应有截断附注")
+		assert.False(t, bot.messages[0].hasDoc)
+	})
+
+	t.Run("过宽图即便 crop 也走文件（不可切与 photoSlices 无关）", func(t *testing.T) {
+		// 9600×1000：chunkBounds 区间空（过宽不可切）→ 即使配置 crop 也维持整图文件
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 9600, 1000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasDoc, "过宽图不可切片，crop 也应走文件")
+		assert.Zero(t, bot.messages[0].albumCount)
+	})
 }

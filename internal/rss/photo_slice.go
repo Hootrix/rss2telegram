@@ -38,9 +38,14 @@ func chunkBounds(w int) (chunkMax, chunkMin int, ok bool) {
 	return chunkMax, chunkMin, chunkMax > 0 && chunkMax >= chunkMin
 }
 
-// fitsReadableAlbum [issue #16 CR] 用头部尺寸预判能否切成 ≤maxAlbumPhotos 张零压缩可读片
-// （不做解码，photoForItem 以此决定相册 vs 整图文件，避免切完再丢弃）
-func fitsReadableAlbum(w, h int) bool {
+// fitsReadableAlbum [issue #16 CR] 用头部尺寸预判能否切成 ≤maxPieces 张零压缩可读片
+// （不做解码，photoForItem 以此决定相册 vs 整图文件，避免切完再丢弃）。
+// [issue #16 用户反馈] maxPieces 参数化（photo_slices 配置）：n > maxPieces 即不可读；
+// 内部仍钳 maxAlbumPhotos 防御（调用方传超硬上限值时按硬上限判定）
+func fitsReadableAlbum(w, h int, maxPieces int) bool {
+	if maxPieces > maxAlbumPhotos {
+		maxPieces = maxAlbumPhotos
+	}
 	chunkMax, chunkMin, ok := chunkBounds(w)
 	if !ok {
 		return false
@@ -49,7 +54,7 @@ func fitsReadableAlbum(w, h int) bool {
 		return false
 	}
 	n := (h + chunkMax - 1) / chunkMax
-	if n > maxAlbumPhotos {
+	if n > maxPieces {
 		return false
 	}
 	return h/n >= chunkMin // 均匀切分后最低片仍须合法（如 9500×600）
@@ -75,8 +80,9 @@ func checkPixelBudget(w, h int) error {
 // DecodeConfig 头部先行像素预检（全量解码前拦截超大位图），
 // 解码失败（webp/损坏/未注册格式）返回 error，由调用方回退下一候选。
 // 全程持 sliceSem 串行（DecodeConfig+Decode+sliceImage）：解码位图峰值内存是
-// 串行化的原因，见 sliceSem 注释
-func slicePhoto(data []byte) ([][]byte, bool, error) {
+// 串行化的原因，见 sliceSem 注释。
+// [issue #16 用户反馈] maxPieces：相册切片上限（photo_slices），语义见 sliceImage
+func slicePhoto(data []byte, maxPieces int) ([][]byte, bool, error) {
 	sliceSem <- struct{}{}
 	defer func() { <-sliceSem }()
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
@@ -90,7 +96,7 @@ func slicePhoto(data []byte) ([][]byte, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("slice photo: decode: %w", err)
 	}
-	return sliceImage(img)
+	return sliceImage(img, maxPieces)
 }
 
 // sliceImage 将已解码位图按片高均匀切段重编码。
@@ -98,10 +104,21 @@ func slicePhoto(data []byte) ([][]byte, bool, error) {
 // 比例与可读压缩三项，由 chunkBounds 统一给出，issue #16 CR）；
 // 切片触发（调用方经 validatePhoto 判定超限）时 n ≥ 2；限内图直接调用则自然产出单片，
 // 由调用方决定单图/相册路径（TestSliceImageTransparentPNG 即单片例证）。
-// 超过 maxAlbumPhotos 片时截尾（truncated=true）。CR 裁决：handler 预检
-// （fitsReadableAlbum）已把切不出可读相册的图分派为整图文件，此截尾路径
-// 仅作防御保留，正常流不可达
-func sliceImage(img image.Image) ([][]byte, bool, error) {
+// [issue #16 用户反馈] maxPieces：相册切片上限（photo_slices，handler 侧保证 2-10），
+// 所需片数 n 超过 maxPieces 时截尾（truncated=true，取顶部 maxPieces 片）——
+// 该路径由 photo_overlimit=crop 正式启用；原实现硬编码 maxAlbumPhotos（注释保留：
+// truncated := n > maxAlbumPhotos / n = maxAlbumPhotos）。
+// 边界：maxPieces > 硬上限钳回 maxAlbumPhotos（防调用方传错击穿 sendMediaGroup）；
+// maxPieces < 1 防御性报错（config 校验已挡，这里兜底直接调用的调用方）
+func sliceImage(img image.Image, maxPieces int) ([][]byte, bool, error) {
+	// 上界钳制：sendMediaGroup 硬上限不可突破（原实现在下方截尾处硬编码 maxAlbumPhotos，
+	// 参数化后移到入口统一钳制，注释说明缘由）
+	if maxPieces > maxAlbumPhotos {
+		maxPieces = maxAlbumPhotos
+	}
+	if maxPieces < 1 {
+		return nil, false, fmt.Errorf("slice photo: maxPieces %d below 1", maxPieces)
+	}
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	// 入口像素守卫：slicePhoto 已预检过，这里兜底直接传位图的调用方
@@ -131,9 +148,11 @@ func sliceImage(img image.Image) ([][]byte, bool, error) {
 	}
 
 	n := (h + chunkMax - 1) / chunkMax
-	truncated := n > maxAlbumPhotos
+	// [issue #16 用户反馈] 原实现：truncated := n > maxAlbumPhotos（硬上限 10）；
+	// 参数化后以 maxPieces 为截断阈值，超限时取顶部 maxPieces 片
+	truncated := n > maxPieces
 	if truncated {
-		n = maxAlbumPhotos
+		n = maxPieces
 	}
 	// 均匀切分：n 段，前 rem 段 +1px；base=⌊h/n⌋
 	base := h / n
@@ -146,7 +165,8 @@ func sliceImage(img image.Image) ([][]byte, bool, error) {
 	var spans []span
 	if truncated {
 		// 截尾路径：片高固定取 chunkMax（不是 base），保证逐片 w+h 合规，尾部像素直接丢弃
-		for i := 0; i < maxAlbumPhotos; i++ {
+		// （原实现固定切满 maxAlbumPhotos 片，参数化后切满 maxPieces 片）
+		for i := 0; i < maxPieces; i++ {
 			spans = append(spans, span{b.Min.Y + i*chunkMax, b.Min.Y + (i+1)*chunkMax})
 		}
 	} else {

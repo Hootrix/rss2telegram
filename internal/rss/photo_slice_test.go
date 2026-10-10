@@ -36,11 +36,12 @@ func dims(t *testing.T, data []byte) (int, int) {
 
 func TestSlicePhoto(t *testing.T) {
 	// [issue #16 CR 可读性重构] 片高被 readableChunkHeight=1280 封顶（sendPhoto 服务端
-	// 压缩至长边 ~1280，片高 ≤1280 保证零二次缩放、文字零损失），所有期望按新数学重算
+	// 压缩至长边 ~1280，片高 ≤1280 保证零二次缩放、文字零损失），所有期望按新数学重算。
+	// [issue #16 用户反馈] slicePhoto/sliceImage 参数化 maxPieces（相册切片上限）
 	t.Run("w+h 超限长图切成多片且逐片合规", func(t *testing.T) {
 		// 200×9900：w+h=10100 触发；chunkMax=min(9800, 4000, 1280)=1280；n=⌈9900/1280⌉=8；
 		// base=1237 rem=4 → 4×1238 + 4×1237
-		chunks, truncated, err := slicePhoto(encodeGrad(t, 200, 9900))
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 200, 9900), maxAlbumPhotos)
 		require.NoError(t, err)
 		assert.False(t, truncated)
 		require.Len(t, chunks, 8)
@@ -62,7 +63,7 @@ func TestSlicePhoto(t *testing.T) {
 
 	t.Run("比例超限窄长条切为合规片", func(t *testing.T) {
 		// 100×5000：比例 50 > 20 触发；chunkMax=min(9900, 2000, 1280)=1280；n=4；base=1250
-		chunks, _, err := slicePhoto(encodeGrad(t, 100, 5000))
+		chunks, _, err := slicePhoto(encodeGrad(t, 100, 5000), maxAlbumPhotos)
 		require.NoError(t, err)
 		require.Len(t, chunks, 4)
 		for i, c := range chunks {
@@ -73,8 +74,8 @@ func TestSlicePhoto(t *testing.T) {
 
 	t.Run("恰好 10 片不截断", func(t *testing.T) {
 		// 100×12800：chunkMax=1280 → n=⌈12800/1280⌉=10，恰等 maxAlbumPhotos：
-		// truncated := n > maxAlbumPhotos 的 off-by-one 守护（误写 >= 此用例必红）
-		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 12800))
+		// truncated := n > maxPieces 的 off-by-one 守护（误写 >= 此用例必红）
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 12800), maxAlbumPhotos)
 		require.NoError(t, err)
 		assert.False(t, truncated)
 		require.Len(t, chunks, maxAlbumPhotos)
@@ -90,8 +91,9 @@ func TestSlicePhoto(t *testing.T) {
 
 	t.Run("超过 10 片截尾并置 truncated", func(t *testing.T) {
 		// 100×25000：chunkMax=1280；n=⌈25000/1280⌉=20 > 10 → 10×1280，尾部 12200 丢弃
-		// （CR 裁决：该截尾路径仅作 sliceImage 防御保留，handler 预检已把此类图分派为整图文件）
-		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 25000))
+		// （issue #16 用户反馈起：该截尾路径由 photo_overlimit=crop 正式启用，
+		// 不再仅是防御保留）
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 25000), maxAlbumPhotos)
 		require.NoError(t, err)
 		assert.True(t, truncated)
 		assert.Len(t, chunks, maxAlbumPhotos)
@@ -101,33 +103,71 @@ func TestSlicePhoto(t *testing.T) {
 		}
 	})
 
+	t.Run("maxPieces=3 压制原 4 片场景为 3 片并截断", func(t *testing.T) {
+		// [issue #16 用户反馈] 100×5000 本可切 4 片（n=4）；上限压到 3 →
+		// truncated=true，取顶部 3×1280（截尾片高固定 chunkMax），尾部 1160 丢弃
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 5000), 3)
+		require.NoError(t, err)
+		assert.True(t, truncated)
+		require.Len(t, chunks, 3)
+		for i, c := range chunks {
+			_, h := dims(t, c)
+			assert.Equal(t, 1280, h, "截尾片 %d 高度应固定 chunkMax", i)
+		}
+	})
+
+	t.Run("maxPieces=4 恰等于 needed 不截断", func(t *testing.T) {
+		// 100×5000：n=4 恰等上限 → 走均匀切分（非截尾），4×1250 拼回原高
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 5000), 4)
+		require.NoError(t, err)
+		assert.False(t, truncated)
+		require.Len(t, chunks, 4)
+		total := 0
+		for _, c := range chunks {
+			_, h := dims(t, c)
+			total += h
+		}
+		assert.Equal(t, 5000, total)
+	})
+
+	t.Run("maxPieces 上界钳制与下界防御", func(t *testing.T) {
+		// 上界：传 >10 被钳回 maxAlbumPhotos（100×12800 恰 10 片不截断）
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 12800), 99)
+		require.NoError(t, err)
+		assert.False(t, truncated)
+		assert.Len(t, chunks, maxAlbumPhotos)
+		// 下界：<1 防御性报错（handler 侧 config 校验已保证 2-10，此处兜底直接调用的调用方）
+		_, _, err = slicePhoto(encodeGrad(t, 100, 5000), 0)
+		assert.ErrorContains(t, err, "maxPieces")
+	})
+
 	t.Run("w 过大无合法片高区间降级", func(t *testing.T) {
 		// 9600×1000：chunkMax=min(400, 192000, 1280)=400 < chunkMin=480 → 区间空
-		_, _, err := slicePhoto(encodeGrad(t, 9600, 1000))
+		_, _, err := slicePhoto(encodeGrad(t, 9600, 1000), maxAlbumPhotos)
 		assert.ErrorContains(t, err, "chunk")
 	})
 
 	t.Run("均匀切分后片高低于下限不可分区", func(t *testing.T) {
 		// 9500×600：区间 [475,500] 非空但 600 无法分为合法段（n=2 → base=300 < 475）
-		_, _, err := slicePhoto(encodeGrad(t, 9500, 600))
+		_, _, err := slicePhoto(encodeGrad(t, 9500, 600), maxAlbumPhotos)
 		assert.ErrorContains(t, err, "partition")
 	})
 
 	t.Run("像素超 40MP 拒绝", func(t *testing.T) {
 		// 直接测 sliceImage：无需真解码 40MP 字节（10000×10001 = 100,010,000 > 40MP）
-		_, _, err := sliceImage(image.NewGray(image.Rect(0, 0, 10000, 10001)))
+		_, _, err := sliceImage(image.NewGray(image.Rect(0, 0, 10000, 10001)), maxAlbumPhotos)
 		assert.ErrorContains(t, err, "pixels")
 	})
 
 	t.Run("宽低于短边下限拒绝（切片只会更窄）", func(t *testing.T) {
 		// 外部 CR：切片是纵向切，片宽=图宽，w < 50 的图切出来仍不可用；
 		// validatePhoto 已在 fetch 路径拦截，此处兜底直接传位图的调用方
-		_, _, err := sliceImage(image.NewGray(image.Rect(0, 0, 40, 200)))
+		_, _, err := sliceImage(image.NewGray(image.Rect(0, 0, 40, 200)), maxAlbumPhotos)
 		assert.ErrorContains(t, err, "below minimum side")
 	})
 
 	t.Run("损坏数据解码失败", func(t *testing.T) {
-		_, _, err := slicePhoto([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0})
+		_, _, err := slicePhoto([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0}, maxAlbumPhotos)
 		assert.ErrorContains(t, err, "decode")
 	})
 }
@@ -140,7 +180,7 @@ func TestSliceImageTransparentPNG(t *testing.T) {
 			img.SetNRGBA(x, y, color.NRGBA{}) // 透明
 		}
 	}
-	chunks, _, err := sliceImage(img)
+	chunks, _, err := sliceImage(img, maxAlbumPhotos)
 	require.NoError(t, err)
 	require.Len(t, chunks, 1)
 	parsed, err := jpeg.Decode(bytes.NewReader(chunks[0]))
@@ -151,22 +191,29 @@ func TestSliceImageTransparentPNG(t *testing.T) {
 	assert.Equal(t, uint32(0xFFFF), b)
 }
 
-// issue #16 CR 可读性重构：fitsReadableAlbum 用头部尺寸预判「能否切成 ≤10 张
-// 零压缩可读片」，photoForItem 以此决定相册 vs 整图文件（避免切完再丢弃）
+// issue #16 CR 可读性重构：fitsReadableAlbum 用头部尺寸预判「能否切成 ≤maxPieces 张
+// 零压缩可读片」，photoForItem 以此决定相册 vs 整图文件（避免切完再丢弃）；
+// [issue #16 用户反馈] maxPieces 参数化（photo_slices 配置）
 func TestFitsReadableAlbum(t *testing.T) {
 	// 1080×12112：chunkMax=1280，n=ceil(12112/1280)=10 恰好 ≤10；末片 1211 ≥ 片高下限 54
-	assert.True(t, fitsReadableAlbum(1080, 12112))
+	assert.True(t, fitsReadableAlbum(1080, 12112, maxAlbumPhotos))
 	// 1080×3363：n=3，每片 1121
-	assert.True(t, fitsReadableAlbum(1080, 3363))
-	// 4000×10000：像素恰 40MP 限内（任务原拟 4000×11000=44MP 超像素预算，按数学修正）；
-	// chunkMax=1280，n=8；末片 1250 ≥ 下限 200
-	assert.True(t, fitsReadableAlbum(4000, 10000))
+	assert.True(t, fitsReadableAlbum(1080, 3363, maxAlbumPhotos))
+	// 4000×10000：像素恰 40MP 限内；chunkMax=1280，n=8；末片 1250 ≥ 下限 200
+	assert.True(t, fitsReadableAlbum(4000, 10000, maxAlbumPhotos))
 	// 1080×33634：像素 36.3MP ≤ 40MP 限内，但 n=27 > 10 → 不可读相册，走整图文件
-	assert.False(t, fitsReadableAlbum(1080, 33634))
+	assert.False(t, fitsReadableAlbum(1080, 33634, maxAlbumPhotos))
 	// 9600×1000：chunkMax=400 < chunkMin=480，区间空（过宽图不可切片）
-	assert.False(t, fitsReadableAlbum(9600, 1000))
+	assert.False(t, fitsReadableAlbum(9600, 1000, maxAlbumPhotos))
 	// 9500×600：区间 [475,500] 非空但 n=2 均分后 base=300 < 475
-	assert.False(t, fitsReadableAlbum(9500, 600))
+	assert.False(t, fitsReadableAlbum(9500, 600, maxAlbumPhotos))
 	// 4000×15000：n=12 > 10
-	assert.False(t, fitsReadableAlbum(4000, 15000))
+	assert.False(t, fitsReadableAlbum(4000, 15000, maxAlbumPhotos))
+
+	// [issue #16 用户反馈] maxPieces 生效：同一尺寸随上限收紧而翻转
+	// 1080×12112：n=10 ≤ 10 → 默认上限可读；压到 3 → 10 > 3 不可读
+	assert.True(t, fitsReadableAlbum(1080, 12112, 10))
+	assert.False(t, fitsReadableAlbum(1080, 12112, 3))
+	// 1080×33634：n=27 连默认上限 10 都超
+	assert.False(t, fitsReadableAlbum(1080, 33634, 10))
 }

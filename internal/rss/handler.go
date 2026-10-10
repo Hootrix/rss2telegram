@@ -796,14 +796,16 @@ func (h *RssHandler) snapshotForItem(ctx context.Context, feedConfig config.Feed
 }
 
 // photoPayload [issue #16] item 级图片载荷：单图/相册/文件互斥，零值走纯文本。
-// CR 修订（2026-10-10）：原「>10 片截尾+附注」路径废弃——sendPhoto 服务端压缩至
+// CR 修订（2026-10-10）：原「>10 片截尾+附注」路径曾废弃——sendPhoto 服务端压缩至
 // 长边 ~1280px，超长切片不可读；改整图 sendDocument（doc），零信息损失。
-// 废弃字段保留备查：
-// truncated bool // 超 maxAlbumPhotos 截尾
+// [issue #16 用户反馈] truncated 字段恢复（两轮历史：issue #16 初版有→CR 废弃→
+// 用户反馈恢复）：photo_overlimit=crop 时超限长图改发「顶部切片预览相册」，
+// caption 需注明截断，truncated 标记该附注（普通完整相册恒 false）
 type photoPayload struct {
-	photo []byte   // 限内单图（或切片单片，数学上不可达，防御保留）
-	album [][]byte // 可读切片 ≤10 张（每片长边 ≤1280）
-	doc   []byte   // 超限整图文件（不可读切片 / w 过宽 / 像素超限）
+	photo     []byte   // 限内单图（或切片单片，数学上不可达，防御保留）
+	album     [][]byte // 可读切片 ≤10 张（每片长边 ≤1280）
+	doc       []byte   // 超限整图文件（不可读切片 / w 过宽 / 像素超限）
+	truncated bool     // crop 预览相册截断标记（issue #16 用户反馈恢复，见上）
 }
 
 // photoForItem [issue #13/16] 仅 media=photo 时按候选顺序下载图片：
@@ -837,7 +839,10 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 		if err := validatePhoto(data); err != nil {
 			// [issue #16 CR] 尺寸类失败：预检可读切片 → 相册；不可读 → 整图文件（胜出，
 			// 不回退后续候选——文件已完整承载内容）；切片解码失败 → 回退下一候选。
-			// 旧实现（截尾相册）保留备查：
+			// [issue #16 用户反馈] 分派按 feed 级 photo_slices/photo_overlimit 重排：
+			// needed ≤ photoSlices → 完整相册；needed > photoSlices 时 crop=顶部切片
+			// 预览+截断附注、document（默认）=整图文件。
+			// 旧实现（截尾相册，issue #16 初版）保留备查：
 			// chunks, truncated, serr := slicePhoto(data)
 			// if serr != nil { ... continue }
 			// if truncated { log "photo sliced with tail dropped..." }
@@ -850,17 +855,35 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 				if !errors.As(err, &dimErr) { // isDimensionError 已保证可达，防御性兜底
 					continue
 				}
-				if !fitsReadableAlbum(dimErr.w, dimErr.h) {
+				slices := feedConfig.EffectivePhotoSlices() // 未配置回退默认 10
+				if !fitsReadableAlbum(dimErr.w, dimErr.h, slices) {
+					// 切不满 photoSlices 张可读片。crop 只对「可切片」的图生效：
+					// 过宽（chunkBounds 区间空）或像素超 40MP 的图物理切不出合规片，
+					// 与 photoSlices 无关，维持整图文件（现状）。document（默认）= 整图文件
+					// （int64 乘积防 32 位平台溢出，同 checkPixelBudget）
+					_, _, boundsOk := chunkBounds(dimErr.w)
+					cropable := boundsOk && int64(dimErr.w)*int64(dimErr.h) <= maxPhotoPixels
+					if feedConfig.PhotoOverlimit == config.PhotoOverlimitCrop && cropable {
+						chunks, truncated, serr := slicePhoto(data, slices)
+						if serr != nil {
+							// 均分不可分区（如 9500×600 连完整相册都切不出，截尾也救不了
+							// 非截尾路径的均分检查）/数据损坏 → 回退下一候选
+							log.Printf("photo slice failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, serr)
+							continue
+						}
+						log.Printf("photo over-limit cropped preview, feed %s item %q url %s: %d/%d chunks", feedConfig.Name, item.Title, u, len(chunks), slices)
+						return photoPayload{album: chunks, truncated: truncated}
+					}
 					log.Printf("photo over readable album limit, sending as document, feed %s item %q url %s (%dx%d)", feedConfig.Name, item.Title, u, dimErr.w, dimErr.h)
 					return photoPayload{doc: data}
 				}
-				chunks, truncated, serr := slicePhoto(data)
+				chunks, truncated, serr := slicePhoto(data, slices)
 				if serr != nil {
 					// 预检后仍失败（图片声明合规但数据损坏）→ 回退下一候选
 					log.Printf("photo slice failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, serr)
 					continue
 				}
-				if truncated { // 防御：预检已保证 ≤10 片，不变量破坏时宁发文件不截尾
+				if truncated { // 防御：预检已保证 ≤slices 片，不变量破坏时宁发文件不截尾
 					log.Printf("photo slice unexpectedly truncated, sending as document, feed %s item %q url %s", feedConfig.Name, item.Title, u)
 					return photoPayload{doc: data}
 				}
@@ -906,21 +929,17 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 
 // newDelivery [issue #16] 按载荷形态构造频道消息：文件 > 相册 > 单图 > 纯文本；
 // 每 (item,channel) 调用一次保证 Message 实例独立（降级状态不跨频道串味）。
-// CR 修订（2026-10-10）：截断附注随截尾路径一并废弃——截尾不再发生，
-// 超限图改发整图文件零信息损失。旧实现保留备查：
+// CR 修订（2026-10-10）曾废弃截断附注——截尾不再发生，超限图改发整图文件；
+// [issue #16 用户反馈] 附注恢复：photo_overlimit=crop 的预览相册非完整内容，
+// caption 必须注明截断（普通完整相册 truncated=false 不受影响）。废弃期实现保留备查：
 //
-//	if p.truncated {
-//		text += "\n\n（长图过长，已截断）"
-//	}
-//
-//	if len(p.album) > 0 {
-//		return telegram.NewPhotoAlbumMessage(text, p.album)
-//	}
-//
-// return telegram.NewPhotoMessage(text, p.photo)
+//	（无 truncated 附注，crop 路径不存在）
 func newDelivery(text string, p photoPayload) *telegram.Message {
 	if len(p.doc) > 0 {
 		return telegram.NewDocumentMessage(text, p.doc)
+	}
+	if p.truncated { // crop 预览相册注明截断（doc 判定在前，截断只可能伴随相册）
+		text += "\n\n（长图过长，已截断）"
 	}
 	if len(p.album) > 0 {
 		return telegram.NewPhotoAlbumMessage(text, p.album)
