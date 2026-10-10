@@ -35,15 +35,19 @@ func dims(t *testing.T, data []byte) (int, int) {
 }
 
 func TestSlicePhoto(t *testing.T) {
+	// [issue #16 CR 可读性重构] 片高被 readableChunkHeight=1280 封顶（sendPhoto 服务端
+	// 压缩至长边 ~1280，片高 ≤1280 保证零二次缩放、文字零损失），所有期望按新数学重算
 	t.Run("w+h 超限长图切成多片且逐片合规", func(t *testing.T) {
-		// 200×9900：w+h=10100 触发；chunkMax=min(9800, 4000)=4000；n=3；base=3300
+		// 200×9900：w+h=10100 触发；chunkMax=min(9800, 4000, 1280)=1280；n=⌈9900/1280⌉=8；
+		// base=1237 rem=4 → 4×1238 + 4×1237
 		chunks, truncated, err := slicePhoto(encodeGrad(t, 200, 9900))
 		require.NoError(t, err)
 		assert.False(t, truncated)
-		require.Len(t, chunks, 3)
+		require.Len(t, chunks, 8)
 		for i, c := range chunks {
 			w, h := dims(t, c)
 			assert.Equal(t, 200, w)
+			assert.LessOrEqual(t, h, readableChunkHeight, "片 %d 超可读片高上限", i)
 			assert.LessOrEqual(t, w+h, maxPhotoSideSum, "片 %d 超 w+h", i)
 			assert.GreaterOrEqual(t, h, (200+maxPhotoRatio-1)/maxPhotoRatio, "片 %d 低于片高下限", i)
 		}
@@ -57,16 +61,20 @@ func TestSlicePhoto(t *testing.T) {
 	})
 
 	t.Run("比例超限窄长条切为合规片", func(t *testing.T) {
-		// 100×5000：比例 50 > 20 触发；chunkMax=min(9900,2000)=2000；n=3；base=1666/1667
+		// 100×5000：比例 50 > 20 触发；chunkMax=min(9900, 2000, 1280)=1280；n=4；base=1250
 		chunks, _, err := slicePhoto(encodeGrad(t, 100, 5000))
 		require.NoError(t, err)
-		require.Len(t, chunks, 3)
+		require.Len(t, chunks, 4)
+		for i, c := range chunks {
+			_, h := dims(t, c)
+			assert.Equal(t, 1250, h, "片 %d 应为均分 1250", i)
+		}
 	})
 
 	t.Run("恰好 10 片不截断", func(t *testing.T) {
-		// 100×20000：chunkMax=min(9900,2000)=2000 → n=⌈20000/2000⌉=10，恰等 maxAlbumPhotos：
+		// 100×12800：chunkMax=1280 → n=⌈12800/1280⌉=10，恰等 maxAlbumPhotos：
 		// truncated := n > maxAlbumPhotos 的 off-by-one 守护（误写 >= 此用例必红）
-		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 20000))
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 12800))
 		require.NoError(t, err)
 		assert.False(t, truncated)
 		require.Len(t, chunks, maxAlbumPhotos)
@@ -74,26 +82,27 @@ func TestSlicePhoto(t *testing.T) {
 		for i, c := range chunks {
 			w, h := dims(t, c)
 			assert.Equal(t, 100, w)
-			assert.Equal(t, 2000, h, "片 %d 高度应为满额 chunkMax", i)
+			assert.Equal(t, 1280, h, "片 %d 高度应为满额 chunkMax", i)
 			total += h
 		}
-		assert.Equal(t, 20000, total, "各片拼回总高")
+		assert.Equal(t, 12800, total, "各片拼回总高")
 	})
 
 	t.Run("超过 10 片截尾并置 truncated", func(t *testing.T) {
-		// 100×25000：chunkMax=2000；n=13 > 10 → 10×2000，尾部 5000 丢弃
+		// 100×25000：chunkMax=1280；n=⌈25000/1280⌉=20 > 10 → 10×1280，尾部 12200 丢弃
+		// （CR 裁决：该截尾路径仅作 sliceImage 防御保留，handler 预检已把此类图分派为整图文件）
 		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 25000))
 		require.NoError(t, err)
 		assert.True(t, truncated)
 		assert.Len(t, chunks, maxAlbumPhotos)
 		for _, c := range chunks {
 			_, h := dims(t, c)
-			assert.Equal(t, 2000, h)
+			assert.Equal(t, 1280, h)
 		}
 	})
 
 	t.Run("w 过大无合法片高区间降级", func(t *testing.T) {
-		// 9600×1000：chunkMax=min(400, 192000)=400 < chunkMin=480 → 区间空
+		// 9600×1000：chunkMax=min(400, 192000, 1280)=400 < chunkMin=480 → 区间空
 		_, _, err := slicePhoto(encodeGrad(t, 9600, 1000))
 		assert.ErrorContains(t, err, "chunk")
 	})
@@ -140,4 +149,24 @@ func TestSliceImageTransparentPNG(t *testing.T) {
 	assert.Equal(t, uint32(0xFFFF), r, "透明区应填白")
 	assert.Equal(t, uint32(0xFFFF), g)
 	assert.Equal(t, uint32(0xFFFF), b)
+}
+
+// issue #16 CR 可读性重构：fitsReadableAlbum 用头部尺寸预判「能否切成 ≤10 张
+// 零压缩可读片」，photoForItem 以此决定相册 vs 整图文件（避免切完再丢弃）
+func TestFitsReadableAlbum(t *testing.T) {
+	// 1080×12112：chunkMax=1280，n=ceil(12112/1280)=10 恰好 ≤10；末片 1211 ≥ 片高下限 54
+	assert.True(t, fitsReadableAlbum(1080, 12112))
+	// 1080×3363：n=3，每片 1121
+	assert.True(t, fitsReadableAlbum(1080, 3363))
+	// 4000×10000：像素恰 40MP 限内（任务原拟 4000×11000=44MP 超像素预算，按数学修正）；
+	// chunkMax=1280，n=8；末片 1250 ≥ 下限 200
+	assert.True(t, fitsReadableAlbum(4000, 10000))
+	// 1080×33634：像素 36.3MP ≤ 40MP 限内，但 n=27 > 10 → 不可读相册，走整图文件
+	assert.False(t, fitsReadableAlbum(1080, 33634))
+	// 9600×1000：chunkMax=400 < chunkMin=480，区间空（过宽图不可切片）
+	assert.False(t, fitsReadableAlbum(9600, 1000))
+	// 9500×600：区间 [475,500] 非空但 n=2 均分后 base=300 < 475
+	assert.False(t, fitsReadableAlbum(9500, 600))
+	// 4000×15000：n=12 > 10
+	assert.False(t, fitsReadableAlbum(4000, 15000))
 }

@@ -44,6 +44,9 @@ type Message struct {
 	// photos 相册切片（issue #16）：非空 → sendMediaGroup；与 photo 互斥，
 	// photo 永久失败降级同时置空两者。切片字节跨频道只读共享
 	photos [][]byte
+	// doc 超限长图整图文件（issue #16 CR：不压缩无尺寸限制）；与 photo/photos 互斥，
+	// 永久失败降级同置空。字节跨频道只读共享
+	doc []byte
 	// captionPlain caption 的 markdown 降级，与 plain 分离：
 	// caption 解析失败常由 1024 截断切断实体引起，是 caption 独有问题；
 	// 共用 plain 会让图片失败降级后的全文无辜走 plain、丢失格式（issue #13）
@@ -74,6 +77,14 @@ func NewPhotoAlbumMessage(text string, photos [][]byte) *Message {
 	return &Message{text: text, photos: photos}
 }
 
+// NewDocumentMessage 文件消息（issue #16 CR）：doc 为原图字节（≤10MB 已在下载层保证）
+func NewDocumentMessage(text string, doc []byte) *Message {
+	if len(doc) == 0 {
+		return NewMessage(text)
+	}
+	return &Message{text: text, doc: doc}
+}
+
 // Text 只读访问原始消息文本，供跨包（rss 集成测试等）断言内容
 func (m *Message) Text() string { return m.text }
 
@@ -82,6 +93,9 @@ func (m *Message) HasPhoto() bool { return len(m.photo) > 0 }
 
 // HasAlbum 是否仍为相册消息（issue #16，跨包断言发送/降级路径用）
 func (m *Message) HasAlbum() bool { return len(m.photos) > 0 }
+
+// HasDoc 是否仍为文件消息（issue #16 CR）
+func (m *Message) HasDoc() bool { return len(m.doc) > 0 }
 
 // AlbumCount 相册切片张数（issue #16，跨包断言用）
 func (m *Message) AlbumCount() int { return len(m.photos) }
@@ -270,7 +284,7 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 // 重试放大（photo 路径）：单次 Send 最坏 4 次 API（photo md → photo plain →
 // text md → text plain，其中最多 2 次 ≤10MB 上传）；叠加外层 8 次 Send（普通 3 + flood 5）
 // 最坏 32 次调用 / 16 次上传，仅瞬态错误持续叠加时出现（纯文本现状最坏 16 次，可接受）；
-// album 路径同构（issue #16）
+// album 路径同构（issue #16）；document 路径（issue #16 CR）与两者同构
 func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64, error) {
 	if channel == "" {
 		return 0, errors.New("telegram: empty channel")
@@ -288,6 +302,26 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 		return 0, fmt.Errorf("create telegram sender: %w", err)
 	}
 	recipient := newChannelRecipient(channel)
+
+	// [issue #16 CR] document 路径：超限长图整图发送（不压缩无尺寸限制），
+	// 失败分类与 photo/album 同构
+	if len(message.doc) > 0 {
+		sent, err := sendDocumentOnce(sender, recipient, message)
+		if err == nil {
+			return int64(sent.ID), nil
+		}
+		if isParseEntitiesError(err) && !message.captionPlain {
+			message.captionPlain = true
+			log.Printf("document caption parse failed, retrying document with plain caption")
+			sent, err = sendDocumentOnce(sender, recipient, message)
+			if err == nil {
+				return int64(sent.ID), nil
+			}
+		}
+		if ferr := handlePhotoFailure(message, err, "document"); ferr != nil {
+			return 0, b.sendError(ctx, ferr)
+		}
+	}
 
 	// [issue #16] album 路径：与 photo 分支同构的失败分类——
 	// 成功返回首条 message_id；parse 400 → captionPlain 重试一次；
@@ -400,14 +434,14 @@ func handlePhotoFailure(message *Message, err error, kind string) error {
 	}
 	if isPhotoPermanentError(err) {
 		log.Printf("%s send failed permanently, falling back to text message: %v", kind, err)
-		message.photo, message.photos = nil, nil
+		message.photo, message.photos, message.doc = nil, nil, nil // doc 同置空（issue #16 CR，三者互斥）
 		return nil
 	}
 	if message.photoTransientFails >= maxPhotoTransientFails-1 {
 		// 保险丝（外部 CR，#13 引入）：持续瞬态失败会耗尽 sendWithRetry 预算
 		// 饿死整个 feed，达阈值放弃图片降级全文，文本成功即标 seen 解卡
 		log.Printf("%s transiently failed %d times, giving up and falling back to text: %v", kind, message.photoTransientFails+1, err)
-		message.photo, message.photos = nil, nil
+		message.photo, message.photos, message.doc = nil, nil, nil // doc 同置空（issue #16 CR，三者互斥）
 		return nil
 	}
 	message.photoTransientFails++
@@ -444,6 +478,34 @@ func sendAlbumOnce(sender *tele.Bot, recipient tele.Recipient, message *Message)
 		return tele.Message{}, errors.New("telegram: empty album response")
 	}
 	return sent[0], nil
+}
+
+// sendDocumentOnce [issue #16 CR] 单次文件发送尝试。文件名按字节嗅探生成
+// （FromReader 不带名，无名文件在客户端展示为无法预览的裸文件）；
+// caption 语义与 photo 相同
+func sendDocumentOnce(sender *tele.Bot, recipient tele.Recipient, message *Message) (tele.Message, error) {
+	caption := message.text
+	if message.captionPlain {
+		caption = tgmd.Unescape(caption)
+	}
+	caption = truncateCaption(caption)
+	options := &tele.SendOptions{}
+	if !message.captionPlain {
+		options.ParseMode = tele.ModeMarkdown
+	}
+	name := "long-image.bin"
+	switch ct := http.DetectContentType(message.doc); ct {
+	case "image/jpeg":
+		name = "long-image.jpg"
+	case "image/png":
+		name = "long-image.png"
+	}
+	doc := &tele.Document{File: tele.FromReader(bytes.NewReader(message.doc)), FileName: name, Caption: caption}
+	sent, err := sender.Send(recipient, doc, options)
+	if err != nil {
+		return tele.Message{}, err
+	}
+	return *sent, nil
 }
 
 // isPhotoPermanentError 图片层面永久失败（尺寸/格式/权限/实体过大）：

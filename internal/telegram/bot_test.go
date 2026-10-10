@@ -43,6 +43,8 @@ type fakeTG struct {
 	albumFail500        bool        // sendMediaGroup 恒返回 500（瞬态失败）
 	albumFail429        bool        // sendMediaGroup 恒返回 429 + retry_after（外部 CR：429 不得计入保险丝）
 	albumFailCaption400 bool        // 首次 sendMediaGroup 返回 parse entities 400
+	docs                []docSend   // 每次 sendDocument 的字段与文件字节（issue #16 CR）
+	docFail400          bool        // sendDocument 恒返回 400（永久失败）
 	server              *httptest.Server
 }
 
@@ -65,6 +67,16 @@ type albumMedia struct {
 	Media     string `json:"media"`
 	Caption   string `json:"caption"`
 	ParseMode string `json:"parse_mode"`
+}
+
+// docSend 记录一次 sendDocument 请求的关键字段（issue #16 CR）。
+// 与 sendPhoto 的 FromReader 陷阱不同：tele.Document.MediaFile 会把 FileName 写入
+// File.fileName，multipart 文件部件的 filename 为 "long-image.*"，可直接从文件部件取
+type docSend struct {
+	caption   string
+	parseMode string
+	fileName  string // multipart 文件部件 filename（telebot 由 Document.FileName 填写）
+	data      []byte
 }
 
 func newFakeTG(failFirst bool) *fakeTG {
@@ -217,6 +229,44 @@ func newFakeTG(failFirst bool) *fakeTG {
 				}
 			}
 			writeFakeJSON(w, map[string]any{"ok": true, "result": results})
+		case "sendDocument":
+			// [issue #16 CR] 整图文件路径：文件部件字段名 "document"（telebot sendMedia
+			// 以 MediaType 作为端点与字段名），multipart filename 已由 Document.FileName 填写。
+			// 与 photo 同款陷阱保留：取不到文件部件时回退 FormValue("document")
+			ds := docSend{}
+			if err := r.ParseMultipartForm(64 << 20); err == nil && r.MultipartForm != nil {
+				ds.caption = r.FormValue("caption")
+				ds.parseMode = r.FormValue("parse_mode")
+				if files := r.MultipartForm.File["document"]; len(files) > 0 {
+					ds.fileName = files[0].Filename
+					fh, _ := files[0].Open()
+					b, _ := io.ReadAll(fh)
+					_ = fh.Close()
+					ds.data = b
+				} else if v := r.FormValue("document"); v != "" {
+					ds.data = []byte(v)
+				}
+			}
+			f.mu.Lock()
+			f.docs = append(f.docs, ds)
+			docFail400 := f.docFail400
+			f.mu.Unlock()
+
+			if docFail400 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: DOCUMENT_INVALID"}`))
+				return
+			}
+			// 成功响应形态与 sendMessage 相同（result 带 message_id/text）
+			writeFakeJSON(w, map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"message_id": 1,
+					"chat":       map[string]any{"id": -1009999, "type": "channel"},
+					"date":       1,
+					"text":       ds.caption,
+				},
+			})
 		case "sendMessage":
 			body, _ := io.ReadAll(r.Body)
 			var m map[string]any
@@ -296,6 +346,12 @@ func (f *fakeTG) albums_() []albumSend {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]albumSend{}, f.albums...)
+}
+
+func (f *fakeTG) docs_() []docSend {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]docSend{}, f.docs...)
 }
 
 func writeFakeJSON(w http.ResponseWriter, v any) {
@@ -1096,4 +1152,56 @@ func TestSendAlbum429NotCountedIntoFuse(t *testing.T) {
 	assert.True(t, errors.As(err, &rl), "429 应包装为 RateLimitError 交外层冷却")
 	assert.True(t, m.HasAlbum(), "429 不得置空相册")
 	assert.Zero(t, m.photoTransientFails, "429 不得计入保险丝")
+}
+
+// issue #16 CR：document 成功路径——文件字节原样上传、文件名按字节嗅探、
+// caption/parse_mode 语义与 photo 相同、msgID 取自成功响应
+func TestSendDocumentSuccess(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	// png 魔数 + 填充：http.DetectContentType 判 image/png → 文件名 long-image.png（稳定，
+	// 最小 JPEG 头嗅探不可靠，见 http.DetectContentType 对 JPEG 需完整 SOI+APP0 标记）
+	img := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 64)...)
+	m := NewDocumentMessage("*标题*", img)
+	msgID, err := b.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	docs := f.docs_()
+	require.Len(t, docs, 1)
+	assert.Equal(t, "long-image.png", docs[0].fileName, "文件名应按字节嗅探生成")
+	assert.Equal(t, img, docs[0].data, "文件字节应与原图一致")
+	assert.Equal(t, "*标题*", docs[0].caption, "caption 首挂")
+	assert.Equal(t, "Markdown", docs[0].parseMode)
+	assert.True(t, m.HasDoc(), "发送成功不改变 doc 状态")
+}
+
+// document 400 属永久失败：置空 doc 就地降级文本（与 photo/album 同构）
+func TestSendDocumentPermanent400FallsBackToText(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.docFail400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	img := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 64)...)
+	m := NewDocumentMessage("txt", img)
+	_, err = b.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err, "400 属永久失败，就地降级文本成功")
+	assert.False(t, m.HasDoc(), "doc 已置空")
+	assert.Len(t, f.docs_(), 1, "document 只尝试一次")
+	sends := f.sends_()
+	require.Len(t, sends, 1, "补发了一条文本消息")
+}
+
+// 边界：空字节等价 NewMessage（调用方免判空）
+func TestNewDocumentMessageEmpty(t *testing.T) {
+	assert.Equal(t, NewMessage("x").text, NewDocumentMessage("x", nil).text)
+	assert.False(t, NewDocumentMessage("x", nil).HasDoc())
 }

@@ -23,9 +23,39 @@ const (
 	// 注意：测试用 10000×10001 = 100_010,000 像素恰好超此阈值，故不能写成 40<<20（≈41.9MP）
 	maxPhotoPixels = 40_000_000
 
+	// readableChunkHeight [issue #16 CR] Telegram sendPhoto 服务端压缩至长边 ~1280（Bot API 无 HD 档，
+	// 查证 2026-10）；片高 ≤1280 保证片的长边不被二次缩放、文字零损失
+	readableChunkHeight = 1280
+
 	// 重编码质量：实测长截图 q85 单片 ≤1MB，远低于 10MB 上限
 	sliceJPEGQuality = 85
 )
+
+// chunkBounds [issue #16 CR] 给定宽度返回合法片高上下限（同时满足 w+h、比例、可读压缩三项）；
+// ok=false 表示该宽度不存在合法片高（过宽图不可切片）。
+// sliceImage 与 fitsReadableAlbum 预检共用，防两处数学漂移
+func chunkBounds(w int) (chunkMax, chunkMin int, ok bool) {
+	chunkMax = min(min(maxPhotoSideSum-w, maxPhotoRatio*w), readableChunkHeight)
+	chunkMin = (w + maxPhotoRatio - 1) / maxPhotoRatio
+	return chunkMax, chunkMin, chunkMax > 0 && chunkMax >= chunkMin
+}
+
+// fitsReadableAlbum [issue #16 CR] 用头部尺寸预判能否切成 ≤maxAlbumPhotos 张零压缩可读片
+// （不做解码，photoForItem 以此决定相册 vs 整图文件，避免切完再丢弃）
+func fitsReadableAlbum(w, h int) bool {
+	chunkMax, chunkMin, ok := chunkBounds(w)
+	if !ok {
+		return false
+	}
+	if w*h > maxPhotoPixels {
+		return false
+	}
+	n := (h + chunkMax - 1) / chunkMax
+	if n > maxAlbumPhotos {
+		return false
+	}
+	return h/n >= chunkMin // 均匀切分后最低片仍须合法（如 9500×600）
+}
 
 // sliceSem 切片全程串行：解码位图峰值大（40MP 16bit PNG ≈ 320MB），
 // ProcessFeeds 双 feed 并发叠加会击穿内存（CR），串行化把峰值钳到单图水平
@@ -66,10 +96,13 @@ func slicePhoto(data []byte) ([][]byte, bool, error) {
 }
 
 // sliceImage 将已解码位图按片高均匀切段重编码。
-// 片高合法区间 [⌈w/20⌉, min(10000−w, 20w)]（同时满足 w+h 与比例）；
+// 片高合法区间 [⌈w/20⌉, min(10000−w, 20w, readableChunkHeight)]（同时满足 w+h、
+// 比例与可读压缩三项，由 chunkBounds 统一给出，issue #16 CR）；
 // 切片触发（调用方经 validatePhoto 判定超限）时 n ≥ 2；限内图直接调用则自然产出单片，
 // 由调用方决定单图/相册路径（TestSliceImageTransparentPNG 即单片例证）。
-// 超过 maxAlbumPhotos 片时截尾（truncated=true，尾部像素丢弃由 caption 披露）
+// 超过 maxAlbumPhotos 片时截尾（truncated=true）。CR 裁决：handler 预检
+// （fitsReadableAlbum）已把切不出可读相册的图分派为整图文件，此截尾路径
+// 仅作防御保留，正常流不可达
 func sliceImage(img image.Image) ([][]byte, bool, error) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -77,11 +110,16 @@ func sliceImage(img image.Image) ([][]byte, bool, error) {
 	if err := checkPixelBudget(w, h); err != nil {
 		return nil, false, err
 	}
-	chunkMax := min(maxPhotoSideSum-w, maxPhotoRatio*w)
-	chunkMin := (w + maxPhotoRatio - 1) / maxPhotoRatio
-	if chunkMax <= 0 || chunkMax < chunkMin {
+	chunkMax, chunkMin, ok := chunkBounds(w)
+	if !ok {
 		return nil, false, fmt.Errorf("slice photo: width %d has no valid chunk height (range [%d,%d])", w, chunkMin, chunkMax)
 	}
+	// [issue #16 CR] 旧内联计算（readableChunkHeight 引入前）保留备查：
+	// chunkMax := min(maxPhotoSideSum-w, maxPhotoRatio*w)
+	// chunkMin := (w + maxPhotoRatio - 1) / maxPhotoRatio
+	// if chunkMax <= 0 || chunkMax < chunkMin {
+	// 	return nil, false, fmt.Errorf("slice photo: width %d has no valid chunk height (range [%d,%d])", w, chunkMin, chunkMax)
+	// }
 	// [外部 CR] 短边守卫：切片是纵向切，片宽=图宽，w < 50 的图切出来仍低于 Telegram
 	// 短边下限，不可修复；validatePhoto 已在 fetch 路径拦截，此处兜底直接传位图的调用方
 	if w < minPhotoSide {
