@@ -1057,6 +1057,88 @@ func TestSendPhotoCaptionPlainThenPermanentFallsBackWithMarkdown(t *testing.T) {
 	assert.Equal(t, `\[标题]正文`, sends[0]["text"], "降级文本为反转义前的全文原文")
 }
 
+// issue #16 二轮评审：captionNote 仅进 caption（1024 预算内拼接），
+// text 恒为全文——photo 永久失败降级纯文本时用 4096 全文，附注不得污染
+func TestCaptionNoteOnlyInCaption(t *testing.T) {
+	const note = "（长图过长，已截断）" // 10 码元
+	// 1013 码元汉字正文：budget = 1024-10-2 = 1012 → caption 中正文预截 1012
+	base := strings.Repeat("新", 1013)
+
+	t.Run("album 附注进 caption 首片且 text 保留全文", func(t *testing.T) {
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewPhotoAlbumMessage(base, [][]byte{[]byte("img1"), []byte("img2")})
+		m.SetCaptionNote(note)
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		albums := f.albums_()
+		require.Len(t, albums, 1)
+		cap := albums[0].media[0].Caption
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, cap, "caption=预截正文+附注，恰 1024 码元")
+		assert.True(t, strings.HasSuffix(cap, note), "附注不被截断吞掉")
+		assert.Equal(t, base, m.Text(), "text 恒全文：无附注、无 1024 截断")
+		assert.Equal(t, note, m.CaptionNote())
+	})
+
+	t.Run("doc 附注进 caption 且 text 保留全文", func(t *testing.T) {
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewDocumentMessage(base, []byte("img1"))
+		m.SetCaptionNote(note)
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		docs := f.docs_()
+		require.Len(t, docs, 1)
+		cap := docs[0].caption
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, cap)
+		assert.Equal(t, base, m.Text(), "text 恒全文")
+	})
+
+	t.Run("photo 附注进 caption", func(t *testing.T) {
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewPhotoMessage(base, []byte("img1"))
+		m.SetCaptionNote(note)
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		photos := f.photos_()
+		require.Len(t, photos, 1)
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, photos[0].caption)
+	})
+
+	t.Run("无附注行为不变", func(t *testing.T) {
+		// captionNote 零值空串：caption 构造与既有路径逐字节一致
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewPhotoAlbumMessage("cap", [][]byte{[]byte("img1"), []byte("img2")})
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		albums := f.albums_()
+		assert.Equal(t, "cap", albums[0].media[0].Caption)
+		assert.Empty(t, m.CaptionNote())
+	})
+}
+
 // issue #16：相册消息——sendMediaGroup、caption 首片挂载、失败分类复用 photo 语义
 func TestSendAlbumSuccess(t *testing.T) {
 	f := newFakeTG(false)

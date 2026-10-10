@@ -4,6 +4,7 @@ package rss
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -22,7 +23,10 @@ const (
 	maxPhotoPixels = 40_000_000
 
 	// readableChunkHeight [issue #16 CR] Telegram sendPhoto 服务端压缩至长边 ~1280（Bot API 无 HD 档，
-	// 查证 2026-10）；片高 ≤1280 保证片的长边不被二次缩放、文字零损失
+	// 查证 2026-10）。片高 ≤1280 保证 w≤1280 时整片零缩放；w>1280 时整片被等比压缩
+	// 至长边 1280（系数 1280/w，如 2000 宽压到 0.64×），实测仍可读，优于整图附件；
+	// 行为保留，注释 2026-10-10 二轮评审修正（原「片的长边不被二次缩放、文字零损失」
+	// 仅对 w≤1280 成立）
 	readableChunkHeight = 1280
 
 	// 重编码质量：实测长截图 q85 单片 ≤1MB，远低于 10MB 上限
@@ -66,9 +70,26 @@ func fitsReadableAlbum(w, h int, maxPieces int) bool {
 	return h/n >= chunkMin // 均匀切分后最低片仍须合法（如 9500×600）
 }
 
-// sliceSem 切片全程串行：解码位图峰值大（40MP 16bit PNG ≈ 320MB），
-// ProcessFeeds 双 feed 并发叠加会击穿内存（CR），串行化把峰值钳到单图水平
-var sliceSem = make(chan struct{}, 1)
+// sliceSem [issue #16 二轮评审] 包级全局已删除：切片串行化职责上移到
+// RssHandler.sliceSerialized（构造注入替代全局状态，见 handler.go）。
+// 原实现保留备查：
+// var sliceSem = make(chan struct{}, 1)
+// （slicePhoto 持信令进出：sliceSem <- struct{}{} / defer func() { <-sliceSem }()）
+
+// unsliceableError [issue #16 二轮评审] 可判别错误：「图片完好但切不动」——
+// 均分不可分区（partition）/ 单片重编码超 10MB。与「数据损坏」（解码失败，普通 error）
+// 区分：handler 的 crop 分支前者兜底发原文件（crop 不应比 document 差，用户裁定），
+// 后者回退下一候选
+type unsliceableError struct{ reason string }
+
+func (e *unsliceableError) Error() string { return "photo unsliceable: " + e.reason }
+
+// isUnsliceableError 判定切片失败是否属「图片完好切不动」（errors.As 识别，
+// 包装链路可追溯）
+func isUnsliceableError(err error) bool {
+	var u *unsliceableError
+	return errors.As(err, &u)
+}
 
 // checkPixelBudget 像素预算守卫，slicePhoto 与 sliceImage 共用：
 // 前者在 DecodeConfig 后、全量解码前调用（内存保护的承重点），
@@ -84,13 +105,13 @@ func checkPixelBudget(w, h int) error {
 
 // slicePhoto 解码原始图片字节并切片。
 // DecodeConfig 头部先行像素预检（全量解码前拦截超大位图），
-// 解码失败（webp/损坏/未注册格式）返回 error，由调用方回退下一候选。
-// 全程持 sliceSem 串行（DecodeConfig+Decode+sliceImage）：解码位图峰值内存是
-// 串行化的原因，见 sliceSem 注释。
+// 解码失败（webp/损坏/未注册格式）返回 error，由调用方回退下一候选；
+// 切不动（均分不可分/单片超限）返回 unsliceableError。
+// [issue #16 二轮评审] 回归纯函数：串行化已上移 handler（sliceSerialized），
+// 原函数内持包级 sliceSem 的两行保留备查：
+// sliceSem <- struct{}{} / defer func() { <-sliceSem }()
 // [issue #16 用户反馈] maxPieces：相册切片上限（photo_slices），语义见 sliceImage
 func slicePhoto(data []byte, maxPieces int) ([][]byte, bool, error) {
-	sliceSem <- struct{}{}
-	defer func() { <-sliceSem }()
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return nil, false, fmt.Errorf("slice photo: decode config: %w", err)
@@ -163,8 +184,10 @@ func sliceImage(img image.Image, maxPieces int) ([][]byte, bool, error) {
 	// 均匀切分：n 段，前 rem 段 +1px；base=⌊h/n⌋
 	base := h / n
 	if !truncated && base < chunkMin {
-		// 区间非空但 h 无法分成合法段（如 9500×600），不可修复
-		return nil, false, fmt.Errorf("slice photo: height %d cannot partition into valid chunks (base %d < min %d)", h, base, chunkMin)
+		// 区间非空但 h 无法分成合法段（如 9500×600），不可修复。
+		// [issue #16 二轮评审] 包 unsliceableError：图片完好切不动，crop 分支
+		// 据此兜底原文件（数据损坏类错误保持普通 error 走回退）
+		return nil, false, &unsliceableError{reason: fmt.Sprintf("height %d cannot partition into valid chunks (base %d < min %d)", h, base, chunkMin)}
 	}
 
 	type span struct{ y0, y1 int }
@@ -219,7 +242,9 @@ func encodeChunkJPEG(img image.Image) ([]byte, error) {
 		return nil, fmt.Errorf("slice photo: encode: %w", err)
 	}
 	if buf.Len() > maxPhotoBytes {
-		return nil, fmt.Errorf("slice photo: chunk %d bytes exceeds %d", buf.Len(), maxPhotoBytes)
+		// [issue #16 二轮评审] 极端纹理图单片超限：图片完好切不动（降质是另一回事，
+		// TODO 自适应降质 issue #16），包 unsliceableError 供 crop 分支兜底原文件
+		return nil, &unsliceableError{reason: fmt.Sprintf("chunk %d bytes exceeds %d", buf.Len(), maxPhotoBytes)}
 	}
 	return buf.Bytes(), nil
 }

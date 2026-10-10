@@ -35,6 +35,9 @@ type RssHandler struct {
 	// 图片下载器（issue #13）；nil 时 media=photo 的 feed 也只降级文本不 panic
 	// （直接字面量构造的测试 handler 即此形态）
 	photoFetcher PhotoFetcher
+	// 切片串行化信号量（issue #16 二轮评审，原包级 sliceSem 注入化）：
+	// nil 时直通不串行（字面量构造的测试 handler）
+	sliceSem chan struct{}
 	// sleepFn func(time.Duration) // 可注入的 sleep（测试免真睡）；nil 时退回 time.Sleep
 	waitFn     func(context.Context, time.Duration) error
 	nowFn      func() time.Time
@@ -81,6 +84,9 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage, 
 		storage:      store,
 		snapshot:     snapshot,
 		photoFetcher: newHTTPPhotoFetcher(),
+		// 切片串行化：解码位图峰值大（40MP 16bit PNG ≈ 320MB），双 feed 并发叠加
+		// 会击穿内存（CR），容量 1 把峰值钳到单图水平（issue #16 二轮评审注入化）
+		sliceSem: make(chan struct{}, 1),
 		// sleepFn: time.Sleep,
 		nowFn:      time.Now,
 		sendStates: make(map[string]*channelSendState),
@@ -88,6 +94,22 @@ func NewRssHandler(cfg *config.Config, bot TelegramBot, store *storage.Storage, 
 		feedBudget:    maxBlockingBudget,
 		messageBudget: maxBlockingBudget,
 	}
+}
+
+// sliceSerialized 切片串行化：位图峰值大（40MP 16bit PNG ≈ 320MB），双 feed 并发
+// 会击穿内存（CR）；经构造注入而非包级全局（CLAUDE.md），等待响应 ctx 取消，
+// 字面量构造的 handler（测试）nil 安全直通
+func (h *RssHandler) sliceSerialized(ctx context.Context, data []byte, maxPieces int) ([][]byte, bool, error) {
+	if h.sliceSem == nil {
+		return slicePhoto(data, maxPieces)
+	}
+	select {
+	case h.sliceSem <- struct{}{}:
+		defer func() { <-h.sliceSem }()
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	return slicePhoto(data, maxPieces)
 }
 
 func (h *RssHandler) now() time.Time {
@@ -863,10 +885,18 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 					// 与 photoSlices 无关，维持整图文件（现状）。document（默认）= 整图文件
 					// [issue #16 审查] 可切性判据收敛到 slicableBounds（与 fitsReadableAlbum 同源）
 					if feedConfig.PhotoOverlimit == config.PhotoOverlimitCrop && slicableBounds(dimErr.w, dimErr.h) {
-						chunks, truncated, serr := slicePhoto(data, slices)
+						chunks, truncated, serr := h.sliceSerialized(ctx, data, slices)
 						if serr != nil {
-							// 均分不可分区（如 9500×600 连完整相册都切不出，截尾也救不了
-							// 非截尾路径的均分检查）/数据损坏 → 回退下一候选
+							// [issue #16 二轮评审] 双路分野：图片完好切不动（均分不可分区如
+							// 9500×600 / 单片超 10MB）→ crop 不应比 document 差，兜底发原文件
+							// （用户裁定；原「一律回退候选降级文本」行为废弃，注释保留备查）；
+							// 数据损坏（解码失败）→ 照旧回退下一候选。
+							// ctx 取消的 Err 亦落此处：isUnsliceableError=false → continue →
+							// 循环头 ctx 检查短路，行为自洽
+							if isUnsliceableError(serr) {
+								log.Printf("photo unsliceable, cropping falls back to document, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, serr)
+								return photoPayload{doc: data}
+							}
 							log.Printf("photo slice failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, serr)
 							continue
 						}
@@ -876,7 +906,7 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 					log.Printf("photo over readable album limit, sending as document, feed %s item %q url %s (%dx%d)", feedConfig.Name, item.Title, u, dimErr.w, dimErr.h)
 					return photoPayload{doc: data}
 				}
-				chunks, truncated, serr := slicePhoto(data, slices)
+				chunks, truncated, serr := h.sliceSerialized(ctx, data, slices) // [issue #16 二轮评审] 串行化上移 handler
 				if serr != nil {
 					// 预检后仍失败（图片声明合规但数据损坏）→ 回退下一候选
 					log.Printf("photo slice failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, serr)
@@ -931,14 +961,18 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 // CR 修订（2026-10-10）曾废弃截断附注——截尾不再发生，超限图改发整图文件；
 // [issue #16 用户反馈] 附注恢复：photo_overlimit=crop 的预览相册非完整内容，
 // caption 必须注明截断（普通完整相册 truncated=false 不受影响）。
-// [issue #16 审查] 附注经 AppendCaptionNote 在 1024 码元预算内拼接——旧裸拼接注释保留：
-// text += "\n\n（长图过长，已截断）" 会被 telegram 层统一截断在长 caption 下吞掉附注
+// [issue #16 审查] 附注经 AppendCaptionNote 在 1024 码元预算内拼接。
+// [issue #16 二轮评审] 附注改为 SetCaptionNote 仅进 caption——text 恒为全文，
+// photo 永久失败降级纯文本时按 4096 发全文，附注不得污染。旧裸拼接实现保留备查：
+// text += "\n\n（长图过长，已截断）"（text 被污染且长 caption 下附注被截断吞掉）
 func newDelivery(text string, p photoPayload) *telegram.Message {
 	if len(p.doc) > 0 {
 		return telegram.NewDocumentMessage(text, p.doc)
 	}
 	if p.truncated { // crop 预览相册注明截断（doc 判定在前，截断只可能伴随相册）
-		text = telegram.AppendCaptionNote(text, "（长图过长，已截断）")
+		m := telegram.NewPhotoAlbumMessage(text, p.album)
+		m.SetCaptionNote("（长图过长，已截断）")
+		return m
 	}
 	if len(p.album) > 0 {
 		return telegram.NewPhotoAlbumMessage(text, p.album)

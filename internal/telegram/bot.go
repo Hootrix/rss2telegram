@@ -56,6 +56,10 @@ type Message struct {
 	// 每轮新建）。达 maxPhotoTransientFails 后置空 photo 降级文本（外部 CR 保险丝）
 	// album 路径共用（issue #16）
 	photoTransientFails int
+	// captionNote 截断附注仅进 caption——text 恒为全文，供 4096 纯文本降级使用
+	// （issue #16 二轮评审）：crop 预览相册非完整内容，caption 需注明截断，
+	// 但 photo 永久失败降级文本必须还原完整渲染文本，附注只在 caption 预算内拼接
+	captionNote string
 }
 
 func NewMessage(text string) *Message { return &Message{text: text} }
@@ -99,6 +103,12 @@ func (m *Message) HasDoc() bool { return len(m.doc) > 0 }
 
 // AlbumCount 相册切片张数（issue #16，跨包断言用）
 func (m *Message) AlbumCount() int { return len(m.photos) }
+
+// SetCaptionNote 设置截断附注（仅进 caption，见 captionNote 字段注释；issue #16 二轮评审）
+func (m *Message) SetCaptionNote(note string) { m.captionNote = note }
+
+// CaptionNote 只读访问截断附注，供跨包断言（issue #16 二轮评审）
+func (m *Message) CaptionNote() string { return m.captionNote }
 
 // RateLimitError 表示 Telegram 429 限速，携带服务端指示的等待时长。
 // 独立成项目内类型：handler 层用 errors.As 识别即可，无需 import telebot
@@ -402,16 +412,26 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 	return int64(sent.ID), nil
 }
 
-// sendPhotoOnce 单次 photo 发送尝试。每次新建 reader 与 Photo 实例：
-// reader 读过即耗尽；telebot Photo.Send 会回写 receiver（*p = *msg.Photo），
-// 复用实例会污染重试。caption 构造：先按 captionPlain 反转义再截断
-// （反转义会改变长度，先截后转义可能超限）
-func sendPhotoOnce(sender *tele.Bot, recipient tele.Recipient, message *Message) (*tele.Message, error) {
+// buildCaption [issue #16 二轮评审] photo/album/document 三处共用的 caption 构造
+// （原三处重复 4 行顺势收敛）：按 captionPlain 反转义 → captionNote 在 1024 预算内
+// 拼接截断附注 → 统一截断。反转义会改变长度，先截后转义可能超限，故顺序固定；
+// 附注经 AppendCaptionNote 预截正文保证自身不被本步截断吞掉
+func buildCaption(message *Message) string {
 	caption := message.text
 	if message.captionPlain {
 		caption = tgmd.Unescape(caption)
 	}
-	caption = truncateCaption(caption)
+	if message.captionNote != "" {
+		caption = AppendCaptionNote(caption, message.captionNote)
+	}
+	return truncateCaption(caption)
+}
+
+// sendPhotoOnce 单次 photo 发送尝试。每次新建 reader 与 Photo 实例：
+// reader 读过即耗尽；telebot Photo.Send 会回写 receiver（*p = *msg.Photo），
+// 复用实例会污染重试。caption 构造见 buildCaption
+func sendPhotoOnce(sender *tele.Bot, recipient tele.Recipient, message *Message) (*tele.Message, error) {
+	caption := buildCaption(message)
 	options := &tele.SendOptions{}
 	if !message.captionPlain {
 		options.ParseMode = tele.ModeMarkdown
@@ -451,11 +471,7 @@ func handlePhotoFailure(message *Message, err error, kind string) error {
 // sendAlbumOnce 单次相册发送尝试。每次新建 reader 与 Album 实例（reader 读过即耗尽）；
 // caption 与 parse_mode 挂首片 InputMedia（telebot SendAlbum 逐项序列化）
 func sendAlbumOnce(sender *tele.Bot, recipient tele.Recipient, message *Message) (tele.Message, error) {
-	caption := message.text
-	if message.captionPlain {
-		caption = tgmd.Unescape(caption)
-	}
-	caption = truncateCaption(caption)
+	caption := buildCaption(message)
 	options := &tele.SendOptions{}
 	if !message.captionPlain {
 		options.ParseMode = tele.ModeMarkdown
@@ -482,13 +498,9 @@ func sendAlbumOnce(sender *tele.Bot, recipient tele.Recipient, message *Message)
 
 // sendDocumentOnce [issue #16 CR] 单次文件发送尝试。文件名按字节嗅探生成
 // （FromReader 不带名，无名文件在客户端展示为无法预览的裸文件）；
-// caption 语义与 photo 相同
+// caption 语义与 photo 相同（buildCaption 统一构造）
 func sendDocumentOnce(sender *tele.Bot, recipient tele.Recipient, message *Message) (tele.Message, error) {
-	caption := message.text
-	if message.captionPlain {
-		caption = tgmd.Unescape(caption)
-	}
-	caption = truncateCaption(caption)
+	caption := buildCaption(message)
 	options := &tele.SendOptions{}
 	if !message.captionPlain {
 		options.ParseMode = tele.ModeMarkdown

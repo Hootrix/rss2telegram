@@ -172,6 +172,27 @@ func TestSlicePhoto(t *testing.T) {
 	})
 }
 
+// issue #16 二轮评审：可判别错误 unsliceableError——「图片完好但切不动」
+// （均分不可分 / 单片超 10MB），与「数据损坏」（解码失败）区分：
+// handler 的 crop 分支前者兜底原文件、后者回退下一候选
+func TestUnsliceableError(t *testing.T) {
+	t.Run("均分不可分区属 unsliceable", func(t *testing.T) {
+		// 9500×600：区间 [475,500] 非空但 n=2 均分 base=300 < 475 → partition 报错
+		_, _, err := slicePhoto(encodeGrad(t, 9500, 600), maxAlbumPhotos)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "partition")
+		assert.True(t, isUnsliceableError(err), "图片完好切不动，应可判别为 unsliceable")
+	})
+
+	t.Run("解码损坏不属 unsliceable", func(t *testing.T) {
+		// 截断 JPEG：DecodeConfig 头部可读但全量解码失败 → 数据损坏，普通错误
+		full := encodeGrad(t, 200, 9900)
+		_, _, err := slicePhoto(full[:len(full)*3/5], maxAlbumPhotos)
+		require.Error(t, err)
+		assert.False(t, isUnsliceableError(err), "数据损坏应回退候选而非兜底原文件")
+	})
+}
+
 func TestSliceImageTransparentPNG(t *testing.T) {
 	// 透明 PNG 经 encodeChunkJPEG 后左上角应为白底（JPEG 无 alpha）
 	img := image.NewNRGBA(image.Rect(0, 0, 100, 100))

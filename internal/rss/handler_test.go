@@ -902,12 +902,13 @@ func (f *cancelingFetcher) Fetch(ctx context.Context, _ string) ([]byte, error) 
 type photoBot struct {
 	mu       sync.Mutex
 	messages []struct {
-		channel    string
-		hasPhoto   bool
-		hasDoc     bool // [issue #16 CR] 整图文件消息
-		albumCount int  // [issue #16] 相册切片张数（AlbumCount()）
-		text       string
-		msg        *telegram.Message
+		channel     string
+		hasPhoto    bool
+		hasDoc      bool // [issue #16 CR] 整图文件消息
+		albumCount  int  // [issue #16] 相册切片张数（AlbumCount()）
+		text        string
+		captionNote string // [issue #16 二轮评审] 截断附注（CaptionNote()，仅进 caption）
+		msg         *telegram.Message
 	}
 }
 
@@ -915,13 +916,14 @@ func (b *photoBot) Send(_ context.Context, channel string, m *telegram.Message) 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.messages = append(b.messages, struct {
-		channel    string
-		hasPhoto   bool
-		hasDoc     bool
-		albumCount int
-		text       string
-		msg        *telegram.Message
-	}{channel, m.HasPhoto(), m.HasDoc(), m.AlbumCount(), m.Text(), m})
+		channel     string
+		hasPhoto    bool
+		hasDoc      bool
+		albumCount  int
+		text        string
+		captionNote string
+		msg         *telegram.Message
+	}{channel, m.HasPhoto(), m.HasDoc(), m.AlbumCount(), m.Text(), m.CaptionNote(), m})
 	return 1, nil
 }
 
@@ -1145,7 +1147,9 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		assert.NotSame(t, bot.messages[0].msg, bot.messages[1].msg, "各频道必须是独立 Message 实例（降级状态不跨频道串味）")
 	})
 
-	// [issue #16 用户反馈] photo_overlimit=crop：超限长图改发顶部切片相册预览 + 截断附注
+	// [issue #16 用户反馈] photo_overlimit=crop：超限长图改发顶部切片相册预览 + 截断附注。
+	// [issue #16 二轮评审] 附注仅进 caption（Message.CaptionNote），text 恒为全文——
+	// photo 永久失败降级纯文本时按 4096 发全文，附注不得污染
 	t.Run("crop 超长图发顶部切片相册并注明截断", func(t *testing.T) {
 		// 100×25000：needed=⌈25000/1280⌉=20 > 10 → 默认走 doc；
 		// crop 改为取顶部 10×1280 相册 + caption 附注
@@ -1161,7 +1165,8 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		require.Len(t, bot.messages, 1)
 		assert.Equal(t, 10, bot.messages[0].albumCount, "crop 应取顶部 10 片")
 		assert.False(t, bot.messages[0].hasDoc, "crop 不再走文件附件")
-		assert.Contains(t, bot.messages[0].text, "（长图过长，已截断）", "crop 相册 caption 应注明截断")
+		assert.NotContains(t, bot.messages[0].text, "（长图过长，已截断）", "text 恒全文，附注不进 text")
+		assert.Equal(t, "（长图过长，已截断）", bot.messages[0].captionNote, "附注挂在 Message.CaptionNote")
 	})
 
 	t.Run("crop 配 photo_slices 压制片数", func(t *testing.T) {
@@ -1178,7 +1183,8 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 
 		require.Len(t, bot.messages, 1)
 		assert.Equal(t, 3, bot.messages[0].albumCount)
-		assert.Contains(t, bot.messages[0].text, "（长图过长，已截断）")
+		assert.Equal(t, "（长图过长，已截断）", bot.messages[0].captionNote)
+		assert.NotContains(t, bot.messages[0].text, "已截断", "text 恒全文")
 	})
 
 	t.Run("photo_slices 宽松时完整相册无附注", func(t *testing.T) {
@@ -1214,10 +1220,11 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		assert.Zero(t, bot.messages[0].albumCount)
 	})
 
-	t.Run("crop 遇均分不可分区回退候选降级文本", func(t *testing.T) {
+	t.Run("crop 遇均分不可分区兜底原文件", func(t *testing.T) {
 		// 9500×600：fits=false（n=2 均分 base=300 < 片高下限 475）但 slicableBounds=true
 		// （区间 [475,500] 非空、5.7MP 限内）→ 进 crop 分支 → slicePhoto 报 partition
-		// 错误 → 回退；无后续候选 → 零载荷文本（锁住注释定义的行为分叉，非 doc）
+		// （unsliceableError）→ [issue #16 二轮评审] 图片完好切不动：crop 不应比
+		// document 差，兜底发原文件（原「回退候选降级文本」行为废弃，注释保留备查）
 		bot := &photoBot{}
 		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
 			"https://img.example.com/first.png": encodeGrad(t, 9500, 600),
@@ -1228,7 +1235,27 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
 
 		require.Len(t, bot.messages, 1)
-		assert.False(t, bot.messages[0].hasDoc, "partition 失败回退候选，不硬转 doc")
+		assert.True(t, bot.messages[0].hasDoc, "切片不可分=图片完好，crop 应兜底原文件")
+		assert.Zero(t, bot.messages[0].albumCount)
+		assert.Empty(t, bot.messages[0].captionNote, "doc 全文完整，无需附注")
+	})
+
+	t.Run("crop 遇解码损坏回退候选降级文本", func(t *testing.T) {
+		// 头部合规但数据损坏的截断 JPEG（完整编码前 60% 字节）+ crop：
+		// 解码失败=数据损坏（非 unsliceable）→ 照旧回退；无后续候选 → 零载荷文本。
+		// 与上一用例构成 unsliceable/doc 与损坏/回退的两条路分野
+		bot := &photoBot{}
+		full := encodeGrad(t, 200, 9900)
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": full[:len(full)*3/5],
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.False(t, bot.messages[0].hasDoc, "数据损坏不应兜底发坏文件")
 		assert.False(t, bot.messages[0].hasPhoto)
 		assert.Zero(t, bot.messages[0].albumCount)
 		assert.Equal(t, "photo item", bot.messages[0].text, "全候选失败降级纯文本")
