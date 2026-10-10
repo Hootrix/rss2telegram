@@ -55,8 +55,12 @@ var _ PhotoFetcher = (*httpPhotoFetcher)(nil)
 
 // photoDimensionError 尺寸/比例超 Telegram sendPhoto 硬限制（issue #16）：
 // 可通过本地切片修复的失败类别，handler 据此触发 slicePhoto。
-// 短边过小不属此类——切片只会更小，不可修复
-type photoDimensionError struct{ reason string }
+// 短边过小不属此类——切片只会更小，不可修复。
+// w/h 字段（外部 CR）供 handler 在解码前用头部尺寸预判能否切出可读相册
+type photoDimensionError struct {
+	w, h   int
+	reason string
+}
 
 func (e *photoDimensionError) Error() string { return "photo dimensions: " + e.reason }
 
@@ -88,12 +92,12 @@ func validatePhoto(data []byte) error {
 		return fmt.Errorf("decode photo header: %w", err) // 解析失败=损坏
 	}
 	w, h := cfg.Width, cfg.Height
-	if w+h > maxPhotoSideSum {
-		// [issue #16] 普通 fmt.Errorf 无法判别，换可切片的尺寸类错误；
-		// 旧实现保留备查：
-		// return fmt.Errorf("photo dimensions %dx%d exceed w+h limit %d", w, h, maxPhotoSideSum)
-		return &photoDimensionError{fmt.Sprintf("%dx%d exceed w+h limit %d", w, h, maxPhotoSideSum)}
-	}
+	// [外部 CR] 短边检查前置：40×12000 的 w+h 超限但短边 40 < 50，切片只会更窄不可修复，
+	// 若后置会被误判为可切片的尺寸类错误。旧位置（w+h 检查之后）保留备查：
+	// maxSide, minSide := w, h
+	// if minSide > maxSide {
+	// 	maxSide, minSide = minSide, maxSide
+	// }
 	maxSide, minSide := w, h
 	if minSide > maxSide {
 		maxSide, minSide = minSide, maxSide
@@ -101,12 +105,18 @@ func validatePhoto(data []byte) error {
 	if minSide < minPhotoSide {
 		return fmt.Errorf("photo dimensions %dx%d below minimum side %d", w, h, minPhotoSide)
 	}
+	if w+h > maxPhotoSideSum {
+		// [issue #16] 普通 fmt.Errorf 无法判别，换可切片的尺寸类错误；
+		// 旧实现保留备查：
+		// return fmt.Errorf("photo dimensions %dx%d exceed w+h limit %d", w, h, maxPhotoSideSum)
+		return &photoDimensionError{w: w, h: h, reason: fmt.Sprintf("%dx%d exceed w+h limit %d", w, h, maxPhotoSideSum)}
+	}
 	// 整数比较避免浮点：max > 20*min
 	if maxSide > maxPhotoRatio*minSide {
 		// [issue #16] 同 w+h：比例超限可切片，换可判别的尺寸类错误；
 		// 旧实现保留备查：
 		// return fmt.Errorf("photo aspect ratio %d:%d exceeds %d", w, h, maxPhotoRatio)
-		return &photoDimensionError{fmt.Sprintf("%d:%d exceeds %d", w, h, maxPhotoRatio)}
+		return &photoDimensionError{w: w, h: h, reason: fmt.Sprintf("%d:%d exceeds %d", w, h, maxPhotoRatio)}
 	}
 	return nil
 }

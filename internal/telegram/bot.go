@@ -386,11 +386,18 @@ func sendPhotoOnce(sender *tele.Bot, recipient tele.Recipient, message *Message)
 	return sender.Send(recipient, photo, options)
 }
 
-// handlePhotoFailure [issue #16] photo/album 共用的失败分类：
-// 永久失败（400/413）置空图片就地降级文本返回 nil；
+// handlePhotoFailure [issue #16] photo/album/document 共用的失败分类：
+// 429 豁免计数原样返回（外部 CR）；永久失败（400/413）置空图片就地降级文本返回 nil；
 // 瞬态失败达保险丝阈值同样置空降级；否则计数并返回 err 交外层重试。
-// kind 为日志来源（"photo"/"album"）：共用后日志仍可辨图片形态，排障不混
+// kind 为日志来源（"photo"/"album"/"document"）：共用后日志仍可辨图片形态，排障不混
 func handlePhotoFailure(message *Message, err error, kind string) error {
+	// [CR 修复] 429 不计入保险丝：服务端已指示冷却时长且外层有独立 flood 配额
+	// （maxFloodRetries=5）与冷却等待，计数会把首刷撞限的相册/图片系统性降级文本；
+	// 置空后外层重试永远失去图片。原样返回交 sendError → RateLimitError → 外层冷却
+	var flood tele.FloodError
+	if errors.As(err, &flood) {
+		return err
+	}
 	if isPhotoPermanentError(err) {
 		log.Printf("%s send failed permanently, falling back to text message: %v", kind, err)
 		message.photo, message.photos = nil, nil

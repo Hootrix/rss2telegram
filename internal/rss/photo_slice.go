@@ -15,15 +15,21 @@ const (
 	// sendMediaGroup 单次相册上限
 	maxAlbumPhotos = 10
 
-	// 解码位图上限（字面 100MP = 100_000_000）：10MB JPEG 可声称任意尺寸，解码前按头部拦截，
-	// 防超大位图打爆常驻内存。最坏瞬时 250–400MB（4:4:4 JPEG 解码 ~300MB + 每片 RGBA 画布
-	// 峰值，w=5000 时 ~100MB），逐片分配可回收，可接受。
-	// 注意：测试用 10000×10001 = 100_010,000 像素恰好超此阈值，故不能写成 100<<20（≈104.9MP）
-	maxPhotoPixels = 100_000_000
+	// 解码位图上限（字面 40MP = 40_000_000）：10MB JPEG 可声称任意尺寸，解码前按头部拦截，
+	// 防超大位图打爆常驻内存。
+	// [外部 CR] 原 100MP 过大：16-bit PNG 解码 NRGBA64 8B/px，100MP 即 800MB，
+	// 双 feed 并发可破 1.5GB（CR）；40MP 覆盖实测案例 1080×33634=36.3MP，最坏单图 320MB，
+	// 配合 sliceSem 串行化把峰值钳到单图水平。
+	// 注意：测试用 10000×10001 = 100_010,000 像素恰好超此阈值，故不能写成 40<<20（≈41.9MP）
+	maxPhotoPixels = 40_000_000
 
 	// 重编码质量：实测长截图 q85 单片 ≤1MB，远低于 10MB 上限
 	sliceJPEGQuality = 85
 )
+
+// sliceSem 切片全程串行：解码位图峰值大（40MP 16bit PNG ≈ 320MB），
+// ProcessFeeds 双 feed 并发叠加会击穿内存（CR），串行化把峰值钳到单图水平
+var sliceSem = make(chan struct{}, 1)
 
 // checkPixelBudget 像素预算守卫，slicePhoto 与 sliceImage 共用：
 // 前者在 DecodeConfig 后、全量解码前调用（内存保护的承重点），
@@ -39,8 +45,12 @@ func checkPixelBudget(w, h int) error {
 
 // slicePhoto 解码原始图片字节并切片。
 // DecodeConfig 头部先行像素预检（全量解码前拦截超大位图），
-// 解码失败（webp/损坏/未注册格式）返回 error，由调用方回退下一候选
+// 解码失败（webp/损坏/未注册格式）返回 error，由调用方回退下一候选。
+// 全程持 sliceSem 串行（DecodeConfig+Decode+sliceImage）：解码位图峰值内存是
+// 串行化的原因，见 sliceSem 注释
 func slicePhoto(data []byte) ([][]byte, bool, error) {
+	sliceSem <- struct{}{}
+	defer func() { <-sliceSem }()
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return nil, false, fmt.Errorf("slice photo: decode config: %w", err)
@@ -71,6 +81,11 @@ func sliceImage(img image.Image) ([][]byte, bool, error) {
 	chunkMin := (w + maxPhotoRatio - 1) / maxPhotoRatio
 	if chunkMax <= 0 || chunkMax < chunkMin {
 		return nil, false, fmt.Errorf("slice photo: width %d has no valid chunk height (range [%d,%d])", w, chunkMin, chunkMax)
+	}
+	// [外部 CR] 短边守卫：切片是纵向切，片宽=图宽，w < 50 的图切出来仍低于 Telegram
+	// 短边下限，不可修复；validatePhoto 已在 fetch 路径拦截，此处兜底直接传位图的调用方
+	if w < minPhotoSide {
+		return nil, false, fmt.Errorf("slice photo: width %d below minimum side %d", w, minPhotoSide)
 	}
 	// h=0 → n=⌈0/chunkMax⌉=0 → 下方 base := h/n 整型除零 panic；h<0 同落 n=0，一并拦截。
 	// w<=0 理论上已被上方区间守卫拦截（w=0 → 20w=0；w<0 → 20w<0，均使 chunkMax<=0），

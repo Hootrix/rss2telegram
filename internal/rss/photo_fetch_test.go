@@ -82,6 +82,14 @@ func TestValidatePhoto(t *testing.T) {
 	t.Run("短边过小不可切片（切片只会更小）", func(t *testing.T) {
 		assert.False(t, isDimensionError(validatePhoto(encodeGray(t, 100, 49, false))))
 	})
+	// 外部 CR：40×12000 的 w+h=12040 超限，但短边 40 < 50，切片只会更小不可修复——
+	// 短边检查必须先于 w+h 判定，否则被误判为可切片的尺寸类错误
+	t.Run("窄长条短边过小不可切片（先于 w+h 判定）", func(t *testing.T) {
+		// 40×12000：w+h=12040 超限但短边 40 < 50，切片只会更小 → 非尺寸类错误
+		err := validatePhoto(encodeGray(t, 40, 12000, true))
+		assert.False(t, isDimensionError(err))
+		assert.Error(t, err)
+	})
 	t.Run("非尺寸失败不可切片", func(t *testing.T) {
 		assert.False(t, isDimensionError(validatePhoto([]byte("<html>x</html>"))))
 	})

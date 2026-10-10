@@ -41,6 +41,7 @@ type fakeTG struct {
 	albums              []albumSend // 每次 sendMediaGroup 的 media 数组与图片字节（issue #16）
 	albumFail400        bool        // sendMediaGroup 恒返回 400（尺寸永久失败）
 	albumFail500        bool        // sendMediaGroup 恒返回 500（瞬态失败）
+	albumFail429        bool        // sendMediaGroup 恒返回 429 + retry_after（外部 CR：429 不得计入保险丝）
 	albumFailCaption400 bool        // 首次 sendMediaGroup 返回 parse entities 400
 	server              *httptest.Server
 }
@@ -173,9 +174,22 @@ func newFakeTG(failFirst bool) *fakeTG {
 			f.albums = append(f.albums, as)
 			albumFail400 := f.albumFail400
 			albumFail500 := f.albumFail500
+			albumFail429 := f.albumFail429
 			failCaption := f.albumFailCaption400 && len(f.albums) == 1
 			f.mu.Unlock()
 
+			// 429 报文形态复用 sendMessage flood429 的 JSON（issue #6 线上报文）：
+			// 带 retry_after 参数时 telebot extractOk 返回 FloodError 值类型
+			if albumFail429 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				writeFakeJSON(w, map[string]any{
+					"ok": false, "error_code": 429,
+					"description": "Too Many Requests: retry after 21",
+					"parameters":  map[string]any{"retry_after": 21},
+				})
+				return
+			}
 			if albumFail500 {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"ok":false,"error_code":500,"description":"Internal Server Error"}`))
@@ -1060,4 +1074,26 @@ func TestSendAlbumTransientFuse(t *testing.T) {
 func TestNewPhotoAlbumMessageEmpty(t *testing.T) {
 	assert.Equal(t, NewMessage("x").text, NewPhotoAlbumMessage("x", nil).text)
 	assert.False(t, NewPhotoAlbumMessage("x", nil).HasAlbum())
+}
+
+// 外部 CR：429 不计入保险丝——服务端已指示冷却时长，外层有独立 flood 配额
+// （maxFloodRetries=5）与冷却等待；若 429 计入 photoTransientFails，同一消息
+// 第 2 次 429 即触发保险丝置空相册/图片降级文本，首刷撞频道限额是必然场景，
+// 置空后外层重试永远失去图片，属确定性回归
+func TestSendAlbum429NotCountedIntoFuse(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.albumFail429 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage("txt", [][]byte{[]byte("img1"), []byte("img2")})
+	_, err = b.Send(context.Background(), "@it", m)
+
+	assert.Error(t, err)
+	var rl *RateLimitError
+	assert.True(t, errors.As(err, &rl), "429 应包装为 RateLimitError 交外层冷却")
+	assert.True(t, m.HasAlbum(), "429 不得置空相册")
+	assert.Zero(t, m.photoTransientFails, "429 不得计入保险丝")
 }

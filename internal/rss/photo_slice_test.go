@@ -104,10 +104,17 @@ func TestSlicePhoto(t *testing.T) {
 		assert.ErrorContains(t, err, "partition")
 	})
 
-	t.Run("像素超 100MP 拒绝", func(t *testing.T) {
-		// 直接测 sliceImage：无需真解码 100MP 字节
+	t.Run("像素超 40MP 拒绝", func(t *testing.T) {
+		// 直接测 sliceImage：无需真解码 40MP 字节（10000×10001 = 100,010,000 > 40MP）
 		_, _, err := sliceImage(image.NewGray(image.Rect(0, 0, 10000, 10001)))
 		assert.ErrorContains(t, err, "pixels")
+	})
+
+	t.Run("宽低于短边下限拒绝（切片只会更窄）", func(t *testing.T) {
+		// 外部 CR：切片是纵向切，片宽=图宽，w < 50 的图切出来仍不可用；
+		// validatePhoto 已在 fetch 路径拦截，此处兜底直接传位图的调用方
+		_, _, err := sliceImage(image.NewGray(image.Rect(0, 0, 40, 200)))
+		assert.ErrorContains(t, err, "below minimum side")
 	})
 
 	t.Run("损坏数据解码失败", func(t *testing.T) {
