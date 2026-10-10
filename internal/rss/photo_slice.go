@@ -16,7 +16,8 @@ const (
 	maxAlbumPhotos = 10
 
 	// 解码位图上限（字面 100MP = 100_000_000）：10MB JPEG 可声称任意尺寸，解码前按头部拦截，
-	// 防超大位图打爆常驻内存（100MP YCbCr ≈ 150MB 瞬时峰值，可接受）。
+	// 防超大位图打爆常驻内存。最坏瞬时 250–400MB（4:4:4 JPEG 解码 ~300MB + 每片 RGBA 画布
+	// 峰值，w=5000 时 ~100MB），逐片分配可回收，可接受。
 	// 注意：测试用 10000×10001 = 100_010,000 像素恰好超此阈值，故不能写成 100<<20（≈104.9MP）
 	maxPhotoPixels = 100_000_000
 
@@ -28,7 +29,9 @@ const (
 // 前者在 DecodeConfig 后、全量解码前调用（内存保护的承重点），
 // 后者在入口调用（覆盖直接传位图的调用方，如测试与未来复用）
 func checkPixelBudget(w, h int) error {
-	if w*h > maxPhotoPixels {
+	// int64 乘积防 32 位平台溢出：JPEG 尺寸上限 65535² ≈ 4.29e9 超 int32，
+	// int 为 32 位的平台上 w*h 会回绕成负数绕过守卫
+	if int64(w)*int64(h) > maxPhotoPixels {
 		return fmt.Errorf("slice photo: %dx%d pixels exceed %d", w, h, maxPhotoPixels)
 	}
 	return nil

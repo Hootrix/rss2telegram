@@ -841,11 +841,14 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 				if truncated {
 					log.Printf("photo sliced with tail dropped, feed %s item %q url %s: %d chunks", feedConfig.Name, item.Title, u, len(chunks))
 				}
-				// 切片触发契约保证 ≥2 片；单片防御性走单图路径
+				// 切片触发契约保证 ≥2 片；单片防御性走单图路径，空切片（不变量破坏）回退下一候选而非 panic
+				if len(chunks) == 1 {
+					return photoPayload{photo: chunks[0]}
+				}
 				if len(chunks) >= 2 {
 					return photoPayload{album: chunks, truncated: truncated}
 				}
-				return photoPayload{photo: chunks[0]}
+				continue
 			}
 			log.Printf("photo validate failed, feed %s item %q url %s: %v", feedConfig.Name, item.Title, u, err)
 			continue
@@ -887,7 +890,10 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 
 // newDelivery [issue #16] 按载荷形态构造频道消息：相册 > 单图 > 纯文本；
 // 每 (item,channel) 调用一次保证 Message 实例独立（降级状态不跨频道串味）。
-// 截断附注拼进 text：caption 与相册失败后的文本降级都如实披露
+// 截断附注拼进 text：caption 与相册失败后的文本降级都如实披露。
+// 已知边角：正文超 ~1010 UTF-16 码元时，caption 侧附注可能被 caption 上限吞掉
+// （truncateCaption 的换行回退恰好切在附注前的 \n\n）；文本降级路径不截断、
+// 附注必在。触发罕见、失败温和（只丢附注不再披露截断），预算截正文属过度设计，不改逻辑
 func newDelivery(text string, p photoPayload) *telegram.Message {
 	if p.truncated {
 		text += "\n\n（长图过长，已截断）"

@@ -304,7 +304,7 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 				return int64(sent.ID), nil
 			}
 		}
-		if ferr := handlePhotoFailure(message, err); ferr != nil {
+		if ferr := handlePhotoFailure(message, err, "album"); ferr != nil {
 			return 0, b.sendError(ctx, ferr)
 		}
 	}
@@ -344,7 +344,7 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 		// 	message.photoTransientFails++
 		// 	return 0, b.sendError(ctx, err)
 		// }
-		if ferr := handlePhotoFailure(message, err); ferr != nil {
+		if ferr := handlePhotoFailure(message, err, "photo"); ferr != nil {
 			return 0, b.sendError(ctx, ferr)
 		}
 	}
@@ -387,17 +387,18 @@ func sendPhotoOnce(sender *tele.Bot, recipient tele.Recipient, message *Message)
 
 // handlePhotoFailure [issue #16] photo/album 共用的失败分类：
 // 永久失败（400/413）置空图片就地降级文本返回 nil；
-// 瞬态失败达保险丝阈值同样置空降级；否则计数并返回 err 交外层重试
-func handlePhotoFailure(message *Message, err error) error {
+// 瞬态失败达保险丝阈值同样置空降级；否则计数并返回 err 交外层重试。
+// kind 为日志来源（"photo"/"album"）：共用后日志仍可辨图片形态，排障不混
+func handlePhotoFailure(message *Message, err error, kind string) error {
 	if isPhotoPermanentError(err) {
-		log.Printf("photo send failed permanently, falling back to text message: %v", err)
+		log.Printf("%s send failed permanently, falling back to text message: %v", kind, err)
 		message.photo, message.photos = nil, nil
 		return nil
 	}
 	if message.photoTransientFails >= maxPhotoTransientFails-1 {
 		// 保险丝（外部 CR，#13 引入）：持续瞬态失败会耗尽 sendWithRetry 预算
 		// 饿死整个 feed，达阈值放弃图片降级全文，文本成功即标 seen 解卡
-		log.Printf("photo transiently failed %d times, giving up photo and falling back to text: %v", message.photoTransientFails+1, err)
+		log.Printf("%s transiently failed %d times, giving up and falling back to text: %v", kind, message.photoTransientFails+1, err)
 		message.photo, message.photos = nil, nil
 		return nil
 	}
@@ -430,6 +431,8 @@ func sendAlbumOnce(sender *tele.Bot, recipient tele.Recipient, message *Message)
 		return tele.Message{}, err
 	}
 	if len(sent) == 0 {
+		// telebot v3.1.3 对 ok:true 且 result 短于文件数的响应会在库内 index panic，
+		// 此分支仅在库修复后生效，留作库行为变更保险
 		return tele.Message{}, errors.New("telegram: empty album response")
 	}
 	return sent[0], nil

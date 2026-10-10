@@ -191,14 +191,18 @@ func newFakeTG(failFirst bool) *fakeTG {
 				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: MEDIA_GROUP_INVALID"}`))
 				return
 			}
-			// sendMediaGroup 成功响应 result 为消息数组
-			writeFakeJSON(w, map[string]any{
-				"ok": true,
-				"result": []map[string]any{
-					{"message_id": 1, "chat": map[string]any{"id": -1009999, "type": "channel"}, "date": 1},
-					{"message_id": 2, "chat": map[string]any{"id": -1009999, "type": "channel"}, "date": 1},
-				},
-			})
+			// sendMediaGroup 成功响应 result 为消息数组：按 media 数动态生成
+			// （message_id 从 1 递增）。硬编码 2 条会在 ≥3 片相册时让 telebot
+			// 回写循环按文件数索引 result 越界 panic
+			results := make([]map[string]any, len(as.media))
+			for i := range results {
+				results[i] = map[string]any{
+					"message_id": i + 1,
+					"chat":       map[string]any{"id": -1009999, "type": "channel"},
+					"date":       1,
+				}
+			}
+			writeFakeJSON(w, map[string]any{"ok": true, "result": results})
 		case "sendMessage":
 			body, _ := io.ReadAll(r.Body)
 			var m map[string]any
@@ -1000,6 +1004,35 @@ func TestSendAlbumPermanent400FallsBackToText(t *testing.T) {
 	assert.False(t, m.HasPhoto())
 	sends := f.sends_()
 	require.Len(t, sends, 1, "补发了一条文本消息")
+}
+
+// 复合边界：caption md parse 400 → album plain 重试恰逢相册永久 400 →
+// 置空相册降级全文文本。锁死时序：captionPlain 已置 true 但 plain 未动，
+// 降级文本仍带 Markdown（对照 TestSendPhotoCaptionPlainThenPermanentFallsBackWithMarkdown）
+func TestSendAlbumCaptionPlainThenPermanentFallsBackWithMarkdown(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.albumFailCaption400 = true
+	f.albumFail400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage(`\[标题]正文`, [][]byte{[]byte("img1"), []byte("img2")})
+	msgID, err := b.Send(context.Background(), "@it", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	albums := f.albums_()
+	require.Len(t, albums, 2, "caption parse 重试一次，共两次 album")
+	assert.Equal(t, "Markdown", albums[0].media[0].ParseMode)
+	assert.Empty(t, albums[1].media[0].ParseMode, "caption plain 重试不带 parse_mode")
+	assert.False(t, m.HasAlbum(), "相册永久失败后已置空")
+	assert.False(t, m.HasPhoto())
+	sends := f.sends_()
+	require.Len(t, sends, 1, "相册永久失败后只发一次文本")
+	assert.Equal(t, "Markdown", sends[0]["parse_mode"], "captionPlain 不得污染 plain，全文仍走 markdown")
+	assert.Equal(t, `\[标题]正文`, sends[0]["text"], "降级文本为反转义前的全文原文")
 }
 
 // 瞬态失败走保险丝：首次失败保留相册交外层重试；达 maxPhotoTransientFails

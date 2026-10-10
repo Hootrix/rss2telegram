@@ -1068,6 +1068,8 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		assert.Equal(t, 3, bot.messages[0].albumCount)
 		assert.False(t, bot.messages[0].hasPhoto)
 		assert.NotContains(t, bot.messages[0].text, "已截断", "未截断不附注")
+		_, calls := fetcher.snapshot()
+		assert.Equal(t, 1, calls, "切片成功不回退后续候选")
 	})
 
 	t.Run("超 10 片截尾附注截断提示", func(t *testing.T) {
@@ -1112,5 +1114,20 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		require.Len(t, bot.messages, 1)
 		assert.False(t, bot.messages[0].hasPhoto)
 		assert.Zero(t, bot.messages[0].albumCount)
+	})
+
+	t.Run("双频道各收相册且实例独立", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 200, 9900),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a", "@b"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 2, "两频道各收到一条")
+		assert.Equal(t, 3, bot.messages[0].albumCount)
+		assert.Equal(t, 3, bot.messages[1].albumCount)
+		assert.NotSame(t, bot.messages[0].msg, bot.messages[1].msg, "各频道必须是独立 Message 实例（降级状态不跨频道串味）")
 	})
 }
