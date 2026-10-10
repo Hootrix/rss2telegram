@@ -45,6 +45,7 @@ type fakeTG struct {
 	albumFailCaption400 bool        // 首次 sendMediaGroup 返回 parse entities 400
 	docs                []docSend   // 每次 sendDocument 的字段与文件字节（issue #16 CR）
 	docFail400          bool        // sendDocument 恒返回 400（永久失败）
+	docFailCaption400   bool        // 首次 sendDocument 返回 parse entities 400（issue #16 CR）
 	server              *httptest.Server
 }
 
@@ -250,8 +251,14 @@ func newFakeTG(failFirst bool) *fakeTG {
 			f.mu.Lock()
 			f.docs = append(f.docs, ds)
 			docFail400 := f.docFail400
+			failDocCaption := f.docFailCaption400 && len(f.docs) == 1
 			f.mu.Unlock()
 
+			if failDocCaption {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 150"}`))
+				return
+			}
 			if docFail400 {
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: DOCUMENT_INVALID"}`))
@@ -1198,6 +1205,30 @@ func TestSendDocumentPermanent400FallsBackToText(t *testing.T) {
 	assert.Len(t, f.docs_(), 1, "document 只尝试一次")
 	sends := f.sends_()
 	require.Len(t, sends, 1, "补发了一条文本消息")
+}
+
+// issue #16 CR：caption parse 400 → captionPlain 降级重试一次（去 parse_mode、反转义），
+// doc 保留——失败分类与 photo/album 同构（对照 TestSendAlbumCaptionParseFallback）
+func TestSendDocumentCaptionParseFallback(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.docFailCaption400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	img := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 64)...)
+	m := NewDocumentMessage(`\[转义]标题`, img)
+	_, err = b.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	docs := f.docs_()
+	require.Len(t, docs, 2, "caption parse 重试一次，共两次 document")
+	assert.Equal(t, "Markdown", docs[0].parseMode, "首试带 parse_mode")
+	assert.Equal(t, "", docs[1].parseMode, "降级重试去 parse_mode")
+	assert.Equal(t, "[转义]标题", docs[1].caption, "plain 重试应反转义")
+	assert.True(t, m.captionPlain, "降级状态随 Message 保留")
+	assert.True(t, m.HasDoc(), "caption 问题不丢 doc")
 }
 
 // 边界：空字节等价 NewMessage（调用方免判空）

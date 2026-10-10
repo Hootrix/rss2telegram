@@ -15,12 +15,10 @@ const (
 	// sendMediaGroup 单次相册上限
 	maxAlbumPhotos = 10
 
-	// 解码位图上限（字面 40MP = 40_000_000）：10MB JPEG 可声称任意尺寸，解码前按头部拦截，
-	// 防超大位图打爆常驻内存。
-	// [外部 CR] 原 100MP 过大：16-bit PNG 解码 NRGBA64 8B/px，100MP 即 800MB，
+	// 解码位图上限 40MP = 40_000_000：10MB JPEG 可声称任意尺寸，解码前按头部拦截，
+	// 防超大位图打爆常驻内存。16-bit PNG 解码 NRGBA64 8B/px，100MP 即 800MB，
 	// 双 feed 并发可破 1.5GB（CR）；40MP 覆盖实测案例 1080×33634=36.3MP，最坏单图 320MB，
-	// 配合 sliceSem 串行化把峰值钳到单图水平。
-	// 注意：测试用 10000×10001 = 100_010,000 像素恰好超此阈值，故不能写成 40<<20（≈41.9MP）
+	// 配合 sliceSem 串行化把峰值钳到单图水平
 	maxPhotoPixels = 40_000_000
 
 	// readableChunkHeight [issue #16 CR] Telegram sendPhoto 服务端压缩至长边 ~1280（Bot API 无 HD 档，

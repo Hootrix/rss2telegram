@@ -844,8 +844,12 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 			// if len(chunks) == 1 { return photoPayload{photo: chunks[0]} }
 			// if len(chunks) >= 2 { return photoPayload{album: chunks, truncated: truncated} }
 			if isDimensionError(err) {
-				// type assertion 直接断言安全：isDimensionError 为真即 *photoDimensionError
-				dimErr := err.(*photoDimensionError)
+				// errors.As 风格取回 w/h：未来有人包装 photoDimensionError 时裸断言会 panic，
+				// As 零成本防御；isDimensionError 已保证可达，此兜底防御性保留
+				var dimErr *photoDimensionError
+				if !errors.As(err, &dimErr) { // isDimensionError 已保证可达，防御性兜底
+					continue
+				}
 				if !fitsReadableAlbum(dimErr.w, dimErr.h) {
 					log.Printf("photo over readable album limit, sending as document, feed %s item %q url %s (%dx%d)", feedConfig.Name, item.Title, u, dimErr.w, dimErr.h)
 					return photoPayload{doc: data}
