@@ -269,7 +269,8 @@ func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64
 // 400/413 → 置空 photo 降级全文文本、其余错误保留状态交外层重试
 // 重试放大（photo 路径）：单次 Send 最坏 4 次 API（photo md → photo plain →
 // text md → text plain，其中最多 2 次 ≤10MB 上传）；叠加外层 8 次 Send（普通 3 + flood 5）
-// 最坏 32 次调用 / 16 次上传，仅瞬态错误持续叠加时出现（纯文本现状最坏 16 次，可接受）
+// 最坏 32 次调用 / 16 次上传，仅瞬态错误持续叠加时出现（纯文本现状最坏 16 次，可接受）；
+// album 路径同构（issue #16）
 func (b *Bot) Send(ctx context.Context, channel string, message *Message) (int64, error) {
 	if channel == "" {
 		return 0, errors.New("telegram: empty channel")

@@ -130,7 +130,8 @@ func sliceImage(img image.Image) ([][]byte, bool, error) {
 }
 
 // encodeChunkJPEG 铺白底画布后 q85 重编码（JPEG 无 alpha，透明区直编会变黑），
-// 单片超 maxPhotoBytes 视为整图不可发（极端纹理图，TODO 自适应降质 issue #16）
+// 单片超 maxPhotoBytes 视为整图不可发（极端纹理图，TODO 自适应降质 issue #16）。
+// 上限检查暂无直接单测（构造 >10MB 编码成本过高），如后续引入自适应降质需一并补测
 func encodeChunkJPEG(img image.Image) ([]byte, error) {
 	b := img.Bounds()
 	canvas := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))

@@ -63,6 +63,23 @@ func TestSlicePhoto(t *testing.T) {
 		require.Len(t, chunks, 3)
 	})
 
+	t.Run("恰好 10 片不截断", func(t *testing.T) {
+		// 100×20000：chunkMax=min(9900,2000)=2000 → n=⌈20000/2000⌉=10，恰等 maxAlbumPhotos：
+		// truncated := n > maxAlbumPhotos 的 off-by-one 守护（误写 >= 此用例必红）
+		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 20000))
+		require.NoError(t, err)
+		assert.False(t, truncated)
+		require.Len(t, chunks, maxAlbumPhotos)
+		total := 0
+		for i, c := range chunks {
+			w, h := dims(t, c)
+			assert.Equal(t, 100, w)
+			assert.Equal(t, 2000, h, "片 %d 高度应为满额 chunkMax", i)
+			total += h
+		}
+		assert.Equal(t, 20000, total, "各片拼回总高")
+	})
+
 	t.Run("超过 10 片截尾并置 truncated", func(t *testing.T) {
 		// 100×25000：chunkMax=2000；n=13 > 10 → 10×2000，尾部 5000 丢弃
 		chunks, truncated, err := slicePhoto(encodeGrad(t, 100, 25000))
