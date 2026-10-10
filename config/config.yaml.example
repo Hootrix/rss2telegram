@@ -60,6 +60,13 @@ feeds:
     channels:
       - "@test_push"
     media: photo  # 可选，缺省不启用；只能填 photo，其他值启动报错
+    # photo_slices 相册切片上限（可选，仅在 media: photo 时允许配置，否则启动报错）：
+    # 长图切片相册最多展示的片数；缺省 0 = 默认 10；显式值只能填 2-10（相册硬上限 10）
+    # photo_slices: 10
+    # photo_overlimit 超限长图行为（可选，仅在 media: photo 时允许配置，否则启动报错）：
+    #   document（默认）= 切不完整图的超限长图整图发文件附件（完整但无内联预览）
+    #   crop = 改发顶部 photo_slices 片切片相册预览，caption 注明「（长图过长，已截断）」
+    # photo_overlimit: document
     template: |
       📰 *{title}*
 
