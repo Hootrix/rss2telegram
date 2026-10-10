@@ -1,0 +1,250 @@
+package rss
+
+// issue #16：超限长图切片为 sendPhoto 合规片，纯函数、无状态
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
+)
+
+const (
+	// sendMediaGroup 单次相册上限
+	maxAlbumPhotos = 10
+
+	// 解码位图上限 40MP = 40_000_000：10MB JPEG 可声称任意尺寸，解码前按头部拦截，
+	// 防超大位图打爆常驻内存。16-bit PNG 解码 NRGBA64 8B/px，100MP 即 800MB，
+	// 双 feed 并发可破 1.5GB（CR）；40MP 覆盖实测案例 1080×33634=36.3MP，最坏单图 320MB，
+	// 配合 sliceSem 串行化把峰值钳到单图水平
+	maxPhotoPixels = 40_000_000
+
+	// readableChunkHeight [issue #16 CR] Telegram sendPhoto 服务端压缩至长边 ~1280（Bot API 无 HD 档，
+	// 查证 2026-10）。片高 ≤1280 保证 w≤1280 时整片零缩放；w>1280 时整片被等比压缩
+	// 至长边 1280（系数 1280/w，如 2000 宽压到 0.64×），实测仍可读，优于整图附件；
+	// 行为保留，注释 2026-10-10 二轮评审修正（原「片的长边不被二次缩放、文字零损失」
+	// 仅对 w≤1280 成立）
+	readableChunkHeight = 1280
+
+	// 重编码质量：实测长截图 q85 单片 ≤1MB，远低于 10MB 上限
+	sliceJPEGQuality = 85
+)
+
+// chunkBounds [issue #16 CR] 给定宽度返回合法片高上下限（同时满足 w+h、比例、可读压缩三项）；
+// ok=false 表示该宽度不存在合法片高（过宽图不可切片）。
+// sliceImage 与 fitsReadableAlbum 预检共用，防两处数学漂移
+func chunkBounds(w int) (chunkMax, chunkMin int, ok bool) {
+	chunkMax = min(min(maxPhotoSideSum-w, maxPhotoRatio*w), readableChunkHeight)
+	chunkMin = (w + maxPhotoRatio - 1) / maxPhotoRatio
+	return chunkMax, chunkMin, chunkMax > 0 && chunkMax >= chunkMin
+}
+
+// slicableBounds [issue #16 审查] 判定 (w,h) 是否物理可切合规片：chunkBounds 区间非空
+// 且像素 ≤ 40MP（int64 乘积防 32 位平台溢出，同 checkPixelBudget）。
+// fitsReadableAlbum 与 handler 的 cropable 判据共用，消除多处手写同套数学的漂移风险
+func slicableBounds(w, h int) bool {
+	_, _, ok := chunkBounds(w)
+	return ok && int64(w)*int64(h) <= maxPhotoPixels
+}
+
+// fitsReadableAlbum [issue #16 CR] 用头部尺寸预判能否切成 ≤maxPieces 张零压缩可读片
+// （不做解码，photoForItem 以此决定相册 vs 整图文件，避免切完再丢弃）。
+// [issue #16 用户反馈] maxPieces 参数化（photo_slices 配置）：n > maxPieces 即不可读；
+// 内部仍钳 maxAlbumPhotos 防御（调用方传超硬上限值时按硬上限判定）
+func fitsReadableAlbum(w, h int, maxPieces int) bool {
+	if maxPieces > maxAlbumPhotos {
+		maxPieces = maxAlbumPhotos
+	}
+	// 区间空（过宽不可切）/像素超 40MP 的不可切判定收敛到 slicableBounds 单点
+	if !slicableBounds(w, h) {
+		return false
+	}
+	chunkMax, chunkMin, _ := chunkBounds(w) // slicableBounds 已保证区间非空
+	n := (h + chunkMax - 1) / chunkMax
+	if n > maxPieces {
+		return false
+	}
+	return h/n >= chunkMin // 均匀切分后最低片仍须合法（如 9500×600）
+}
+
+// sliceSem [issue #16 二轮评审] 包级全局已删除：切片串行化职责上移到
+// RssHandler.sliceSerialized（构造注入替代全局状态，见 handler.go）。
+// 原实现保留备查：
+// var sliceSem = make(chan struct{}, 1)
+// （slicePhoto 持信令进出：sliceSem <- struct{}{} / defer func() { <-sliceSem }()）
+
+// unsliceableError [issue #16 二轮评审] 可判别错误：「图片完好但切不动」——
+// 均分不可分区（partition）/ 单片重编码超 10MB。与「数据损坏」（解码失败，普通 error）
+// 区分：handler 的 crop 分支前者兜底发原文件（crop 不应比 document 差，用户裁定），
+// 后者回退下一候选
+type unsliceableError struct{ reason string }
+
+func (e *unsliceableError) Error() string { return "photo unsliceable: " + e.reason }
+
+// isUnsliceableError 判定切片失败是否属「图片完好切不动」（errors.As 识别，
+// 包装链路可追溯）
+func isUnsliceableError(err error) bool {
+	var u *unsliceableError
+	return errors.As(err, &u)
+}
+
+// checkPixelBudget 像素预算守卫，slicePhoto 与 sliceImage 共用：
+// 前者在 DecodeConfig 后、全量解码前调用（内存保护的承重点），
+// 后者在入口调用（覆盖直接传位图的调用方，如测试与未来复用）
+func checkPixelBudget(w, h int) error {
+	// int64 乘积防 32 位平台溢出：JPEG 尺寸上限 65535² ≈ 4.29e9 超 int32，
+	// int 为 32 位的平台上 w*h 会回绕成负数绕过守卫
+	if int64(w)*int64(h) > maxPhotoPixels {
+		return fmt.Errorf("slice photo: %dx%d pixels exceed %d", w, h, maxPhotoPixels)
+	}
+	return nil
+}
+
+// slicePhoto 解码原始图片字节并切片。
+// DecodeConfig 头部先行像素预检（全量解码前拦截超大位图），
+// 解码失败（webp/损坏/未注册格式）返回 error，由调用方回退下一候选；
+// 切不动（均分不可分/单片超限）返回 unsliceableError。
+// [issue #16 二轮评审] 回归纯函数：串行化已上移 handler（sliceSerialized），
+// 原函数内持包级 sliceSem 的两行保留备查：
+// sliceSem <- struct{}{} / defer func() { <-sliceSem }()
+// [issue #16 用户反馈] maxPieces：相册切片上限（photo_slices），语义见 sliceImage
+func slicePhoto(data []byte, maxPieces int) ([][]byte, bool, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, false, fmt.Errorf("slice photo: decode config: %w", err)
+	}
+	if err := checkPixelBudget(cfg.Width, cfg.Height); err != nil {
+		return nil, false, err
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, false, fmt.Errorf("slice photo: decode: %w", err)
+	}
+	return sliceImage(img, maxPieces)
+}
+
+// sliceImage 将已解码位图按片高均匀切段重编码。
+// 片高合法区间 [⌈w/20⌉, min(10000−w, 20w, readableChunkHeight)]（同时满足 w+h、
+// 比例与可读压缩三项，由 chunkBounds 统一给出，issue #16 CR）；
+// 切片触发（调用方经 validatePhoto 判定超限）时 n ≥ 2；限内图直接调用则自然产出单片，
+// 由调用方决定单图/相册路径（TestSliceImageTransparentPNG 即单片例证）。
+// [issue #16 用户反馈] maxPieces：相册切片上限（photo_slices，handler 侧保证 2-10），
+// 所需片数 n 超过 maxPieces 时截尾（truncated=true，取顶部 maxPieces 片）——
+// 该路径由 photo_overlimit=crop 正式启用；原实现硬编码 maxAlbumPhotos（注释保留：
+// truncated := n > maxAlbumPhotos / n = maxAlbumPhotos）。
+// 边界：maxPieces > 硬上限钳回 maxAlbumPhotos（防调用方传错击穿 sendMediaGroup）；
+// maxPieces < 1 防御性报错（config 校验已挡，这里兜底直接调用的调用方）
+func sliceImage(img image.Image, maxPieces int) ([][]byte, bool, error) {
+	// 上界钳制：sendMediaGroup 硬上限不可突破（原实现在下方截尾处硬编码 maxAlbumPhotos，
+	// 参数化后移到入口统一钳制，注释说明缘由）
+	if maxPieces > maxAlbumPhotos {
+		maxPieces = maxAlbumPhotos
+	}
+	if maxPieces < 1 {
+		return nil, false, fmt.Errorf("slice photo: maxPieces %d below 1", maxPieces)
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	// 入口像素守卫：slicePhoto 已预检过，这里兜底直接传位图的调用方
+	if err := checkPixelBudget(w, h); err != nil {
+		return nil, false, err
+	}
+	chunkMax, chunkMin, ok := chunkBounds(w)
+	if !ok {
+		return nil, false, fmt.Errorf("slice photo: width %d has no valid chunk height (range [%d,%d])", w, chunkMin, chunkMax)
+	}
+	// [issue #16 CR] 旧内联计算（readableChunkHeight 引入前）保留备查：
+	// chunkMax := min(maxPhotoSideSum-w, maxPhotoRatio*w)
+	// chunkMin := (w + maxPhotoRatio - 1) / maxPhotoRatio
+	// if chunkMax <= 0 || chunkMax < chunkMin {
+	// 	return nil, false, fmt.Errorf("slice photo: width %d has no valid chunk height (range [%d,%d])", w, chunkMin, chunkMax)
+	// }
+	// [外部 CR] 短边守卫：切片是纵向切，片宽=图宽，w < 50 的图切出来仍低于 Telegram
+	// 短边下限，不可修复；validatePhoto 已在 fetch 路径拦截，此处兜底直接传位图的调用方
+	if w < minPhotoSide {
+		return nil, false, fmt.Errorf("slice photo: width %d below minimum side %d", w, minPhotoSide)
+	}
+	// h=0 → n=⌈0/chunkMax⌉=0 → 下方 base := h/n 整型除零 panic；h<0 同落 n=0，一并拦截。
+	// w<=0 理论上已被上方区间守卫拦截（w=0 → 20w=0；w<0 → 20w<0，均使 chunkMax<=0），
+	// 此处对称防御，防上游构造出倒置 Rect（Bounds.Dx() 可为负）
+	if h <= 0 || w <= 0 {
+		return nil, false, fmt.Errorf("slice photo: invalid dimensions %dx%d", w, h)
+	}
+
+	n := (h + chunkMax - 1) / chunkMax
+	// [issue #16 用户反馈] 原实现：truncated := n > maxAlbumPhotos（硬上限 10）；
+	// 参数化后以 maxPieces 为截断阈值，超限时取顶部 maxPieces 片
+	truncated := n > maxPieces
+	if truncated {
+		n = maxPieces
+	}
+	// 均匀切分：n 段，前 rem 段 +1px；base=⌊h/n⌋
+	base := h / n
+	if !truncated && base < chunkMin {
+		// 区间非空但 h 无法分成合法段（如 9500×600），不可修复。
+		// [issue #16 二轮评审] 包 unsliceableError：图片完好切不动，crop 分支
+		// 据此兜底原文件（数据损坏类错误保持普通 error 走回退）
+		return nil, false, &unsliceableError{reason: fmt.Sprintf("height %d cannot partition into valid chunks (base %d < min %d)", h, base, chunkMin)}
+	}
+
+	type span struct{ y0, y1 int }
+	var spans []span
+	if truncated {
+		// 截尾路径：片高固定取 chunkMax（不是 base），保证逐片 w+h 合规，尾部像素直接丢弃
+		// （原实现固定切满 maxAlbumPhotos 片，参数化后切满 maxPieces 片）
+		for i := 0; i < maxPieces; i++ {
+			spans = append(spans, span{b.Min.Y + i*chunkMax, b.Min.Y + (i+1)*chunkMax})
+		}
+	} else {
+		rem := h % n
+		y := b.Min.Y
+		for i := 0; i < n; i++ {
+			ph := base
+			if i < rem {
+				ph++
+			}
+			spans = append(spans, span{y, y + ph})
+			y += ph
+		}
+	}
+
+	sub, ok := img.(interface {
+		SubImage(image.Rectangle) image.Image
+	})
+	if !ok { // 标准库解码产物均实现 SubImage，防御性分支
+		return nil, false, fmt.Errorf("slice photo: image type %T lacks SubImage", img)
+	}
+	var chunks [][]byte
+	for _, s := range spans {
+		piece := sub.SubImage(image.Rect(b.Min.X, s.y0, b.Max.X, s.y1))
+		chunk, err := encodeChunkJPEG(piece)
+		if err != nil {
+			return nil, false, err
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, truncated, nil
+}
+
+// encodeChunkJPEG 铺白底画布后 q85 重编码（JPEG 无 alpha，透明区直编会变黑），
+// 单片超 maxPhotoBytes 视为整图不可发（极端纹理图，TODO 自适应降质 issue #16）。
+// 上限检查暂无直接单测（构造 >10MB 编码成本过高），如后续引入自适应降质需一并补测
+func encodeChunkJPEG(img image.Image) ([]byte, error) {
+	b := img.Bounds()
+	canvas := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	draw.Draw(canvas, canvas.Bounds(), img, b.Min, draw.Over)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, canvas, &jpeg.Options{Quality: sliceJPEGQuality}); err != nil {
+		return nil, fmt.Errorf("slice photo: encode: %w", err)
+	}
+	if buf.Len() > maxPhotoBytes {
+		// [issue #16 二轮评审] 极端纹理图单片超限：图片完好切不动（降质是另一回事，
+		// TODO 自适应降质 issue #16），包 unsliceableError 供 crop 分支兜底原文件
+		return nil, &unsliceableError{reason: fmt.Sprintf("chunk %d bytes exceeds %d", buf.Len(), maxPhotoBytes)}
+	}
+	return buf.Bytes(), nil
+}

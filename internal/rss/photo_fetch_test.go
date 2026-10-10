@@ -69,6 +69,30 @@ func TestValidatePhoto(t *testing.T) {
 		webp := append([]byte("RIFF\x00\x00\x00\x00WEBPVP8 "), make([]byte, 32)...)
 		assert.NoError(t, validatePhoto(webp))
 	})
+	// issue #16：尺寸/比例超限须返回可判别的 photoDimensionError（handler 据此触发切片），
+	// 其余失败类别必须不可误判
+	t.Run("w+h 超限返回可切片的 dimension 错误", func(t *testing.T) {
+		err := validatePhoto(encodeGray(t, 1080, 10492, true))
+		assert.True(t, isDimensionError(err), "w+h 超限应可切片: %v", err)
+	})
+	t.Run("比例超限返回可切片的 dimension 错误", func(t *testing.T) {
+		err := validatePhoto(encodeGray(t, 60, 1260, false))
+		assert.True(t, isDimensionError(err), "比例超限应可切片: %v", err)
+	})
+	t.Run("短边过小不可切片（切片只会更小）", func(t *testing.T) {
+		assert.False(t, isDimensionError(validatePhoto(encodeGray(t, 100, 49, false))))
+	})
+	// 外部 CR：40×12000 的 w+h=12040 超限，但短边 40 < 50，切片只会更小不可修复——
+	// 短边检查必须先于 w+h 判定，否则被误判为可切片的尺寸类错误
+	t.Run("窄长条短边过小不可切片（先于 w+h 判定）", func(t *testing.T) {
+		// 40×12000：w+h=12040 超限但短边 40 < 50，切片只会更小 → 非尺寸类错误
+		err := validatePhoto(encodeGray(t, 40, 12000, true))
+		assert.False(t, isDimensionError(err))
+		assert.Error(t, err)
+	})
+	t.Run("非尺寸失败不可切片", func(t *testing.T) {
+		assert.False(t, isDimensionError(validatePhoto([]byte("<html>x</html>"))))
+	})
 }
 
 // issue #13：httpPhotoFetcher.Fetch——状态码/大小/嗅探/UA/超时

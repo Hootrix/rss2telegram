@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,14 @@ type fakeTG struct {
 	photoFail413        bool        // sendPhoto 恒返回 413（实体过大）
 	photoFail500        bool        // sendPhoto 恒返回 500（瞬态失败）
 	photoFailCaption400 bool        // sendPhoto 首次返回 parse entities 400
+	albums              []albumSend // 每次 sendMediaGroup 的 media 数组与图片字节（issue #16）
+	albumFail400        bool        // sendMediaGroup 恒返回 400（尺寸永久失败）
+	albumFail500        bool        // sendMediaGroup 恒返回 500（瞬态失败）
+	albumFail429        bool        // sendMediaGroup 恒返回 429 + retry_after（外部 CR：429 不得计入保险丝）
+	albumFailCaption400 bool        // 首次 sendMediaGroup 返回 parse entities 400
+	docs                []docSend   // 每次 sendDocument 的字段与文件字节（issue #16 CR）
+	docFail400          bool        // sendDocument 恒返回 400（永久失败）
+	docFailCaption400   bool        // 首次 sendDocument 返回 parse entities 400（issue #16 CR）
 	server              *httptest.Server
 }
 
@@ -45,6 +54,30 @@ type photoSend struct {
 	caption   string
 	parseMode string // "" = 请求未带 parse_mode
 	photo     []byte
+}
+
+// albumSend 记录一次 sendMediaGroup 请求的关键字段（issue #16）：
+// caption/parse_mode 在 media JSON 数组内（telebot SendAlbum 逐项写入），非顶层表单
+type albumSend struct {
+	media  []albumMedia
+	photos [][]byte // 按 attach://<index> 顺序
+}
+
+type albumMedia struct {
+	Type      string `json:"type"`
+	Media     string `json:"media"`
+	Caption   string `json:"caption"`
+	ParseMode string `json:"parse_mode"`
+}
+
+// docSend 记录一次 sendDocument 请求的关键字段（issue #16 CR）。
+// 与 sendPhoto 的 FromReader 陷阱不同：tele.Document.MediaFile 会把 FileName 写入
+// File.fileName，multipart 文件部件的 filename 为 "long-image.*"，可直接从文件部件取
+type docSend struct {
+	caption   string
+	parseMode string
+	fileName  string // multipart 文件部件 filename（telebot 由 Document.FileName 填写）
+	data      []byte
 }
 
 func newFakeTG(failFirst bool) *fakeTG {
@@ -130,6 +163,117 @@ func newFakeTG(failFirst bool) *fakeTG {
 					"photo":      []map[string]any{{"file_id": "ph1", "file_unique_id": "u1", "width": 100, "height": 100}},
 				},
 			})
+		case "sendMediaGroup":
+			// telebot SendAlbum：media 为 JSON 数组字符串，文件字段名 "0"、"1"…
+			// 与 sendPhoto 同款陷阱：v3.1.3 FromReader 不设 fileName → CreateFormFile
+			// 产出 filename="" 部件，Go 服务端 ReadForm 归为表单值而非文件部件，
+			// 故优先取文件部件、取不到再回退 FormValue(idx)
+			as := albumSend{}
+			if err := r.ParseMultipartForm(64 << 20); err == nil && r.MultipartForm != nil {
+				_ = json.Unmarshal([]byte(r.FormValue("media")), &as.media)
+				for range as.media {
+					idx := strconv.Itoa(len(as.photos))
+					if files := r.MultipartForm.File[idx]; len(files) > 0 {
+						fh, _ := files[0].Open()
+						b, _ := io.ReadAll(fh)
+						_ = fh.Close()
+						as.photos = append(as.photos, b)
+					} else if v := r.FormValue(idx); v != "" {
+						as.photos = append(as.photos, []byte(v))
+					}
+				}
+			}
+			f.mu.Lock()
+			f.albums = append(f.albums, as)
+			albumFail400 := f.albumFail400
+			albumFail500 := f.albumFail500
+			albumFail429 := f.albumFail429
+			failCaption := f.albumFailCaption400 && len(f.albums) == 1
+			f.mu.Unlock()
+
+			// 429 报文形态复用 sendMessage flood429 的 JSON（issue #6 线上报文）：
+			// 带 retry_after 参数时 telebot extractOk 返回 FloodError 值类型
+			if albumFail429 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				writeFakeJSON(w, map[string]any{
+					"ok": false, "error_code": 429,
+					"description": "Too Many Requests: retry after 21",
+					"parameters":  map[string]any{"retry_after": 21},
+				})
+				return
+			}
+			if albumFail500 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":500,"description":"Internal Server Error"}`))
+				return
+			}
+			if failCaption {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 150"}`))
+				return
+			}
+			if albumFail400 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: MEDIA_GROUP_INVALID"}`))
+				return
+			}
+			// sendMediaGroup 成功响应 result 为消息数组：按 media 数动态生成
+			// （message_id 从 1 递增）。硬编码 2 条会在 ≥3 片相册时让 telebot
+			// 回写循环按文件数索引 result 越界 panic
+			results := make([]map[string]any, len(as.media))
+			for i := range results {
+				results[i] = map[string]any{
+					"message_id": i + 1,
+					"chat":       map[string]any{"id": -1009999, "type": "channel"},
+					"date":       1,
+				}
+			}
+			writeFakeJSON(w, map[string]any{"ok": true, "result": results})
+		case "sendDocument":
+			// [issue #16 CR] 整图文件路径：文件部件字段名 "document"（telebot sendMedia
+			// 以 MediaType 作为端点与字段名），multipart filename 已由 Document.FileName 填写。
+			// 与 photo 同款陷阱保留：取不到文件部件时回退 FormValue("document")
+			ds := docSend{}
+			if err := r.ParseMultipartForm(64 << 20); err == nil && r.MultipartForm != nil {
+				ds.caption = r.FormValue("caption")
+				ds.parseMode = r.FormValue("parse_mode")
+				if files := r.MultipartForm.File["document"]; len(files) > 0 {
+					ds.fileName = files[0].Filename
+					fh, _ := files[0].Open()
+					b, _ := io.ReadAll(fh)
+					_ = fh.Close()
+					ds.data = b
+				} else if v := r.FormValue("document"); v != "" {
+					ds.data = []byte(v)
+				}
+			}
+			f.mu.Lock()
+			f.docs = append(f.docs, ds)
+			docFail400 := f.docFail400
+			failDocCaption := f.docFailCaption400 && len(f.docs) == 1
+			f.mu.Unlock()
+
+			if failDocCaption {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 150"}`))
+				return
+			}
+			if docFail400 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: DOCUMENT_INVALID"}`))
+				return
+			}
+			// 成功响应形态与 sendMessage 相同（result 带 message_id/text）
+			writeFakeJSON(w, map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"message_id": 1,
+					"chat":       map[string]any{"id": -1009999, "type": "channel"},
+					"date":       1,
+					"text":       ds.caption,
+				},
+			})
 		case "sendMessage":
 			body, _ := io.ReadAll(r.Body)
 			var m map[string]any
@@ -203,6 +347,18 @@ func (f *fakeTG) photos_() []photoSend {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]photoSend{}, f.photos...)
+}
+
+func (f *fakeTG) albums_() []albumSend {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]albumSend{}, f.albums...)
+}
+
+func (f *fakeTG) docs_() []docSend {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]docSend{}, f.docs...)
 }
 
 func writeFakeJSON(w http.ResponseWriter, v any) {
@@ -628,6 +784,50 @@ func TestTruncateCaption(t *testing.T) {
 	})
 }
 
+// issue #16 用户反馈：AppendCaptionNote 在 1024 码元预算内拼接附注——
+// 先预截正文再拼附注，保证附注本身不被 Send 路径的统一截断吞掉
+// （长描述 feed 的 caption 常 ≥1013 码元，裸拼接的附注必被截尾）
+func TestAppendCaptionNote(t *testing.T) {
+	const note = "（长图过长，已截断）" // 10 个 BMP 字符 = 10 码元
+
+	t.Run("短正文原样附注", func(t *testing.T) {
+		assert.Equal(t, "hello\n\n"+note, AppendCaptionNote("hello", note))
+	})
+
+	t.Run("1013 码元正文附注后总长恰在预算内且 rune 边界完整", func(t *testing.T) {
+		// 1013 汉字 = 1013 码元；budget = 1024-10-2 = 1012 → 预截正文 1012；
+		// 总长 1012+2+10 = 1024 恰满，附注完整在尾（裸拼接时附注必被吞）
+		in := strings.Repeat("新", 1013)
+		got := AppendCaptionNote(in, note)
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, got)
+		assert.LessOrEqual(t, captionUnits(got), maxCaptionUnits, "总码元不得超 1024")
+		assert.True(t, strings.HasSuffix(got, note), "附注必须完整保留在尾部")
+	})
+
+	t.Run("正文含换行时预算内回退到换行", func(t *testing.T) {
+		// budget=1012 内换行回退仍生效：换行前 600 ≥ budget/2 → 截到换行
+		in := strings.Repeat("a", 600) + "\n" + strings.Repeat("b", 600)
+		assert.Equal(t, strings.Repeat("a", 600)+"\n\n"+note, AppendCaptionNote(in, note))
+	})
+
+	t.Run("note 超预算的防御路径 budget 归零", func(t *testing.T) {
+		// note 自身 ≥1024 码元（真实调用不会发生，防御锁定行为）：
+		// budget = 1024-1024-2 < 0 → 0，正文整段丢弃，只剩 sep+note
+		bigNote := strings.Repeat("新", 1024)
+		got := AppendCaptionNote("hello", bigNote)
+		assert.Equal(t, "\n\n"+bigNote, got)
+	})
+
+	t.Run("emoji 宽度计入预算", func(t *testing.T) {
+		// 506 emoji = 1012 码元恰好用满 budget，附注仍完整；
+		// 再补一个 emoji（+2）会被预截掉，emoji 不被劈半
+		in := strings.Repeat("🎉", 507)
+		got := AppendCaptionNote(in, note)
+		assert.Equal(t, strings.Repeat("🎉", 506)+"\n\n"+note, got)
+		assert.LessOrEqual(t, captionUnits(got), maxCaptionUnits)
+	})
+}
+
 // issue #13：Message 携带可选图片字节；空字节等价普通文本消息
 func TestNewPhotoMessage(t *testing.T) {
 	t.Run("有图", func(t *testing.T) {
@@ -855,4 +1055,310 @@ func TestSendPhotoCaptionPlainThenPermanentFallsBackWithMarkdown(t *testing.T) {
 	require.Len(t, sends, 1, "图片永久失败后只发一次文本")
 	assert.Equal(t, "Markdown", sends[0]["parse_mode"], "captionPlain 不得污染 plain，全文仍走 markdown")
 	assert.Equal(t, `\[标题]正文`, sends[0]["text"], "降级文本为反转义前的全文原文")
+}
+
+// issue #16 二轮评审：captionNote 仅进 caption（1024 预算内拼接），
+// text 恒为全文——photo 永久失败降级纯文本时用 4096 全文，附注不得污染
+func TestCaptionNoteOnlyInCaption(t *testing.T) {
+	const note = "（长图过长，已截断）" // 10 码元
+	// 1013 码元汉字正文：budget = 1024-10-2 = 1012 → caption 中正文预截 1012
+	base := strings.Repeat("新", 1013)
+
+	t.Run("album 附注进 caption 首片且 text 保留全文", func(t *testing.T) {
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewPhotoAlbumMessage(base, [][]byte{[]byte("img1"), []byte("img2")})
+		m.SetCaptionNote(note)
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		albums := f.albums_()
+		require.Len(t, albums, 1)
+		cap := albums[0].media[0].Caption
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, cap, "caption=预截正文+附注，恰 1024 码元")
+		assert.True(t, strings.HasSuffix(cap, note), "附注不被截断吞掉")
+		assert.Equal(t, base, m.Text(), "text 恒全文：无附注、无 1024 截断")
+		assert.Equal(t, note, m.CaptionNote())
+	})
+
+	t.Run("doc 附注进 caption 且 text 保留全文", func(t *testing.T) {
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewDocumentMessage(base, []byte("img1"))
+		m.SetCaptionNote(note)
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		docs := f.docs_()
+		require.Len(t, docs, 1)
+		cap := docs[0].caption
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, cap)
+		assert.Equal(t, base, m.Text(), "text 恒全文")
+	})
+
+	t.Run("photo 附注进 caption", func(t *testing.T) {
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewPhotoMessage(base, []byte("img1"))
+		m.SetCaptionNote(note)
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		photos := f.photos_()
+		require.Len(t, photos, 1)
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, photos[0].caption)
+	})
+
+	t.Run("无附注行为不变", func(t *testing.T) {
+		// captionNote 零值空串：caption 构造与既有路径逐字节一致
+		f := newFakeTG(false)
+		defer f.server.Close()
+		t.Setenv("TELEGRAM_API_URL", f.server.URL)
+		b, err := NewBot(context.Background(), "1:test")
+		require.NoError(t, err)
+
+		m := NewPhotoAlbumMessage("cap", [][]byte{[]byte("img1"), []byte("img2")})
+		_, err = b.Send(context.Background(), "@it", m)
+		require.NoError(t, err)
+
+		albums := f.albums_()
+		assert.Equal(t, "cap", albums[0].media[0].Caption)
+		assert.Empty(t, m.CaptionNote())
+	})
+}
+
+// issue #16：相册消息——sendMediaGroup、caption 首片挂载、失败分类复用 photo 语义
+func TestSendAlbumSuccess(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage("cap", [][]byte{[]byte("img1"), []byte("img2")})
+	msgID, err := b.Send(context.Background(), "@it", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID, "取相册首条 message_id（回填链接用）")
+	albums := f.albums_()
+	require.Len(t, albums, 1)
+	as := albums[0]
+	require.Len(t, as.media, 2)
+	require.Len(t, as.photos, 2)
+	assert.Equal(t, "photo", as.media[0].Type)
+	assert.Equal(t, "photo", as.media[1].Type)
+	// telebot v3.1.3 ModeMarkdown = "Markdown"（大写 M），逐项写入 InputMedia JSON
+	assert.Equal(t, "Markdown", as.media[0].ParseMode)
+	assert.Equal(t, "cap", as.media[0].Caption, "caption 仅挂首片")
+	assert.Empty(t, as.media[1].Caption)
+	assert.Equal(t, []byte("img1"), as.photos[0], "attach://0 对应首片字节")
+	assert.Equal(t, []byte("img2"), as.photos[1])
+	assert.True(t, m.HasAlbum(), "发送成功不改变相册状态")
+}
+
+// caption parse 400 → captionPlain 降级重试一次（去 parse_mode、反转义），相册保留
+func TestSendAlbumCaptionParseFallback(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.albumFailCaption400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage("a*b", [][]byte{[]byte("img1"), []byte("img2")})
+	_, err = b.Send(context.Background(), "@it", m)
+
+	require.NoError(t, err)
+	albums := f.albums_()
+	require.Len(t, albums, 2)
+	assert.Equal(t, "Markdown", albums[0].media[0].ParseMode, "首试带 parse_mode")
+	assert.Empty(t, albums[1].media[0].ParseMode, "降级重试去 parse_mode")
+	assert.Equal(t, "a*b", albums[1].media[0].Caption, "caption 反转义后原样（无转义序列时不变）")
+	assert.True(t, m.captionPlain, "降级状态随 Message 保留")
+	assert.True(t, m.HasAlbum(), "caption 问题不丢相册")
+}
+
+// 400 属图片永久失败：置空相册就地降级文本，不算瞬态失败交外层重试
+func TestSendAlbumPermanent400FallsBackToText(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.albumFail400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage("txt", [][]byte{[]byte("img1"), []byte("img2")})
+	_, err = b.Send(context.Background(), "@it", m)
+
+	require.NoError(t, err, "400 属图片永久失败，就地降级文本成功")
+	assert.False(t, m.HasAlbum(), "相册已置空")
+	assert.False(t, m.HasPhoto())
+	sends := f.sends_()
+	require.Len(t, sends, 1, "补发了一条文本消息")
+}
+
+// 复合边界：caption md parse 400 → album plain 重试恰逢相册永久 400 →
+// 置空相册降级全文文本。锁死时序：captionPlain 已置 true 但 plain 未动，
+// 降级文本仍带 Markdown（对照 TestSendPhotoCaptionPlainThenPermanentFallsBackWithMarkdown）
+func TestSendAlbumCaptionPlainThenPermanentFallsBackWithMarkdown(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.albumFailCaption400 = true
+	f.albumFail400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage(`\[标题]正文`, [][]byte{[]byte("img1"), []byte("img2")})
+	msgID, err := b.Send(context.Background(), "@it", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	albums := f.albums_()
+	require.Len(t, albums, 2, "caption parse 重试一次，共两次 album")
+	assert.Equal(t, "Markdown", albums[0].media[0].ParseMode)
+	assert.Empty(t, albums[1].media[0].ParseMode, "caption plain 重试不带 parse_mode")
+	assert.False(t, m.HasAlbum(), "相册永久失败后已置空")
+	assert.False(t, m.HasPhoto())
+	sends := f.sends_()
+	require.Len(t, sends, 1, "相册永久失败后只发一次文本")
+	assert.Equal(t, "Markdown", sends[0]["parse_mode"], "captionPlain 不得污染 plain，全文仍走 markdown")
+	assert.Equal(t, `\[标题]正文`, sends[0]["text"], "降级文本为反转义前的全文原文")
+}
+
+// 瞬态失败走保险丝：首次失败保留相册交外层重试；达 maxPhotoTransientFails
+// 阈值放弃相册降级文本（与 photo 保险丝共用计数）
+func TestSendAlbumTransientFuse(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.albumFail500 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage("txt", [][]byte{[]byte("img1"), []byte("img2")})
+	_, err = b.Send(context.Background(), "@it", m)
+	assert.Error(t, err, "第一次瞬态失败保留相册交外层重试")
+	assert.True(t, m.HasAlbum())
+
+	m.photoTransientFails = maxPhotoTransientFails - 1 // 已累计到阈值-1，本次再失败触发保险丝
+	_, err = b.Send(context.Background(), "@it", m)
+	require.NoError(t, err, "达阈值放弃相册降级文本")
+	assert.False(t, m.HasAlbum(), "保险丝触发置空相册")
+}
+
+// 边界：空切片等价 NewMessage（调用方免判空）
+func TestNewPhotoAlbumMessageEmpty(t *testing.T) {
+	assert.Equal(t, NewMessage("x").text, NewPhotoAlbumMessage("x", nil).text)
+	assert.False(t, NewPhotoAlbumMessage("x", nil).HasAlbum())
+}
+
+// 外部 CR：429 不计入保险丝——服务端已指示冷却时长，外层有独立 flood 配额
+// （maxFloodRetries=5）与冷却等待；若 429 计入 photoTransientFails，同一消息
+// 第 2 次 429 即触发保险丝置空相册/图片降级文本，首刷撞频道限额是必然场景，
+// 置空后外层重试永远失去图片，属确定性回归
+func TestSendAlbum429NotCountedIntoFuse(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.albumFail429 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	m := NewPhotoAlbumMessage("txt", [][]byte{[]byte("img1"), []byte("img2")})
+	_, err = b.Send(context.Background(), "@it", m)
+
+	assert.Error(t, err)
+	var rl *RateLimitError
+	assert.True(t, errors.As(err, &rl), "429 应包装为 RateLimitError 交外层冷却")
+	assert.True(t, m.HasAlbum(), "429 不得置空相册")
+	assert.Zero(t, m.photoTransientFails, "429 不得计入保险丝")
+}
+
+// issue #16 CR：document 成功路径——文件字节原样上传、文件名按字节嗅探、
+// caption/parse_mode 语义与 photo 相同、msgID 取自成功响应
+func TestSendDocumentSuccess(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	// png 魔数 + 填充：http.DetectContentType 判 image/png → 文件名 long-image.png（稳定，
+	// 最小 JPEG 头嗅探不可靠，见 http.DetectContentType 对 JPEG 需完整 SOI+APP0 标记）
+	img := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 64)...)
+	m := NewDocumentMessage("*标题*", img)
+	msgID, err := b.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), msgID)
+	docs := f.docs_()
+	require.Len(t, docs, 1)
+	assert.Equal(t, "long-image.png", docs[0].fileName, "文件名应按字节嗅探生成")
+	assert.Equal(t, img, docs[0].data, "文件字节应与原图一致")
+	assert.Equal(t, "*标题*", docs[0].caption, "caption 首挂")
+	assert.Equal(t, "Markdown", docs[0].parseMode)
+	assert.True(t, m.HasDoc(), "发送成功不改变 doc 状态")
+}
+
+// document 400 属永久失败：置空 doc 就地降级文本（与 photo/album 同构）
+func TestSendDocumentPermanent400FallsBackToText(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.docFail400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	img := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 64)...)
+	m := NewDocumentMessage("txt", img)
+	_, err = b.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err, "400 属永久失败，就地降级文本成功")
+	assert.False(t, m.HasDoc(), "doc 已置空")
+	assert.Len(t, f.docs_(), 1, "document 只尝试一次")
+	sends := f.sends_()
+	require.Len(t, sends, 1, "补发了一条文本消息")
+}
+
+// issue #16 CR：caption parse 400 → captionPlain 降级重试一次（去 parse_mode、反转义），
+// doc 保留——失败分类与 photo/album 同构（对照 TestSendAlbumCaptionParseFallback）
+func TestSendDocumentCaptionParseFallback(t *testing.T) {
+	f := newFakeTG(false)
+	defer f.server.Close()
+	f.docFailCaption400 = true
+	t.Setenv("TELEGRAM_API_URL", f.server.URL)
+	b, err := NewBot(context.Background(), "1:test")
+	require.NoError(t, err)
+
+	img := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 64)...)
+	m := NewDocumentMessage(`\[转义]标题`, img)
+	_, err = b.Send(context.Background(), "@chan", m)
+
+	require.NoError(t, err)
+	docs := f.docs_()
+	require.Len(t, docs, 2, "caption parse 重试一次，共两次 document")
+	assert.Equal(t, "Markdown", docs[0].parseMode, "首试带 parse_mode")
+	assert.Equal(t, "", docs[1].parseMode, "降级重试去 parse_mode")
+	assert.Equal(t, "[转义]标题", docs[1].caption, "plain 重试应反转义")
+	assert.True(t, m.captionPlain, "降级状态随 Message 保留")
+	assert.True(t, m.HasDoc(), "caption 问题不丢 doc")
+}
+
+// 边界：空字节等价 NewMessage（调用方免判空）
+func TestNewDocumentMessageEmpty(t *testing.T) {
+	assert.Equal(t, NewMessage("x").text, NewDocumentMessage("x", nil).text)
+	assert.False(t, NewDocumentMessage("x", nil).HasDoc())
 }

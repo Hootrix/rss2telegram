@@ -895,17 +895,20 @@ func (f *cancelingFetcher) Fetch(ctx context.Context, _ string) ([]byte, error) 
 	return nil, ctx.Err()
 }
 
-// photoBot 记录每次收到的消息形态（HasPhoto/Text/频道/实例指针），返回成功。
+// photoBot 记录每次收到的消息形态（HasPhoto/HasDoc/Text/频道/实例指针），返回成功。
 // msg 指针供断言「各频道收到独立 Message 实例」（spec §7）：锁住
 // NewPhotoMessage 在频道循环内的构造位置——挪到循环外会共享实例、
 // photo 降级状态跨频道串味，NotSame 断言此时必失败
 type photoBot struct {
 	mu       sync.Mutex
 	messages []struct {
-		channel  string
-		hasPhoto bool
-		text     string
-		msg      *telegram.Message
+		channel     string
+		hasPhoto    bool
+		hasDoc      bool // [issue #16 CR] 整图文件消息
+		albumCount  int  // [issue #16] 相册切片张数（AlbumCount()）
+		text        string
+		captionNote string // [issue #16 二轮评审] 截断附注（CaptionNote()，仅进 caption）
+		msg         *telegram.Message
 	}
 }
 
@@ -913,11 +916,14 @@ func (b *photoBot) Send(_ context.Context, channel string, m *telegram.Message) 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.messages = append(b.messages, struct {
-		channel  string
-		hasPhoto bool
-		text     string
-		msg      *telegram.Message
-	}{channel, m.HasPhoto(), m.Text(), m})
+		channel     string
+		hasPhoto    bool
+		hasDoc      bool
+		albumCount  int
+		text        string
+		captionNote string
+		msg         *telegram.Message
+	}{channel, m.HasPhoto(), m.HasDoc(), m.AlbumCount(), m.Text(), m.CaptionNote(), m})
 	return 1, nil
 }
 
@@ -948,7 +954,8 @@ func newPhotoTestHandler(t *testing.T, channels []string, bot TelegramBot, fetch
 }
 
 func TestProcessFeedPhotoMode(t *testing.T) {
-	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47} // mock 不校验内容，占位字节即可
+	// [issue #16] validatePhoto 已移至 handler 路径，stub 需通过校验（短边 ≥50）
+	pngBytes := encodeGray(t, 60, 50, false)
 
 	t.Run("下载成功收到 photo 消息", func(t *testing.T) {
 		bot := &photoBot{}
@@ -1046,5 +1053,228 @@ func TestProcessFeedPhotoMode(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Empty(t, bot.messages, "取消后不应发送")
 		assert.Equal(t, 1, fetcher.calls, "取消后不再回退第二候选")
+	})
+}
+
+// issue #16：超限长图切片相册端到端（CR 修订：片高 ≤1280 可读切片；不可读改发整图文件）
+func TestProcessFeedPhotoAlbumMode(t *testing.T) {
+	t.Run("尺寸超限长图切片为相册", func(t *testing.T) {
+		// 200×9900：w+h=10100 超限 → 预检可读 → 切 8 片（片高 ≤1280）合规 JPEG
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 200, 9900),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 8, bot.messages[0].albumCount)
+		assert.False(t, bot.messages[0].hasPhoto)
+		assert.False(t, bot.messages[0].hasDoc)
+		assert.NotContains(t, bot.messages[0].text, "已截断", "完整相册无附注（截断附注仅 crop 路径）")
+		_, calls := fetcher.snapshot()
+		assert.Equal(t, 1, calls, "切片胜出不回退后续候选")
+	})
+
+	t.Run("超长图整图走文件", func(t *testing.T) {
+		// 100×25000：n=20 > 10 → 不可读相册 → 整图 sendDocument（零信息损失，无截断附注）
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 25000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasDoc)
+		assert.Zero(t, bot.messages[0].albumCount)
+		assert.False(t, bot.messages[0].hasPhoto)
+		assert.Equal(t, "photo item", bot.messages[0].text, "doc 路径文本为纯渲染文本")
+	})
+
+	t.Run("w 过宽整图走文件且不回退", func(t *testing.T) {
+		// 首候选 9600×1000：片高区间空不可切片 → 整图文件胜出（文件已完整承载内容），
+		// 不回退次候选
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png":  encodeGrad(t, 9600, 1000),
+			"https://img.example.com/second.png": encodeGray(t, 60, 50, false),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasDoc)
+		assert.Zero(t, bot.messages[0].albumCount)
+		_, calls := fetcher.snapshot()
+		assert.Equal(t, 1, calls, "文件胜出不回退后续候选")
+	})
+
+	t.Run("全候选切片失败降级文本", func(t *testing.T) {
+		// 头部合规但数据损坏的截断 JPEG（取完整编码前 60% 字节）：
+		// DecodeConfig 读头部成功 → 尺寸类错误 → 预检可读 → slicePhoto 全量解码失败
+		// → 回退；无后续候选 → 零载荷文本
+		bot := &photoBot{}
+		full := encodeGrad(t, 200, 9900)
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": full[:len(full)*3/5],
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.False(t, bot.messages[0].hasPhoto)
+		assert.Zero(t, bot.messages[0].albumCount)
+		assert.False(t, bot.messages[0].hasDoc)
+	})
+
+	t.Run("双频道各收相册且实例独立", func(t *testing.T) {
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 200, 9900),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a", "@b"}, bot, fetcher, "")
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 2, "两频道各收到一条")
+		assert.Equal(t, 8, bot.messages[0].albumCount)
+		assert.Equal(t, 8, bot.messages[1].albumCount)
+		assert.NotSame(t, bot.messages[0].msg, bot.messages[1].msg, "各频道必须是独立 Message 实例（降级状态不跨频道串味）")
+	})
+
+	// [issue #16 用户反馈] photo_overlimit=crop：超限长图改发顶部切片相册预览 + 截断附注。
+	// [issue #16 二轮评审] 附注仅进 caption（Message.CaptionNote），text 恒为全文——
+	// photo 永久失败降级纯文本时按 4096 发全文，附注不得污染
+	t.Run("crop 超长图发顶部切片相册并注明截断", func(t *testing.T) {
+		// 100×25000：needed=⌈25000/1280⌉=20 > 10 → 默认走 doc；
+		// crop 改为取顶部 10×1280 相册 + caption 附注
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 25000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 10, bot.messages[0].albumCount, "crop 应取顶部 10 片")
+		assert.False(t, bot.messages[0].hasDoc, "crop 不再走文件附件")
+		assert.NotContains(t, bot.messages[0].text, "（长图过长，已截断）", "text 恒全文")
+		assert.Empty(t, bot.messages[0].captionNote, "三轮实测：截断附注已按用户要求移除")
+	})
+
+	t.Run("crop 配 photo_slices 压制片数", func(t *testing.T) {
+		// 200×9900：needed=8，photo_slices=3 → 8 > 3 超限 → crop 取顶部 3×1280 + 附注
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 200, 9900),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoSlices = 3
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 3, bot.messages[0].albumCount)
+		assert.Empty(t, bot.messages[0].captionNote, "三轮实测：截断附注已移除")
+		assert.NotContains(t, bot.messages[0].text, "已截断", "text 恒全文")
+	})
+
+	t.Run("photo_slices 宽松时完整相册无附注", func(t *testing.T) {
+		// 100×5000：needed=⌈5000/1280⌉=4 ≤ photo_slices=4 → 完整 4 片相册，无截断附注
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 5000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoSlices = 4
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.Equal(t, 4, bot.messages[0].albumCount)
+		assert.NotContains(t, bot.messages[0].text, "已截断", "完整相册不应有截断附注")
+		assert.False(t, bot.messages[0].hasDoc)
+	})
+
+	t.Run("过宽图即便 crop 也走文件（不可切与 photoSlices 无关）", func(t *testing.T) {
+		// 9600×1000：chunkBounds 区间空（过宽不可切）→ 即使配置 crop 也维持整图文件
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 9600, 1000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasDoc, "过宽图不可切片，crop 也应走文件")
+		assert.Zero(t, bot.messages[0].albumCount)
+	})
+
+	t.Run("crop 遇均分不可分区兜底原文件", func(t *testing.T) {
+		// 9500×600：fits=false（n=2 均分 base=300 < 片高下限 475）但 slicableBounds=true
+		// （区间 [475,500] 非空、5.7MP 限内）→ 进 crop 分支 → slicePhoto 报 partition
+		// （unsliceableError）→ [issue #16 二轮评审] 图片完好切不动：crop 不应比
+		// document 差，兜底发原文件（原「回退候选降级文本」行为废弃，注释保留备查）
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 9500, 600),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasDoc, "切片不可分=图片完好，crop 应兜底原文件")
+		assert.Zero(t, bot.messages[0].albumCount)
+		assert.Empty(t, bot.messages[0].captionNote, "doc 全文完整，无需附注")
+	})
+
+	t.Run("crop 遇解码损坏回退候选降级文本", func(t *testing.T) {
+		// 头部合规但数据损坏的截断 JPEG（完整编码前 60% 字节）+ crop：
+		// 解码失败=数据损坏（非 unsliceable）→ 照旧回退；无后续候选 → 零载荷文本。
+		// 与上一用例构成 unsliceable/doc 与损坏/回退的两条路分野
+		bot := &photoBot{}
+		full := encodeGrad(t, 200, 9900)
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": full[:len(full)*3/5],
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.False(t, bot.messages[0].hasDoc, "数据损坏不应兜底发坏文件")
+		assert.False(t, bot.messages[0].hasPhoto)
+		assert.Zero(t, bot.messages[0].albumCount)
+		assert.Equal(t, "photo item", bot.messages[0].text, "全候选失败降级纯文本")
+	})
+
+	t.Run("显式 document 与缺省一致走文件", func(t *testing.T) {
+		// 100×25000 + photo_overlimit: document（显式默认值）：needed=20 > 10 →
+		// 整图文件，行为与零值缺省完全一致（锁定枚举 document 的语义）
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 25000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitDocument
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasDoc)
+		assert.Zero(t, bot.messages[0].albumCount)
 	})
 }

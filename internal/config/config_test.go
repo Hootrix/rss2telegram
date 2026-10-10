@@ -254,3 +254,60 @@ func TestValidateMediaEnum(t *testing.T) {
 		assert.ErrorContains(t, err, `"photo"`)
 	})
 }
+
+// issue #16 用户反馈：photo_slices/photo_overlimit 校验——
+// 仅 media=photo 的 feed 允许配置（对齐 snapshot_source 依赖 snapshot 的校验关系），
+// photo_slices 合法显式值 2-10（sendMediaGroup 硬上限 10，0=默认）
+func TestValidatePhotoAlbumConfig(t *testing.T) {
+	newFeed := func(mutate func(*FeedConfig)) *Config {
+		cfg := &Config{
+			Telegram: TelegramConfig{BotToken: "t", CheckInterval: 1},
+			Feeds:    []FeedConfig{{Name: "f", URL: "https://e.com/rss", Channels: []string{"@c"}, Media: MediaPhoto}},
+		}
+		mutate(&cfg.Feeds[0])
+		return cfg
+	}
+
+	t.Run("全零值默认通过且 EffectivePhotoSlices 回退 10", func(t *testing.T) {
+		// Validate 挂在 *Config 上（指针接收者），经 newFeed 构造后校验
+		cfg := newFeed(func(_ *FeedConfig) {})
+		assert.NoError(t, cfg.Validate())
+		assert.Equal(t, 10, cfg.Feeds[0].EffectivePhotoSlices())
+	})
+
+	t.Run("photo_slices 合法边界 2 与 10 通过", func(t *testing.T) {
+		assert.NoError(t, newFeed(func(f *FeedConfig) { f.PhotoSlices = 2 }).Validate())
+		assert.NoError(t, newFeed(func(f *FeedConfig) { f.PhotoSlices = 10 }).Validate())
+	})
+
+	t.Run("photo_slices 越界 1 与 11 报错", func(t *testing.T) {
+		for _, v := range []int{1, 11} {
+			err := newFeed(func(f *FeedConfig) { f.PhotoSlices = v }).Validate()
+			assert.ErrorContains(t, err, "photo_slices", "值 %d 应报错", v)
+		}
+	})
+
+	t.Run("photo_slices 未启用 media 时报错", func(t *testing.T) {
+		err := newFeed(func(f *FeedConfig) { f.Media = ""; f.PhotoSlices = 5 }).Validate()
+		assert.ErrorContains(t, err, "photo_slices")
+		assert.ErrorContains(t, err, "media")
+	})
+
+	t.Run("photo_overlimit 合法值 crop 与 document 通过", func(t *testing.T) {
+		assert.NoError(t, newFeed(func(f *FeedConfig) { f.PhotoOverlimit = PhotoOverlimitCrop }).Validate())
+		assert.NoError(t, newFeed(func(f *FeedConfig) { f.PhotoOverlimit = PhotoOverlimitDocument }).Validate())
+	})
+
+	t.Run("photo_overlimit 非法值报错且列出合法值", func(t *testing.T) {
+		err := newFeed(func(f *FeedConfig) { f.PhotoOverlimit = "archive" }).Validate()
+		assert.ErrorContains(t, err, "photo_overlimit")
+		assert.ErrorContains(t, err, `"crop"`)
+		assert.ErrorContains(t, err, `"document"`)
+	})
+
+	t.Run("photo_overlimit 未启用 media 时报错", func(t *testing.T) {
+		err := newFeed(func(f *FeedConfig) { f.Media = ""; f.PhotoOverlimit = PhotoOverlimitCrop }).Validate()
+		assert.ErrorContains(t, err, "photo_overlimit")
+		assert.ErrorContains(t, err, "media")
+	})
+}

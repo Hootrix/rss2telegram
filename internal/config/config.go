@@ -38,6 +38,14 @@ type FeedConfig struct {
 	// 图片推送模式枚举：空 = 不启用（纯文本）；photo = sendPhoto，
 	// template 渲染结果作为图片 caption（issue #13）
 	Media string `yaml:"media"`
+	// 相册预览切片上限（issue #16 用户反馈）：长图切片相册最多展示的片数；
+	// 0 = 默认 10；显式合法值 2-10（Telegram sendMediaGroup 硬上限）。
+	// 仅 media=photo 时生效
+	PhotoSlices int `yaml:"photo_slices"`
+	// 超限长图行为（issue #16 用户反馈）：document（默认）= 整图发文件附件（完整
+	// 但无内联预览）；crop = 取顶部 photo_slices 片切片相册预览 + caption 注明截断
+	// （可见性优先）。仅 media=photo 时生效
+	PhotoOverlimit string `yaml:"photo_overlimit"`
 }
 
 const (
@@ -49,6 +57,14 @@ const (
 
 	// 图片推送模式枚举（issue #13）：将来新模式（如 video）作为新值扩展
 	MediaPhoto = "photo"
+
+	// 超限长图行为枚举（issue #16 用户反馈）：document = 整图文件附件（默认），
+	// crop = 顶部切片相册预览 + 截断附注
+	PhotoOverlimitDocument = "document"
+	PhotoOverlimitCrop     = "crop"
+
+	// 默认相册切片上限（photo_slices 未配置时），等于 Telegram sendMediaGroup 硬上限
+	defaultPhotoSlices = 10
 )
 
 // Validate 验证配置的合法性
@@ -124,9 +140,36 @@ func (c *Config) Validate() error {
 		if feed.Media != "" && feed.Media != MediaPhoto {
 			return fmt.Errorf("feed %s: invalid media %q (only %q is supported)", feed.Name, feed.Media, MediaPhoto)
 		}
+
+		// 相册切片上限（issue #16 用户反馈）：仅 media=photo 时允许配置（对齐
+		// snapshot_source 依赖 snapshot 的校验关系——独立存在无意义且易被误以为生效）；
+		// 显式值限 2-10：1 片不成相册（单图直接发 sendPhoto），10 = sendMediaGroup 硬上限
+		if feed.PhotoSlices != 0 && (feed.Media != MediaPhoto || feed.PhotoSlices < 2 || feed.PhotoSlices > 10) {
+			return fmt.Errorf("feed %s: invalid photo_slices %d (only 2-10 with media %q is supported)", feed.Name, feed.PhotoSlices, MediaPhoto)
+		}
+
+		// 超限长图行为（issue #16 用户反馈）：仅 media=photo 时允许配置；枚举校验
+		switch feed.PhotoOverlimit {
+		case "":
+		case PhotoOverlimitDocument, PhotoOverlimitCrop:
+			if feed.Media != MediaPhoto {
+				return fmt.Errorf("feed %s: photo_overlimit %q requires media %q to be enabled", feed.Name, feed.PhotoOverlimit, MediaPhoto)
+			}
+		default:
+			return fmt.Errorf("feed %s: invalid photo_overlimit %q (only %q and %q are supported)",
+				feed.Name, feed.PhotoOverlimit, PhotoOverlimitCrop, PhotoOverlimitDocument)
+		}
 	}
 
 	return nil
+}
+
+// EffectivePhotoSlices 相册切片上限：未配置回退默认 10（issue #16 用户反馈）
+func (f FeedConfig) EffectivePhotoSlices() int {
+	if f.PhotoSlices == 0 {
+		return defaultPhotoSlices
+	}
+	return f.PhotoSlices
 }
 
 // 配置文件自动监听Manager 配置管理器
