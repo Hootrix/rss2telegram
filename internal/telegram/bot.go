@@ -587,6 +587,8 @@ func isParseEntitiesError(err error) bool {
 const maxCaptionUnits = 1024
 
 // minNewlineFallbackUnits 换行回退阈值：最后一个换行前的码元数达此值才回退（取上限一半）
+// [issue #16 审查] 已随 truncateToUnits 参数化为 maxUnits/2，常量保留备查（仅作语义说明，
+// 代码中不再引用——truncateCaption(s) ≡ truncateToUnits(s, maxCaptionUnits) 行为不变）
 const minNewlineFallbackUnits = maxCaptionUnits / 2
 
 // maxPhotoTransientFails 图片瞬态失败保险丝阈值：同一条消息累计达此次数后
@@ -601,16 +603,32 @@ func utf16Units(r rune) int {
 	return 1
 }
 
-// truncateCaption 超限时按 rune 边界累加 UTF-16 码元截断（逐 rune 推进天然不劈开代理对），
-// 并优先回退到最后一个换行（其前文码元数 ≥ minNewlineFallbackUnits 时）——legacy Markdown
-// 实体基本不跨行，按行截可大幅降低"切断 [Media](url) 等实体 → captionPlain 降级"的概率。
-// 截的是实体解析前原文，Telegram 校验解析后长度（语法字符被消耗只会更短），1024 保守安全
-func truncateCaption(s string) string {
+// captionUnits 统计字符串的 UTF-16 码元数（逐 rune 累加，无效字节产出宽 1 的 U+FFFD
+// 仍计 1，与 truncateToUnits 的 DecodeRuneInString 口径一致）。
+// [issue #16 审查] 从 truncateCaption 开头的 total 累加循环提取复用
+func captionUnits(s string) int {
 	total := 0
 	for _, r := range s {
 		total += utf16Units(r)
 	}
-	if total <= maxCaptionUnits {
+	return total
+}
+
+// truncateCaption 超限时按 rune 边界累加 UTF-16 码元截断（逐 rune 推进天然不劈开代理对），
+// 并优先回退到最后一个换行（其前文码元数 ≥ 上限一半时）——legacy Markdown
+// 实体基本不跨行，按行截可大幅降低"切断 [Media](url) 等实体 → captionPlain 降级"的概率。
+// 截的是实体解析前原文，Telegram 校验解析后长度（语法字符被消耗只会更短），1024 保守安全。
+// [issue #16 审查] 核心逻辑下沉到参数化的 truncateToUnits，此处变薄壳（行为不变，
+// TestTruncateCaption 守护）
+func truncateCaption(s string) string {
+	return truncateToUnits(s, maxCaptionUnits)
+}
+
+// truncateToUnits [issue #16 审查] truncateCaption 的参数化核心：按 rune 边界累加
+// UTF-16 码元截到 maxUnits 内，换行回退阈值随参数取 maxUnits/2（原 minNewlineFallbackUnits
+// 即 maxCaptionUnits/2，薄壳路径行为不变）。供 AppendCaptionNote 在子预算内预截正文复用
+func truncateToUnits(s string, maxUnits int) string {
+	if total := captionUnits(s); total <= maxUnits {
 		return s
 	}
 
@@ -633,7 +651,7 @@ func truncateCaption(s string) string {
 	units, hardEnd, i := 0, 0, 0
 	for i < len(s) {
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if units+utf16Units(r) > maxCaptionUnits {
+		if units+utf16Units(r) > maxUnits {
 			break
 		}
 		units += utf16Units(r)
@@ -643,13 +661,23 @@ func truncateCaption(s string) string {
 	truncated := s[:hardEnd]
 
 	if idx := strings.LastIndexByte(truncated, '\n'); idx >= 0 {
-		nlUnits := 0
-		for _, r := range truncated[:idx] {
-			nlUnits += utf16Units(r)
-		}
-		if nlUnits >= minNewlineFallbackUnits {
+		// 换行前码元 ≥ maxUnits/2 才回退（原常量 minNewlineFallbackUnits 的参数化形态）
+		if nlUnits := captionUnits(truncated[:idx]); nlUnits >= maxUnits/2 {
 			truncated = truncated[:idx]
 		}
 	}
 	return strings.TrimRight(truncated, " \t\n\r")
+}
+
+// AppendCaptionNote [issue #16 用户反馈] 在 caption 1024 码元预算内拼接截断附注：
+// 先把正文预截到「1024 − 附注宽度 − 分隔符」内再拼，保证附注本身不被
+// telegram 层统一截断吞掉（长描述 feed 的 caption 常 ≥1013 码元）。
+// 边界：note 自身 ≥1024 码元时 budget 归零（正文整段丢弃，真实调用传固定短附注不可达）
+func AppendCaptionNote(text, note string) string {
+	const sep = "\n\n"
+	budget := maxCaptionUnits - captionUnits(note) - captionUnits(sep)
+	if budget < 0 {
+		budget = 0
+	}
+	return truncateToUnits(text, budget) + sep + note
 }

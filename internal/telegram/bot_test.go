@@ -784,6 +784,50 @@ func TestTruncateCaption(t *testing.T) {
 	})
 }
 
+// issue #16 用户反馈：AppendCaptionNote 在 1024 码元预算内拼接附注——
+// 先预截正文再拼附注，保证附注本身不被 Send 路径的统一截断吞掉
+// （长描述 feed 的 caption 常 ≥1013 码元，裸拼接的附注必被截尾）
+func TestAppendCaptionNote(t *testing.T) {
+	const note = "（长图过长，已截断）" // 10 个 BMP 字符 = 10 码元
+
+	t.Run("短正文原样附注", func(t *testing.T) {
+		assert.Equal(t, "hello\n\n"+note, AppendCaptionNote("hello", note))
+	})
+
+	t.Run("1013 码元正文附注后总长恰在预算内且 rune 边界完整", func(t *testing.T) {
+		// 1013 汉字 = 1013 码元；budget = 1024-10-2 = 1012 → 预截正文 1012；
+		// 总长 1012+2+10 = 1024 恰满，附注完整在尾（裸拼接时附注必被吞）
+		in := strings.Repeat("新", 1013)
+		got := AppendCaptionNote(in, note)
+		assert.Equal(t, strings.Repeat("新", 1012)+"\n\n"+note, got)
+		assert.LessOrEqual(t, captionUnits(got), maxCaptionUnits, "总码元不得超 1024")
+		assert.True(t, strings.HasSuffix(got, note), "附注必须完整保留在尾部")
+	})
+
+	t.Run("正文含换行时预算内回退到换行", func(t *testing.T) {
+		// budget=1012 内换行回退仍生效：换行前 600 ≥ budget/2 → 截到换行
+		in := strings.Repeat("a", 600) + "\n" + strings.Repeat("b", 600)
+		assert.Equal(t, strings.Repeat("a", 600)+"\n\n"+note, AppendCaptionNote(in, note))
+	})
+
+	t.Run("note 超预算的防御路径 budget 归零", func(t *testing.T) {
+		// note 自身 ≥1024 码元（真实调用不会发生，防御锁定行为）：
+		// budget = 1024-1024-2 < 0 → 0，正文整段丢弃，只剩 sep+note
+		bigNote := strings.Repeat("新", 1024)
+		got := AppendCaptionNote("hello", bigNote)
+		assert.Equal(t, "\n\n"+bigNote, got)
+	})
+
+	t.Run("emoji 宽度计入预算", func(t *testing.T) {
+		// 506 emoji = 1012 码元恰好用满 budget，附注仍完整；
+		// 再补一个 emoji（+2）会被预截掉，emoji 不被劈半
+		in := strings.Repeat("🎉", 507)
+		got := AppendCaptionNote(in, note)
+		assert.Equal(t, strings.Repeat("🎉", 506)+"\n\n"+note, got)
+		assert.LessOrEqual(t, captionUnits(got), maxCaptionUnits)
+	})
+}
+
 // issue #13：Message 携带可选图片字节；空字节等价普通文本消息
 func TestNewPhotoMessage(t *testing.T) {
 	t.Run("有图", func(t *testing.T) {

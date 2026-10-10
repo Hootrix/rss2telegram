@@ -810,9 +810,10 @@ type photoPayload struct {
 
 // photoForItem [issue #13/16] 仅 media=photo 时按候选顺序下载图片：
 // Fetch 只负责下载（issue #16 起校验移出），validatePhoto 在此分类——
-// 尺寸类失败按 CR 预检分派：可读切片 → 相册、不可读 → 整图文件（均胜出不回退
-// 后续候选）；切片解码失败/其他校验失败回退下一候选；全部失败返回零值（文本推送）。
-// 图片字节每 item 只下载一次，频道间只读共享
+// 尺寸类失败按 feed 级 photo_slices/photo_overlimit 三分派（issue #16 用户反馈）：
+// 完整相册（needed ≤ slices）/ crop 顶部切片预览+截断附注 / doc 整图文件；
+// 不可切图（过宽/超像素）恒 doc 与 photoSlices 无关。切片解码失败/其他校验失败
+// 回退下一候选；全部失败返回零值（文本推送）。图片字节每 item 只下载一次，频道间只读共享
 func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedConfig, item *gofeed.Item) photoPayload {
 	if feedConfig.Media != config.MediaPhoto || h.photoFetcher == nil {
 		return photoPayload{}
@@ -860,10 +861,8 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 					// 切不满 photoSlices 张可读片。crop 只对「可切片」的图生效：
 					// 过宽（chunkBounds 区间空）或像素超 40MP 的图物理切不出合规片，
 					// 与 photoSlices 无关，维持整图文件（现状）。document（默认）= 整图文件
-					// （int64 乘积防 32 位平台溢出，同 checkPixelBudget）
-					_, _, boundsOk := chunkBounds(dimErr.w)
-					cropable := boundsOk && int64(dimErr.w)*int64(dimErr.h) <= maxPhotoPixels
-					if feedConfig.PhotoOverlimit == config.PhotoOverlimitCrop && cropable {
+					// [issue #16 审查] 可切性判据收敛到 slicableBounds（与 fitsReadableAlbum 同源）
+					if feedConfig.PhotoOverlimit == config.PhotoOverlimitCrop && slicableBounds(dimErr.w, dimErr.h) {
 						chunks, truncated, serr := slicePhoto(data, slices)
 						if serr != nil {
 							// 均分不可分区（如 9500×600 连完整相册都切不出，截尾也救不了
@@ -931,15 +930,15 @@ func (h *RssHandler) photoForItem(ctx context.Context, feedConfig config.FeedCon
 // 每 (item,channel) 调用一次保证 Message 实例独立（降级状态不跨频道串味）。
 // CR 修订（2026-10-10）曾废弃截断附注——截尾不再发生，超限图改发整图文件；
 // [issue #16 用户反馈] 附注恢复：photo_overlimit=crop 的预览相册非完整内容，
-// caption 必须注明截断（普通完整相册 truncated=false 不受影响）。废弃期实现保留备查：
-//
-//	（无 truncated 附注，crop 路径不存在）
+// caption 必须注明截断（普通完整相册 truncated=false 不受影响）。
+// [issue #16 审查] 附注经 AppendCaptionNote 在 1024 码元预算内拼接——旧裸拼接注释保留：
+// text += "\n\n（长图过长，已截断）" 会被 telegram 层统一截断在长 caption 下吞掉附注
 func newDelivery(text string, p photoPayload) *telegram.Message {
 	if len(p.doc) > 0 {
 		return telegram.NewDocumentMessage(text, p.doc)
 	}
 	if p.truncated { // crop 预览相册注明截断（doc 判定在前，截断只可能伴随相册）
-		text += "\n\n（长图过长，已截断）"
+		text = telegram.AppendCaptionNote(text, "（长图过长，已截断）")
 	}
 	if len(p.album) > 0 {
 		return telegram.NewPhotoAlbumMessage(text, p.album)

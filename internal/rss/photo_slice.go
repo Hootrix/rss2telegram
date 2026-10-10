@@ -38,6 +38,14 @@ func chunkBounds(w int) (chunkMax, chunkMin int, ok bool) {
 	return chunkMax, chunkMin, chunkMax > 0 && chunkMax >= chunkMin
 }
 
+// slicableBounds [issue #16 审查] 判定 (w,h) 是否物理可切合规片：chunkBounds 区间非空
+// 且像素 ≤ 40MP（int64 乘积防 32 位平台溢出，同 checkPixelBudget）。
+// fitsReadableAlbum 与 handler 的 cropable 判据共用，消除多处手写同套数学的漂移风险
+func slicableBounds(w, h int) bool {
+	_, _, ok := chunkBounds(w)
+	return ok && int64(w)*int64(h) <= maxPhotoPixels
+}
+
 // fitsReadableAlbum [issue #16 CR] 用头部尺寸预判能否切成 ≤maxPieces 张零压缩可读片
 // （不做解码，photoForItem 以此决定相册 vs 整图文件，避免切完再丢弃）。
 // [issue #16 用户反馈] maxPieces 参数化（photo_slices 配置）：n > maxPieces 即不可读；
@@ -46,13 +54,11 @@ func fitsReadableAlbum(w, h int, maxPieces int) bool {
 	if maxPieces > maxAlbumPhotos {
 		maxPieces = maxAlbumPhotos
 	}
-	chunkMax, chunkMin, ok := chunkBounds(w)
-	if !ok {
+	// 区间空（过宽不可切）/像素超 40MP 的不可切判定收敛到 slicableBounds 单点
+	if !slicableBounds(w, h) {
 		return false
 	}
-	if w*h > maxPhotoPixels {
-		return false
-	}
+	chunkMax, chunkMin, _ := chunkBounds(w) // slicableBounds 已保证区间非空
 	n := (h + chunkMax - 1) / chunkMax
 	if n > maxPieces {
 		return false

@@ -1070,7 +1070,7 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		assert.Equal(t, 8, bot.messages[0].albumCount)
 		assert.False(t, bot.messages[0].hasPhoto)
 		assert.False(t, bot.messages[0].hasDoc)
-		assert.NotContains(t, bot.messages[0].text, "已截断", "截尾路径已废弃，无附注")
+		assert.NotContains(t, bot.messages[0].text, "已截断", "完整相册无附注（截断附注仅 crop 路径）")
 		_, calls := fetcher.snapshot()
 		assert.Equal(t, 1, calls, "切片胜出不回退后续候选")
 	})
@@ -1211,6 +1211,43 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 
 		require.Len(t, bot.messages, 1)
 		assert.True(t, bot.messages[0].hasDoc, "过宽图不可切片，crop 也应走文件")
+		assert.Zero(t, bot.messages[0].albumCount)
+	})
+
+	t.Run("crop 遇均分不可分区回退候选降级文本", func(t *testing.T) {
+		// 9500×600：fits=false（n=2 均分 base=300 < 片高下限 475）但 slicableBounds=true
+		// （区间 [475,500] 非空、5.7MP 限内）→ 进 crop 分支 → slicePhoto 报 partition
+		// 错误 → 回退；无后续候选 → 零载荷文本（锁住注释定义的行为分叉，非 doc）
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 9500, 600),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitCrop
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.False(t, bot.messages[0].hasDoc, "partition 失败回退候选，不硬转 doc")
+		assert.False(t, bot.messages[0].hasPhoto)
+		assert.Zero(t, bot.messages[0].albumCount)
+		assert.Equal(t, "photo item", bot.messages[0].text, "全候选失败降级纯文本")
+	})
+
+	t.Run("显式 document 与缺省一致走文件", func(t *testing.T) {
+		// 100×25000 + photo_overlimit: document（显式默认值）：needed=20 > 10 →
+		// 整图文件，行为与零值缺省完全一致（锁定枚举 document 的语义）
+		bot := &photoBot{}
+		fetcher := &mockPhotoFetcher{stub: map[string][]byte{
+			"https://img.example.com/first.png": encodeGrad(t, 100, 25000),
+		}}
+		h := newPhotoTestHandler(t, []string{"@a"}, bot, fetcher, "")
+		h.config.Feeds[0].PhotoOverlimit = config.PhotoOverlimitDocument
+
+		require.NoError(t, h.processFeed(context.Background(), h.config.Feeds[0]))
+
+		require.Len(t, bot.messages, 1)
+		assert.True(t, bot.messages[0].hasDoc)
 		assert.Zero(t, bot.messages[0].albumCount)
 	})
 }
