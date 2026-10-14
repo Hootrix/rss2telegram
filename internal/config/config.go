@@ -46,6 +46,10 @@ type FeedConfig struct {
 	// 但无内联预览）；crop = 取顶部 photo_slices 片切片相册预览 + caption 注明截断
 	// （可见性优先）。仅 media=photo 时生效
 	PhotoOverlimit string `yaml:"photo_overlimit"`
+	// 标题去重开关：同一 feed 内标题+发布日期相同即视为同一文章，不再重复推送。
+	// 用于应对源站更换文章 URL/GUID 的搬运场景（如微信公众号长/短链接混用）；
+	// 副作用：同日同标题的不同文章会被吞掉，仅建议对标题稳定性高的源开启。
+	DeduplicateByTitle bool `yaml:"deduplicate_by_title"`
 }
 
 const (

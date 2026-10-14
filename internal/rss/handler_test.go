@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1294,4 +1295,82 @@ func TestProcessFeedPhotoAlbumMode(t *testing.T) {
 		assert.True(t, bot.messages[0].hasDoc)
 		assert.Zero(t, bot.messages[0].albumCount)
 	})
+}
+
+// issue #18：deduplicate_by_title —— 聚合源对同一文章更换 URL/GUID 时不应重复推送
+func TestDeduplicateByTitleSkipsRelinkedItem(t *testing.T) {
+	var reqCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// 每次请求返回同标题同日期、但 guid/link 不同的条目，模拟源站换 URL
+		n := atomic.AddInt32(&reqCount, 1)
+		fmt.Fprintf(w, `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><link>https://example.com/</link><description>d</description><item><title>same-title</title><guid>guid-%d</guid><link>https://example.com/a%d</link><pubDate>Tue, 14 Oct 2026 00:00:00 +0800</pubDate></item></channel></rss>`, n, n)
+	}))
+	t.Cleanup(server.Close)
+	store, err := storage.NewStorage(t.TempDir())
+	require.NoError(t, err)
+	bot := &scriptBot{script: []error{nil}}
+	h := newRetryTestHandler(bot)
+	h.storage, h.parser = store, gofeed.NewParser()
+	feed := config.FeedConfig{
+		Name: "f", URL: server.URL, Channels: []string{"@a"},
+		FirstPush: true, Template: "{title}", DeduplicateByTitle: true,
+	}
+
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	calls, _ := bot.snapshot()
+	assert.Equal(t, 1, calls, "同标题同日期换链接的 item 不应重复推送")
+}
+
+// issue #18：未开启 deduplicate_by_title 时维持原 GUID/Link 去重语义（换链接即新文章）
+func TestDeduplicateByTitleDisabledResendsRelinkedItem(t *testing.T) {
+	var reqCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&reqCount, 1)
+		fmt.Fprintf(w, `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><link>https://example.com/</link><description>d</description><item><title>same-title</title><guid>guid-%d</guid><link>https://example.com/a%d</link><pubDate>Tue, 14 Oct 2026 00:00:00 +0800</pubDate></item></channel></rss>`, n, n)
+	}))
+	t.Cleanup(server.Close)
+	store, err := storage.NewStorage(t.TempDir())
+	require.NoError(t, err)
+	bot := &scriptBot{script: []error{nil}}
+	h := newRetryTestHandler(bot)
+	h.storage, h.parser = store, gofeed.NewParser()
+	feed := config.FeedConfig{
+		Name: "f", URL: server.URL, Channels: []string{"@a"},
+		FirstPush: true, Template: "{title}",
+	}
+
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	calls, _ := bot.snapshot()
+	assert.Equal(t, 2, calls, "未开启标题去重时换链接视为新文章（原行为锁定）")
+}
+
+// issue #18：同标题不同发布日期不算同一篇，仍应推送
+func TestDeduplicateByTitleDifferentDateStillPushes(t *testing.T) {
+	var reqCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&reqCount, 1)
+		// 第二次请求日期 +1 天：同标题但不同发布日期
+		pub := "Tue, 14 Oct 2026 00:00:00 +0800"
+		if n == 2 {
+			pub = "Wed, 15 Oct 2026 00:00:00 +0800"
+		}
+		fmt.Fprintf(w, `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><link>https://example.com/</link><description>d</description><item><title>same-title</title><guid>guid-%d</guid><link>https://example.com/a%d</link><pubDate>%s</pubDate></item></channel></rss>`, n, n, pub)
+	}))
+	t.Cleanup(server.Close)
+	store, err := storage.NewStorage(t.TempDir())
+	require.NoError(t, err)
+	bot := &scriptBot{script: []error{nil}}
+	h := newRetryTestHandler(bot)
+	h.storage, h.parser = store, gofeed.NewParser()
+	feed := config.FeedConfig{
+		Name: "f", URL: server.URL, Channels: []string{"@a"},
+		FirstPush: true, Template: "{title}", DeduplicateByTitle: true,
+	}
+
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	calls, _ := bot.snapshot()
+	assert.Equal(t, 2, calls, "同标题不同日期不是同一篇，应各自推送")
 }

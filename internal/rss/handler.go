@@ -290,6 +290,22 @@ func generateItemID(item *gofeed.Item) string {
 	return fmt.Sprintf("content:%x", sha256.Sum256([]byte(item.Content)))
 }
 
+// 生成去重 keys：主 key 为 GUID/Link 等；feed 开启 deduplicate_by_title 时，
+// 额外加入「标题 + 发布日期」辅助 key，用于识别源站更换文章 URL/GUID 的同一篇。
+// 无发布时间时辅助 key 仅用标题（同日同标题会合并，属已声明的副作用）
+func generateDedupKeys(item *gofeed.Item, feedConfig config.FeedConfig) []string {
+	keys := []string{generateItemID(item)}
+	if !feedConfig.DeduplicateByTitle || item.Title == "" {
+		return keys
+	}
+	date := ""
+	if item.PublishedParsed != nil {
+		date = item.PublishedParsed.Format("2006-01-02")
+	}
+	keys = append(keys, "title|"+item.Title+"|"+date)
+	return keys
+}
+
 // func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
 func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConfig) error {
 	if err := ctx.Err(); err != nil {
@@ -333,10 +349,17 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 			continue
 		}
 
-		itemID := generateItemID(item)
+		itemKeys := generateDedupKeys(item, feedConfig)
 
 		// 检查是否在本次运行中已经处理过
-		if seenInThisRun[itemID] {
+		seenAny := false
+		for _, k := range itemKeys {
+			if seenInThisRun[k] {
+				seenAny = true
+				break
+			}
+		}
+		if seenAny {
 			log.Printf("Item already seen in this run: %s", item.Title)
 			continue
 		}
@@ -352,15 +375,26 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 				if err := ctx.Err(); err != nil {
 					return fmt.Errorf("mark initial feed items: %w", err)
 				}
-				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
-					log.Printf("Error marking item as seen: %v", err)
+				for _, k := range itemKeys {
+					if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, k); err != nil {
+						log.Printf("Error marking item as seen: %v", err)
+					}
 				}
 			}
 			continue
 		}
 
 		for _, channel := range feedConfig.Channels {
-			if !h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
+			// 任一去重 key 已见即视为该频道已推送过此文（issue #18：换链接的同标题文章
+			// 命中辅助 key 即跳过；多频道语义不变，各频道独立判定）
+			channelSeen := false
+			for _, k := range itemKeys {
+				if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, k) {
+					channelSeen = true
+					break
+				}
+			}
+			if !channelSeen {
 				allChannelsProcessed = false
 				break
 			}
@@ -386,7 +420,9 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 		}
 
 		newItems = append(newItems, item)
-		seenInThisRun[itemID] = true
+		for _, k := range itemKeys {
+			seenInThisRun[k] = true
+		}
 	}
 
 	// 如果有发布时间的文章，按时间排序
@@ -484,7 +520,7 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 	// 单个 feed 原本就只有一个发送名额，直接串行处理，避免每条消息排队 goroutine
 	// 发送后的全 feed sleep 已在上方旧代码保留，节流仅由共享频道状态负责
 	for _, item := range newItems {
-		itemID := generateItemID(item)
+		itemKeys := generateDedupKeys(item, feedConfig)
 
 		// [issue #12] 快照阶段：配置了 snapshot 的 feed 在渲染前建快照，
 		// {telegraph} 降级值已在编排器内决定（快照失败=原文链接，无 link=空串）。
@@ -521,15 +557,24 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 				}
 				return fmt.Errorf("send feed items: %w", err)
 			}
-			if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID) {
+			channelSeen := false
+			for _, k := range itemKeys {
+				if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, k) {
+					channelSeen = true
+					break
+				}
+			}
+			if channelSeen {
 				continue
 			}
 			// delivery := telegram.NewMessage(message) // 旧 sendWithRetry(ctx, channel, message, item.Title)
 			// delivery := telegram.NewPhotoMessage(message, photo) // 旧：单图构造，issue #16 起按载荷分派
 			delivery := newDelivery(message, payload)
 			if msgID, ok := h.sendWithRetry(ctx, channel, delivery, item.Title); ok {
-				if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, itemID); err != nil {
-					log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
+				for _, k := range itemKeys {
+					if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, k); err != nil {
+						log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
+					}
 				}
 				// [issue #12] 快照页 author_url 回填为消息链接（公开频道，尽力而为）
 				h.backfillSnapshotLink(ctx, feedConfig, item, channel, msgID)
