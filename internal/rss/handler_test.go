@@ -1374,3 +1374,87 @@ func TestDeduplicateByTitleDifferentDateStillPushes(t *testing.T) {
 	calls, _ := bot.snapshot()
 	assert.Equal(t, 2, calls, "同标题不同日期不是同一篇，应各自推送")
 }
+
+// issue #18 CR：无发布时间的条目不生成辅助 key——否则同标题文章会被永久合并
+func TestDeduplicateByTitleNoPubDateFallsBackToMainKey(t *testing.T) {
+	var reqCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&reqCount, 1)
+		fmt.Fprintf(w, `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><link>https://example.com/</link><description>d</description><item><title>same-title</title><guid>guid-%d</guid><link>https://example.com/a%d</link></item></channel></rss>`, n, n)
+	}))
+	t.Cleanup(server.Close)
+	store, err := storage.NewStorage(t.TempDir())
+	require.NoError(t, err)
+	bot := &scriptBot{script: []error{nil}}
+	h := newRetryTestHandler(bot)
+	h.storage, h.parser = store, gofeed.NewParser()
+	feed := config.FeedConfig{
+		Name: "f", URL: server.URL, Channels: []string{"@a"},
+		FirstPush: true, Template: "{title}", DeduplicateByTitle: true,
+	}
+
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	calls, _ := bot.snapshot()
+	assert.Equal(t, 2, calls, "无发布时间时只按主 key 去重，同标题换链接视为新文章")
+}
+
+// issue #18 CR：开关开启前推送过的旧文只有主 key，主 key 命中时应补记标题 key，
+// 此后源站换链接也能被辅助 key 拦截（迁移路径）
+func TestDeduplicateByTitleBackfillsAuxKeyOnMainKeyHit(t *testing.T) {
+	var reqCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&reqCount, 1)
+		fmt.Fprintf(w, `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><link>https://example.com/</link><description>d</description><item><title>same-title</title><guid>guid-%d</guid><link>https://example.com/a%d</link><pubDate>Tue, 14 Oct 2026 00:00:00 +0800</pubDate></item></channel></rss>`, n, n)
+	}))
+	t.Cleanup(server.Close)
+	store, err := storage.NewStorage(t.TempDir())
+	require.NoError(t, err)
+	bot := &scriptBot{script: []error{nil}}
+	h := newRetryTestHandler(bot)
+	h.storage, h.parser = store, gofeed.NewParser()
+	feed := config.FeedConfig{
+		Name: "f", URL: server.URL, Channels: []string{"@a"},
+		FirstPush: true, Template: "{title}", DeduplicateByTitle: true,
+	}
+
+	// 模拟开关开启前的旧记录：只标了主 key（旧版本行为）
+	require.NoError(t, h.storage.MarkItemSeen(feed.URL, feed.Name, "@a", "guid-1"))
+
+	// 第一轮：item 主 key guid-1 命中 → 跳过推送，同时补记标题 key
+	// 注意 pubDate +0800 的 10-14 00:00 UTC 归一为 10-13
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	calls, _ := bot.snapshot()
+	assert.Equal(t, 0, calls)
+	assert.True(t, h.storage.IsItemSeen(feed.URL, feed.Name, "@a", "title|same-title|2026-10-13"), "主 key 命中时应补记标题 key")
+
+	// 第二轮：源站换链接 guid-2，主 key 未命中但标题 key 已补记 → 仍跳过
+	require.NoError(t, h.processFeed(context.Background(), feed))
+	calls, _ = bot.snapshot()
+	assert.Equal(t, 0, calls, "补记后换链接的同一文章不应重推")
+}
+
+// issue #18：generateDedupKeys 边界——无发布时间不生成辅助 key、UTC 归一、标题 TrimSpace
+func TestGenerateDedupKeysEdges(t *testing.T) {
+	feed := config.FeedConfig{DeduplicateByTitle: true}
+	pub := time.Date(2026, 10, 14, 3, 0, 0, 0, time.FixedZone("CST", 8*3600)) // UTC 2026-10-13 19:00
+
+	t.Run("无发布时间只有主 key", func(t *testing.T) {
+		item := &gofeed.Item{Title: "t", GUID: "g1"}
+		assert.Equal(t, []string{"g1"}, generateDedupKeys(item, feed))
+	})
+
+	t.Run("同一时刻不同时区写法日期归一到 UTC", func(t *testing.T) {
+		a := &gofeed.Item{Title: "t", GUID: "g", PublishedParsed: &pub}
+		b := &gofeed.Item{Title: "t", GUID: "g"}
+		pubUTC := time.Date(2026, 10, 13, 19, 0, 0, 0, time.UTC)
+		b.PublishedParsed = &pubUTC
+		assert.Equal(t, generateDedupKeys(a, feed), generateDedupKeys(b, feed))
+	})
+
+	t.Run("标题前后空白规范化", func(t *testing.T) {
+		a := &gofeed.Item{Title: " t ", GUID: "g", PublishedParsed: &pub}
+		b := &gofeed.Item{Title: "t", GUID: "g", PublishedParsed: &pub}
+		assert.Equal(t, generateDedupKeys(a, feed), generateDedupKeys(b, feed))
+	})
+}

@@ -291,19 +291,47 @@ func generateItemID(item *gofeed.Item) string {
 }
 
 // 生成去重 keys：主 key 为 GUID/Link 等；feed 开启 deduplicate_by_title 时，
-// 额外加入「标题 + 发布日期」辅助 key，用于识别源站更换文章 URL/GUID 的同一篇。
-// 无发布时间时辅助 key 仅用标题（同日同标题会合并，属已声明的副作用）
+// 额外加入「标题 + 发布日期(UTC)」辅助 key，用于识别源站更换文章 URL/GUID 的同一篇。
+// 无发布时间（PublishedParsed == nil）时不生成辅助 key，只返回主 key——
+// 否则日期为空串会导致同标题文章在布隆过滤器生命周期内被永久合并，
+// "每日早报"类固定标题源开启后将只推第一篇（issue #18 CR）
 func generateDedupKeys(item *gofeed.Item, feedConfig config.FeedConfig) []string {
 	keys := []string{generateItemID(item)}
-	if !feedConfig.DeduplicateByTitle || item.Title == "" {
+	if !feedConfig.DeduplicateByTitle || item.Title == "" || item.PublishedParsed == nil {
 		return keys
 	}
-	date := ""
-	if item.PublishedParsed != nil {
-		date = item.PublishedParsed.Format("2006-01-02")
-	}
-	keys = append(keys, "title|"+item.Title+"|"+date)
+	// 日期统一 UTC 再取：同一条目不同时区写法（+0800/GMT）在 0–8 点会差一天（CR）
+	// 标题 TrimSpace 规范化：源站输出前后空白不一致时会算成两篇（CR）
+	date := item.PublishedParsed.UTC().Format("2006-01-02")
+	keys = append(keys, "title|"+strings.TrimSpace(item.Title)+"|"+date)
 	return keys
+}
+
+// channelSeen 任一去重 key 已见即视为该频道已推送过此文（issue #18：换链接的
+// 同标题文章命中辅助 key 即跳过；多频道语义不变，各频道独立判定）。
+// 部分命中时顺手补记缺失 key：开关开启前推送过的旧文只有主 key，补记后
+// 源站再换链接也能被标题 key 拦截，每篇只多一次写入（CR 建议）
+func (h *RssHandler) channelSeen(feedURL, feedName, channel string, keys []string) bool {
+	seen := false
+	var missing []string
+	for _, k := range keys {
+		if h.storage.IsItemSeen(feedURL, feedName, channel, k) {
+			seen = true
+		} else {
+			missing = append(missing, k)
+		}
+	}
+	if seen && len(missing) > 0 {
+		h.markSeenAll(feedURL, feedName, channel, missing)
+	}
+	return seen
+}
+
+// markSeenAll 批量写入全部去重 key（主 key + 标题辅助 key），单次落盘
+func (h *RssHandler) markSeenAll(feedURL, feedName, channel string, keys []string) {
+	if err := h.storage.MarkItemsSeen(feedURL, feedName, channel, keys); err != nil {
+		log.Printf("MarkItemsSeen ERROR!! channel %s: %v", channel, err)
+	}
 }
 
 // func (h *RssHandler) processFeed(feedConfig config.FeedConfig) error {
@@ -375,26 +403,13 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 				if err := ctx.Err(); err != nil {
 					return fmt.Errorf("mark initial feed items: %w", err)
 				}
-				for _, k := range itemKeys {
-					if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, k); err != nil {
-						log.Printf("Error marking item as seen: %v", err)
-					}
-				}
+				h.markSeenAll(feedConfig.URL, feedConfig.Name, channel, itemKeys)
 			}
 			continue
 		}
 
 		for _, channel := range feedConfig.Channels {
-			// 任一去重 key 已见即视为该频道已推送过此文（issue #18：换链接的同标题文章
-			// 命中辅助 key 即跳过；多频道语义不变，各频道独立判定）
-			channelSeen := false
-			for _, k := range itemKeys {
-				if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, k) {
-					channelSeen = true
-					break
-				}
-			}
-			if !channelSeen {
+			if !h.channelSeen(feedConfig.URL, feedConfig.Name, channel, itemKeys) {
 				allChannelsProcessed = false
 				break
 			}
@@ -557,25 +572,14 @@ func (h *RssHandler) processFeed(ctx context.Context, feedConfig config.FeedConf
 				}
 				return fmt.Errorf("send feed items: %w", err)
 			}
-			channelSeen := false
-			for _, k := range itemKeys {
-				if h.storage.IsItemSeen(feedConfig.URL, feedConfig.Name, channel, k) {
-					channelSeen = true
-					break
-				}
-			}
-			if channelSeen {
+			if h.channelSeen(feedConfig.URL, feedConfig.Name, channel, itemKeys) {
 				continue
 			}
 			// delivery := telegram.NewMessage(message) // 旧 sendWithRetry(ctx, channel, message, item.Title)
 			// delivery := telegram.NewPhotoMessage(message, photo) // 旧：单图构造，issue #16 起按载荷分派
 			delivery := newDelivery(message, payload)
 			if msgID, ok := h.sendWithRetry(ctx, channel, delivery, item.Title); ok {
-				for _, k := range itemKeys {
-					if err := h.storage.MarkItemSeen(feedConfig.URL, feedConfig.Name, channel, k); err != nil {
-						log.Printf("msg send success. MarkItemSeen ERROR!! channel %s: %v", channel, err)
-					}
-				}
+				h.markSeenAll(feedConfig.URL, feedConfig.Name, channel, itemKeys)
 				// [issue #12] 快照页 author_url 回填为消息链接（公开频道，尽力而为）
 				h.backfillSnapshotLink(ctx, feedConfig, item, channel, msgID)
 			}

@@ -120,6 +120,12 @@ func (s *Storage) IsItemSeen(feedURL, feedName, channel, itemID string) bool {
 
 // 标记item为已处理
 func (s *Storage) MarkItemSeen(feedURL, feedName, channel, itemID string) error {
+	return s.MarkItemsSeen(feedURL, feedName, channel, []string{itemID})
+}
+
+// MarkItemsSeen 批量标记多个去重 key 为已处理，全部 key 一次落盘（issue #18 CR：
+// 逐 key 调 MarkItemSeen 会让每篇每频道写盘翻倍；批量接口顺带保证多 key 同成败）
+func (s *Storage) MarkItemsSeen(feedURL, feedName, channel string, itemIDs []string) error {
 	s.Lock()
 	defer s.Unlock()
 
@@ -140,7 +146,9 @@ func (s *Storage) MarkItemSeen(feedURL, feedName, channel, itemID string) error 
 		channelStates[channel] = state
 	}
 
-	state.filter.Add([]byte(itemID))
+	for _, itemID := range itemIDs {
+		state.filter.Add([]byte(itemID))
+	}
 	state.updatedAt = time.Now()
 
 	// 保存状态到文件
